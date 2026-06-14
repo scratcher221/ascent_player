@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.demo.recorder import DemoRecorder
-from ascent_player.demo.storage import load_all_demos
+from ascent_player.demo.ingest import ingest_demonstrations
 from ascent_player.env.browser_backend import BrowserBackend, BrowserStatus
 from ascent_player.env.browser_discovery import discover_ascent_tab, list_chromium_windows
 from ascent_player.env.game_env import ACTION_LABELS, AscentGameEnv
@@ -148,17 +148,9 @@ class TrainingWorker(QThread):
                 return
 
             if self.config.demo.use_demos_on_start:
-                demos = load_all_demos(self.config)
-                if demos:
-                    added = agent.absorb_demonstrations(
-                        demos,
-                        multiplier=self.config.demo.replay_multiplier,
-                    )
-                    loss = agent.pretrain_from_demonstrations(demos)
-                    self.status_ready.emit(
-                        f"Loaded {added} demo transitions"
-                        + (f" | BC loss {loss:.4f}" if loss is not None else "")
-                    )
+                result = ingest_demonstrations(agent, self.config)
+                if result.transitions_added or result.transitions_skipped:
+                    self.status_ready.emit(result.status_message)
 
             state = await env.reset()
             episode_reward = 0.0

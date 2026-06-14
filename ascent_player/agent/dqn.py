@@ -106,21 +106,71 @@ class DQNAgent:
         self.metrics.replay_size = len(self.replay)
         return added
 
+    def absorb_demonstration_arrays(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray,
+        *,
+        multiplier: int = 1,
+        indices: np.ndarray | None = None,
+    ) -> int:
+        if indices is None:
+            indices = np.arange(len(actions), dtype=np.int64)
+        added = 0
+        for _ in range(max(1, multiplier)):
+            for idx in indices:
+                self.replay.add(
+                    states[idx],
+                    int(actions[idx]),
+                    float(rewards[idx]),
+                    next_states[idx],
+                    bool(dones[idx]),
+                )
+                added += 1
+        self.metrics.replay_size = len(self.replay)
+        return added
+
+    def pretrain_from_replay(self, steps: int | None = None) -> float | None:
+        if len(self.replay) == 0:
+            return None
+        total_steps = steps or self.config.demo.pretrain_steps
+        batch_size = min(self.batch_size, len(self.replay))
+        last_loss = None
+        with self.tf.device(self.device_info.training_device):
+            for _ in range(total_steps):
+                batch = self.replay.sample(batch_size)
+                last_loss = float(
+                    self._bc_train_step(
+                        batch.states,
+                        batch.actions,
+                    ).numpy()
+                )
+        return last_loss
+
     def pretrain_from_demonstrations(self, transitions, steps: int | None = None) -> float | None:
         if not transitions:
             return None
         total_steps = steps or self.config.demo.pretrain_steps
-        states = np.asarray([item.state for item in transitions], dtype=np.float32)
-        actions = np.asarray([item.action for item in transitions], dtype=np.int32)
         batch_size = min(self.batch_size, len(transitions))
         last_loss = None
         with self.tf.device(self.device_info.training_device):
             for _ in range(total_steps):
-                indices = np.random.choice(len(transitions), batch_size, replace=True)
+                indices = np.random.randint(0, len(transitions), batch_size)
+                batch_states = np.asarray(
+                    [transitions[i].state for i in indices],
+                    dtype=np.float32,
+                )
+                batch_actions = np.asarray(
+                    [transitions[i].action for i in indices],
+                    dtype=np.int32,
+                )
                 last_loss = float(
                     self._bc_train_step(
-                        states[indices],
-                        actions[indices],
+                        batch_states,
+                        batch_actions,
                     ).numpy()
                 )
         return last_loss

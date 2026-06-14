@@ -77,6 +77,10 @@ class DemoConfig:
     replay_multiplier: int = 3
     pretrain_steps: int = 300
     use_demos_on_start: bool = True
+    # Keep at least this much RAM free for the OS while loading demos.
+    os_memory_reserve_mb: int = 2048
+    # Hard cap on unique demo transitions; None = derive from available memory.
+    max_transitions: int | None = None
 
 
 @dataclass(slots=True)
