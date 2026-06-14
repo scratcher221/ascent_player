@@ -91,6 +91,40 @@ class DQNAgent:
             return list(range(6))
         return [0, 1, 2]
 
+    def absorb_demonstrations(self, transitions, multiplier: int = 1) -> int:
+        added = 0
+        for _ in range(max(1, multiplier)):
+            for transition in transitions:
+                self.replay.add(
+                    transition.state,
+                    transition.action,
+                    transition.reward,
+                    transition.next_state,
+                    transition.done,
+                )
+                added += 1
+        self.metrics.replay_size = len(self.replay)
+        return added
+
+    def pretrain_from_demonstrations(self, transitions, steps: int | None = None) -> float | None:
+        if not transitions:
+            return None
+        total_steps = steps or self.config.demo.pretrain_steps
+        states = np.asarray([item.state for item in transitions], dtype=np.float32)
+        actions = np.asarray([item.action for item in transitions], dtype=np.int32)
+        batch_size = min(self.batch_size, len(transitions))
+        last_loss = None
+        with self.tf.device(self.device_info.training_device):
+            for _ in range(total_steps):
+                indices = np.random.choice(len(transitions), batch_size, replace=True)
+                last_loss = float(
+                    self._bc_train_step(
+                        states[indices],
+                        actions[indices],
+                    ).numpy()
+                )
+        return last_loss
+
     def remember(
         self,
         state: np.ndarray,
@@ -202,3 +236,17 @@ class DQNAgent:
 
             self._compiled_train_step = train_step
         return self._compiled_train_step
+
+    @property
+    def _bc_train_step(self):
+        if not hasattr(self, "_compiled_bc_train_step"):
+
+            @self.tf.function
+            def bc_train_step(states, actions):
+                q_values = self.online(states, training=True)
+                action_masks = self.tf.one_hot(actions, self.config.action_count)
+                selected_q = self.tf.reduce_sum(q_values * action_masks, axis=1)
+                return self.tf.reduce_mean(self.tf.square(1.0 - selected_q))
+
+            self._compiled_bc_train_step = bc_train_step
+        return self._compiled_bc_train_step

@@ -123,7 +123,7 @@ def detect_boost_bar(frame_rgb: np.ndarray) -> tuple[float, bool]:
         boost_level = min(1.0, green_ratio * 4.0)
 
     red_ratio = float(np.mean(red_mask > 0))
-    can_boost = boost_level >= 0.14 and not (boost_level < 0.08 and red_ratio > 0.12)
+    can_boost = not (boost_level < 0.05 and red_ratio > 0.18)
     return boost_level, can_boost
 
 

@@ -6,4 +6,7 @@ __pycache__/
 .mypy_cache/
 checkpoints/
 *.keras
+# Human demonstrations (optional, large)
+demonstrations/*.npz
+
 .DS_Store

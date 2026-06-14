@@ -54,34 +54,45 @@ class ObservationConfig:
 
 @dataclass(slots=True)
 class RewardConfig:
-    survival: float = 0.1
+    survival: float = 0.25
     score_gain: float = 1.0
-    altitude_gain: float = 0.5
+    altitude_gain: float = 0.8
     death: float = -50.0
-    idle_penalty: float = -0.05
-    idle_steps: int = 30
-    jump_penalty: float = -0.12
-    wasted_jump_penalty: float = -0.8
-    boost_gain: float = 3.0
-    boost_spent: float = -0.05
-    low_boost_penalty: float = -0.15
-    boost_jump_threshold: float = 0.18
+    early_death_penalty: float = -25.0
+    early_death_steps: int = 80
+    falling_penalty: float = -0.35
+    idle_penalty: float = -0.03
+    idle_steps: int = 40
+    wasted_jump_penalty: float = -0.35
+    boost_gain: float = 2.0
+    boost_spent: float = 0.0
+    low_boost_penalty: float = -0.05
+    boost_jump_threshold: float = 0.06
+    survival_step_bonus: float = 0.002
+
+
+@dataclass(slots=True)
+class DemoConfig:
+    save_dir: Path = Path("demonstrations")
+    replay_multiplier: int = 3
+    pretrain_steps: int = 300
+    use_demos_on_start: bool = True
 
 
 @dataclass(slots=True)
 class TrainingConfig:
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay: float = 0.995
+    epsilon_decay: float = 0.992
     replay_buffer_size: int = 50_000
     batch_size_cpu: int = 32
     batch_size_gpu: int = 64
-    min_replay_size: int = 1_000
-    target_sync_interval: int = 1_000
+    min_replay_size: int = 400
+    target_sync_interval: int = 800
     frame_skip: int = 4
-    train_every_cpu: int = 4
+    train_every_cpu: int = 2
     train_every_gpu: int = 1
     checkpoint_path: Path = Path("checkpoints/dqn_latest.keras")
     device_mode: DeviceMode = DeviceMode.AUTO
@@ -94,6 +105,7 @@ class AppConfig:
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    demo: DemoConfig = field(default_factory=DemoConfig)
 
     @property
     def action_count(self) -> int:

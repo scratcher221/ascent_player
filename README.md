@@ -86,3 +86,14 @@ device, and train-step latency.
 This is a learning scaffold, not a pre-trained bot. Expect early episodes to be
 mostly random. The DQN improves by collecting transitions, training from replay,
 and saving checkpoints under `checkpoints/`.
+
+## Human demonstrations
+
+See **[DEMO_RECORDING.md](DEMO_RECORDING.md)** for full instructions on recording
+your own playthroughs and training the agent from them.
+
+Quick summary:
+
+1. Click **Record demo** → play with `A` / `D` / `Space` → **Stop recording**
+2. Demos save to `demonstrations/`
+3. Keep **Load demonstrations on start** checked, then click **Start**

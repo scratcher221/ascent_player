@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
 
 from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
+from ascent_player.demo.recorder import DemoRecorder
+from ascent_player.demo.storage import load_all_demos
 from ascent_player.env.browser_backend import BrowserBackend, BrowserStatus
 from ascent_player.env.browser_discovery import discover_ascent_tab, list_chromium_windows
 from ascent_player.env.game_env import ACTION_LABELS, AscentGameEnv
@@ -43,6 +45,55 @@ class WorkerMetrics:
     device: str
     boost_level: float
     can_boost: bool
+
+
+class RecordingWorker(QThread):
+    frame_ready = pyqtSignal(bytes)
+    status_ready = pyqtSignal(str)
+    finished_ok = pyqtSignal(str)
+    error_ready = pyqtSignal(str)
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+
+    def run(self) -> None:
+        try:
+            asyncio.run(self._run_async())
+        except Exception as exc:
+            self.error_ready.emit(str(exc))
+
+    async def _run_async(self) -> None:
+        backend = BrowserBackend(self.config.browser)
+        env = AscentGameEnv(self.config, backend)
+        recorder = DemoRecorder(self.config, backend, env)
+        try:
+            self.status_ready.emit("Preparing demo recording...")
+            await recorder.prepare()
+            self.status_ready.emit(
+                "Recording: play in the browser with A / D / Space. Click Stop when done."
+            )
+            while self.running:
+                frame, action, done = await recorder.capture_step()
+                self.frame_ready.emit(qimage_bytes_from_frame(frame))
+                self.status_ready.emit(
+                    f"Recording demo | action={ACTION_LABELS[action]} | frames={len(recorder.transitions)}"
+                )
+                await backend.wait_ms(env._step_ms())
+                if done:
+                    self.status_ready.emit("Run ended — restarting for more recording...")
+                    recorder.reward_tracker.reset()
+                    recorder._last_state = None
+                    recorder._last_action = None
+                    await env.reset()
+            path = await recorder.stop_and_save()
+            self.finished_ok.emit(f"Saved demonstration: {path} ({len(recorder.transitions)} transitions)")
+        finally:
+            await env.close()
 
 
 class TrainingWorker(QThread):
@@ -95,6 +146,20 @@ class TrainingWorker(QThread):
             self.status_ready.emit(_format_browser_status(status))
             if not status.connected:
                 return
+
+            if self.config.demo.use_demos_on_start:
+                demos = load_all_demos(self.config)
+                if demos:
+                    added = agent.absorb_demonstrations(
+                        demos,
+                        multiplier=self.config.demo.replay_multiplier,
+                    )
+                    loss = agent.pretrain_from_demonstrations(demos)
+                    self.status_ready.emit(
+                        f"Loaded {added} demo transitions"
+                        + (f" | BC loss {loss:.4f}" if loss is not None else "")
+                    )
+
             state = await env.reset()
             episode_reward = 0.0
             episode_score = 0.0
@@ -174,6 +239,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.worker: TrainingWorker | None = None
+        self.recording_worker: RecordingWorker | None = None
 
         self.setWindowTitle("Ascent Neural Network Player")
         self.resize(1180, 760)
@@ -188,6 +254,9 @@ class MainWindow(QMainWindow):
         self.pause_button = QPushButton("Pause")
         self.save_button = QPushButton("Save checkpoint")
         self.load_button = QPushButton("Load checkpoint")
+        self.record_button = QPushButton("Record demo")
+        self.stop_record_button = QPushButton("Stop recording")
+        self.stop_record_button.setEnabled(False)
         self.pause_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.load_button.setEnabled(False)
@@ -205,6 +274,8 @@ class MainWindow(QMainWindow):
         side.addWidget(self.pause_button)
         side.addWidget(self.save_button)
         side.addWidget(self.load_button)
+        side.addWidget(self.record_button)
+        side.addWidget(self.stop_record_button)
         side.addStretch()
         body.addLayout(side, stretch=1)
         root_layout.addLayout(body)
@@ -220,6 +291,8 @@ class MainWindow(QMainWindow):
         self.params.changed.connect(self.apply_config_from_ui)
         self.save_button.clicked.connect(self.save_checkpoint)
         self.load_button.clicked.connect(self.load_checkpoint)
+        self.record_button.clicked.connect(self.start_recording)
+        self.stop_record_button.clicked.connect(self.stop_recording)
 
         self.rescan_timer = QTimer(self)
         self.rescan_timer.timeout.connect(self.rescan)
@@ -238,14 +311,43 @@ class MainWindow(QMainWindow):
         self.config.training.train_every_gpu = self.params.train_every.value()
         self.config.training.device_mode = DeviceMode(self.params.device.currentText())
         self.config.browser.auto_launch_on_miss = self.browser_panel.auto_launch.isChecked()
+        self.config.demo.use_demos_on_start = self.params.use_demos.isChecked()
         mode = self.params.mode.currentText()
         self.config.training.watch_mode = mode == "watch"
         if self.worker is not None:
             self.worker.set_watch_mode(mode == "watch")
             self.worker.set_paused(mode == "paused")
 
+    def start_recording(self) -> None:
+        if self.worker is not None or self.recording_worker is not None:
+            return
+        self.apply_config_from_ui()
+        self.recording_worker = RecordingWorker(self.config)
+        self.recording_worker.frame_ready.connect(self.preview.set_png)
+        self.recording_worker.status_ready.connect(self.status.setText)
+        self.recording_worker.finished_ok.connect(self.recording_finished)
+        self.recording_worker.error_ready.connect(self.show_error)
+        self.recording_worker.finished.connect(self.recording_worker_finished)
+        self.recording_worker.start()
+        self.record_button.setEnabled(False)
+        self.stop_record_button.setEnabled(True)
+        self.start_button.setEnabled(False)
+
+    def stop_recording(self) -> None:
+        if self.recording_worker is not None:
+            self.recording_worker.stop()
+
+    def recording_finished(self, message: str) -> None:
+        self.status.setText(message)
+
+    def recording_worker_finished(self) -> None:
+        self.recording_worker = None
+        self.record_button.setEnabled(True)
+        self.stop_record_button.setEnabled(False)
+        self.start_button.setEnabled(True)
+
     def start_training(self) -> None:
-        if self.worker is not None:
+        if self.worker is not None or self.recording_worker is not None:
             return
         self.apply_config_from_ui()
         self.worker = TrainingWorker(self.config)
@@ -270,7 +372,7 @@ class MainWindow(QMainWindow):
         self.pause_button.setText("Resume" if pause else "Pause")
 
     def rescan(self) -> None:
-        if self.worker is not None:
+        if self.worker is not None or self.recording_worker is not None:
             return
         self.browser_panel.set_status("Scanning for Ascent tab...")
         try:
@@ -343,6 +445,9 @@ class MainWindow(QMainWindow):
         self.load_button.setEnabled(False)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self.recording_worker is not None:
+            self.recording_worker.stop()
+            self.recording_worker.wait(5_000)
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait(5_000)

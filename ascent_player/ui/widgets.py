@@ -104,7 +104,7 @@ class HyperparameterPanel(QGroupBox):
         self.learning_rate.setDecimals(6)
         self.learning_rate.setRange(0.000001, 0.01)
         self.learning_rate.setSingleStep(0.00001)
-        self.learning_rate.setValue(0.0001)
+        self.learning_rate.setValue(0.0005)
 
         self.gamma = QDoubleSpinBox()
         self.gamma.setDecimals(3)
@@ -116,7 +116,7 @@ class HyperparameterPanel(QGroupBox):
         self.epsilon_decay.setDecimals(4)
         self.epsilon_decay.setRange(0.90, 0.9999)
         self.epsilon_decay.setSingleStep(0.0005)
-        self.epsilon_decay.setValue(0.995)
+        self.epsilon_decay.setValue(0.992)
 
         self.batch_size = QSpinBox()
         self.batch_size.setRange(1, 512)
@@ -124,15 +124,18 @@ class HyperparameterPanel(QGroupBox):
 
         self.train_every = QSpinBox()
         self.train_every.setRange(1, 60)
-        self.train_every.setValue(4)
+        self.train_every.setValue(2)
 
         self.min_replay = QSpinBox()
         self.min_replay.setRange(1, 100_000)
-        self.min_replay.setValue(1_000)
+        self.min_replay.setValue(400)
 
         self.frame_skip = QSpinBox()
         self.frame_skip.setRange(1, 20)
         self.frame_skip.setValue(4)
+
+        self.use_demos = QCheckBox("Load demonstrations on start")
+        self.use_demos.setChecked(True)
 
         layout = QFormLayout(self)
         layout.addRow("Mode", self.mode)
@@ -144,6 +147,7 @@ class HyperparameterPanel(QGroupBox):
         layout.addRow("Train every", self.train_every)
         layout.addRow("Min replay", self.min_replay)
         layout.addRow("Frame skip", self.frame_skip)
+        layout.addRow(self.use_demos)
 
         for widget in (
             self.mode,
@@ -160,6 +164,8 @@ class HyperparameterPanel(QGroupBox):
                 widget.valueChanged.connect(self.changed.emit)
             else:
                 widget.currentTextChanged.connect(self.changed.emit)
+
+        self.use_demos.toggled.connect(self.changed.emit)
 
 
 @dataclass(slots=True)

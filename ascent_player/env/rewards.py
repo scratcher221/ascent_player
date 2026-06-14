@@ -11,23 +11,33 @@ class RewardTracker:
     config: RewardConfig
     last_state: FrameState | None = None
     idle_steps: int = 0
+    episode_steps: int = 0
 
     def reset(self) -> None:
         self.last_state = None
         self.idle_steps = 0
+        self.episode_steps = 0
 
     def compute(self, state: FrameState, action: int) -> float:
+        self.episode_steps += 1
         reward = self.config.survival
+        reward += min(
+            self.episode_steps * self.config.survival_step_bonus,
+            self.config.survival * 2.0,
+        )
         previous = self.last_state
 
         if previous is not None:
             reward += self._score_reward(previous, state)
             reward += self._altitude_reward(previous, state)
+            reward += self._falling_penalty(previous, state)
             reward += self._idle_penalty(previous, state, action)
             reward += self._boost_reward(previous, state, action)
 
         if state.game_over:
             reward += self.config.death
+            if self.episode_steps < self.config.early_death_steps:
+                reward += self.config.early_death_penalty
 
         self.last_state = state
         return float(reward)
@@ -40,9 +50,16 @@ class RewardTracker:
     def _altitude_reward(self, previous: FrameState, state: FrameState) -> float:
         if previous.orb_y is None or state.orb_y is None:
             return 0.0
-        # In image coordinates, smaller y means higher on screen.
         altitude_gain = previous.orb_y - state.orb_y
         return max(0.0, altitude_gain / 100.0) * self.config.altitude_gain
+
+    def _falling_penalty(self, previous: FrameState, state: FrameState) -> float:
+        if previous.orb_y is None or state.orb_y is None:
+            return 0.0
+        fall = state.orb_y - previous.orb_y
+        if fall <= 6:
+            return 0.0
+        return (fall / 100.0) * self.config.falling_penalty
 
     def _idle_penalty(
         self,
@@ -54,7 +71,7 @@ class RewardTracker:
         falling = (
             previous.orb_y is not None
             and state.orb_y is not None
-            and state.orb_y > previous.orb_y
+            and state.orb_y > previous.orb_y + 4
         )
         if horizontal_action or not falling:
             self.idle_steps = 0
@@ -76,19 +93,17 @@ class RewardTracker:
             reward += boost_delta * self.config.boost_gain
 
         if action in JUMP_ACTIONS:
-            reward += self.config.jump_penalty
             if previous.boost_level < self.config.boost_jump_threshold:
                 reward += self.config.wasted_jump_penalty
-            elif boost_delta < -0.04:
-                reward += self.config.boost_spent
-                if (
-                    previous.orb_y is not None
-                    and state.orb_y is not None
-                    and state.orb_y >= previous.orb_y - 8
-                ):
-                    reward += self.config.wasted_jump_penalty * 0.5
+            elif (
+                boost_delta < -0.04
+                and previous.orb_y is not None
+                and state.orb_y is not None
+                and state.orb_y >= previous.orb_y - 8
+            ):
+                reward += self.config.wasted_jump_penalty
 
-        if state.boost_level < 0.12:
+        if state.boost_level < 0.05:
             reward += self.config.low_boost_penalty
 
         return reward
