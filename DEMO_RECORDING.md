@@ -15,6 +15,13 @@ folder. For every game step the app stores:
 | `rewards` | Shaped reward signal for that transition |
 | `next_states` | Observation after the action |
 | `dones` | Whether the run ended on that step |
+| `scores` | In-game height score at that step |
+| `episode_ids` | Which run within the recording session |
+| `peak_score` | Highest score reached in the file |
+
+High-score segments (1500+) are weighted more heavily during ingest. Record sessions
+that reach **2000+** when possible — timed boosts through mid-game gaps teach skills
+the agent rarely discovers on its own.
 
 Files are named like `demonstrations/demo_20260614_153045.npz`.
 

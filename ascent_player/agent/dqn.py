@@ -51,6 +51,8 @@ class DQNAgent:
         self.epsilon = config.training.epsilon_start
         self.metrics = AgentMetrics(epsilon=self.epsilon)
         self.replay = ReplayBuffer(config.training.replay_buffer_size)
+        self.demo_replay = ReplayBuffer(config.training.replay_buffer_size)
+        self.sim_replay = ReplayBuffer(config.training.replay_buffer_size)
         self.progress = TrainingProgress(
             baseline_episodes=config.training.baseline_episodes,
             epsilon=config.training.epsilon_start,
@@ -113,7 +115,7 @@ class DQNAgent:
         added = 0
         for _ in range(max(1, multiplier)):
             for transition in transitions:
-                self.replay.add(
+                self.demo_replay.add(
                     transition.state,
                     transition.action,
                     transition.reward,
@@ -134,6 +136,7 @@ class DQNAgent:
         *,
         multiplier: int = 1,
         indices: np.ndarray | None = None,
+        target_buffer: ReplayBuffer | None = None,
     ) -> int:
         expected_channels = self.config.observation.channel_count
         if (
@@ -142,12 +145,13 @@ class DQNAgent:
             or next_states.shape[-1] != expected_channels
         ):
             return 0
+        buffer = target_buffer or self.demo_replay
         if indices is None:
             indices = np.arange(len(actions), dtype=np.int64)
         added = 0
         for _ in range(max(1, multiplier)):
             for idx in indices:
-                self.replay.add(
+                buffer.add(
                     states[idx],
                     int(actions[idx]),
                     float(rewards[idx]),
@@ -159,14 +163,14 @@ class DQNAgent:
         return added
 
     def pretrain_from_replay(self, steps: int | None = None) -> float | None:
-        if len(self.replay) == 0:
+        if len(self.demo_replay) == 0:
             return None
         total_steps = steps or self.config.demo.pretrain_steps
-        batch_size = min(self.batch_size, len(self.replay))
+        batch_size = min(self.batch_size, len(self.demo_replay))
         last_loss = None
         with self.tf.device(self.device_info.training_device):
             for _ in range(total_steps):
-                batch = self.replay.sample(batch_size)
+                batch = self.demo_replay.sample(batch_size)
                 last_loss = float(
                     self._bc_train_step(
                         batch.states,
@@ -207,8 +211,11 @@ class DQNAgent:
         reward: float,
         next_state: np.ndarray,
         done: bool,
+        *,
+        sim: bool = False,
     ) -> None:
-        self.replay.add(state, action, reward, next_state, done)
+        buffer = self.sim_replay if sim else self.replay
+        buffer.add(state, action, reward, next_state, done)
         self.metrics.replay_size = len(self.replay)
 
     def maybe_train(self) -> AgentMetrics:
@@ -220,7 +227,7 @@ class DQNAgent:
         if self.metrics.total_steps % self.train_every != 0:
             return self.metrics
 
-        batch = self.replay.sample(self.batch_size)
+        batch = self._sample_training_batch()
         start = time.perf_counter()
         with self.tf.device(self.device_info.training_device):
             loss = self._train_batch(batch)
@@ -229,8 +236,34 @@ class DQNAgent:
         self.metrics.train_ms = elapsed_ms
 
         if self.metrics.total_steps % self.config.training.target_sync_interval == 0:
-            self.target.set_weights(self.online.get_weights())
+            self._sync_target_network(hard=True)
+        else:
+            self._sync_target_network(hard=False)
         return self.metrics
+
+    def _sample_training_batch(self) -> TransitionBatch:
+        batch_size = self.batch_size
+        sim_ratio = self.config.training.mixed_sim_replay_ratio
+        sim_count = 0
+        if len(self.sim_replay) > 0 and sim_ratio > 0:
+            sim_count = min(int(batch_size * sim_ratio), len(self.sim_replay))
+        rl_count = batch_size - sim_count
+        parts: list[TransitionBatch] = []
+        if rl_count > 0 and len(self.replay) >= rl_count:
+            parts.append(self.replay.sample(rl_count))
+        if sim_count > 0:
+            parts.append(self.sim_replay.sample(sim_count))
+        if not parts:
+            return self.replay.sample(min(batch_size, len(self.replay)))
+        if len(parts) == 1:
+            return parts[0]
+        return TransitionBatch(
+            states=np.concatenate([part.states for part in parts], axis=0),
+            actions=np.concatenate([part.actions for part in parts], axis=0),
+            rewards=np.concatenate([part.rewards for part in parts], axis=0),
+            next_states=np.concatenate([part.next_states for part in parts], axis=0),
+            dones=np.concatenate([part.dones for part in parts], axis=0),
+        )
 
     def end_episode(self) -> None:
         if self.config.training.watch_mode:
@@ -273,8 +306,41 @@ class DQNAgent:
         self._last_autosave_steps = steps
         return True
 
+    def prepare_transfer_from_sim(self) -> None:
+        self.set_learning_rate(self.config.training.transfer_learning_rate)
+        self.epsilon = self.config.training.transfer_epsilon_start
+        self.metrics.epsilon = self.epsilon
+        self.progress.epsilon = self.epsilon
+        self._promote_replay_for_mixed_transfer()
+
+    def _promote_replay_for_mixed_transfer(self) -> None:
+        ratio = self.config.training.mixed_sim_replay_ratio
+        if ratio <= 0 or len(self.replay) == 0:
+            return
+        keep = min(len(self.replay), int(self.replay.capacity * ratio * 2))
+        if keep <= 0:
+            return
+        batch = self.replay.sample(min(keep, len(self.replay)))
+        for idx in range(len(batch.actions)):
+            self.sim_replay.add(
+                batch.states[idx],
+                int(batch.actions[idx]),
+                float(batch.rewards[idx]),
+                batch.next_states[idx],
+                bool(batch.dones[idx]),
+            )
+
     def try_autoload(self) -> LoadResult:
         target = self.config.training.checkpoint_path
+        if self.config.training.transfer_from_sim:
+            sim_path = self.config.training.sim_checkpoint_path
+            if sim_path.exists() and self.load(sim_path):
+                self.prepare_transfer_from_sim()
+                message = (
+                    f"Loaded sim pretrain from {sim_path.name} — "
+                    f"fine-tuning with ε={self.epsilon:.2f}"
+                )
+                return LoadResult(True, message, self.progress)
         if not self.config.training.auto_load_checkpoint:
             return LoadResult(False, "Auto-load disabled — starting from scratch.")
         if not target.exists():
@@ -304,6 +370,9 @@ class DQNAgent:
         self.online.save(target)
         save_progress(target, self.progress)
         return target
+
+    def save_sim_checkpoint(self) -> Path:
+        return self.save(self.config.training.sim_checkpoint_path)
 
     def load(self, path: Path | None = None) -> bool:
         target = path or self.config.training.checkpoint_path
@@ -339,7 +408,35 @@ class DQNAgent:
         actions = self.tf.convert_to_tensor(batch.actions, dtype=self.tf.int32)
         rewards = self.tf.convert_to_tensor(batch.rewards, dtype=self.tf.float32)
         dones = self.tf.convert_to_tensor(batch.dones, dtype=self.tf.float32)
-        return self._train_step(states, actions, rewards, next_states, dones)
+        loss = self._train_step(states, actions, rewards, next_states, dones)
+        if (
+            len(self.demo_replay) > 0
+            and self.metrics.total_steps % max(1, self.config.demo.hybrid_bc_every) == 0
+        ):
+            demo_batch = self.demo_replay.sample(
+                min(self.batch_size, len(self.demo_replay))
+            )
+            bc_loss = self._bc_train_step(
+                self.tf.convert_to_tensor(demo_batch.states, dtype=self.tf.float32),
+                self.tf.convert_to_tensor(demo_batch.actions, dtype=self.tf.int32),
+            )
+            loss = loss + self.config.demo.bc_loss_weight * bc_loss
+        return loss
+
+    def _sync_target_network(self, *, hard: bool) -> None:
+        if hard:
+            self.target.set_weights(self.online.get_weights())
+            return
+        tau = self.config.training.soft_target_tau
+        if tau <= 0:
+            return
+        online_weights = self.online.get_weights()
+        target_weights = self.target.get_weights()
+        blended = [
+            tau * online + (1.0 - tau) * target
+            for online, target in zip(online_weights, target_weights, strict=True)
+        ]
+        self.target.set_weights(blended)
 
     @property
     def device_message(self) -> str:
@@ -358,30 +455,60 @@ class DQNAgent:
     @property
     def _train_step(self):
         if not hasattr(self, "_compiled_train_step"):
+            agent = self
+            action_count = agent.config.action_count
+            tf = agent.tf
+            neg_inf = tf.constant(-1e9, dtype=tf.float32)
 
             @self.tf.function
             def train_step(states, actions, rewards, next_states, dones):
-                next_q = self.target(next_states, training=False)
-                max_next_q = self.tf.reduce_max(next_q, axis=1)
-                targets = rewards + (1.0 - dones) * self.config.training.gamma * max_next_q
+                boost_levels = tf.reduce_mean(next_states[..., -2], axis=[1, 2])
+                can_boost = boost_levels * 100.0 >= agent.config.reward.boost_min_energy
+                action_idx = tf.range(action_count, dtype=tf.int32)
+                jump_actions = action_idx >= 3
+                allowed = tf.logical_or(
+                    ~jump_actions,
+                    tf.tile(can_boost[:, None], [1, action_count]),
+                )
+                mask = tf.cast(allowed, tf.float32)
 
-                with self.tf.GradientTape() as tape:
-                    q_values = self.online(states, training=True)
-                    action_masks = self.tf.one_hot(actions, self.config.action_count)
-                    selected_q = self.tf.reduce_sum(q_values * action_masks, axis=1)
-                    loss = self.tf.keras.losses.Huber()(targets, selected_q)
+                online_next_q = agent.online(next_states, training=False)
+                target_next_q = agent.target(next_states, training=False)
+                masked_online = tf.where(mask > 0.0, online_next_q, neg_inf)
+                masked_target = tf.where(mask > 0.0, target_next_q, neg_inf)
 
-                gradients = tape.gradient(loss, self.online.trainable_variables)
+                if agent.config.training.use_double_dqn:
+                    best_actions = tf.argmax(masked_online, axis=1, output_type=tf.int32)
+                    next_values = tf.reduce_sum(
+                        tf.one_hot(best_actions, action_count) * target_next_q,
+                        axis=1,
+                    )
+                else:
+                    next_values = tf.reduce_max(masked_target, axis=1)
+
+                targets = rewards + (1.0 - dones) * agent.config.training.gamma * next_values
+
+                with tf.GradientTape() as tape:
+                    q_values = agent.online(states, training=True)
+                    action_masks = tf.one_hot(actions, action_count)
+                    selected_q = tf.reduce_sum(q_values * action_masks, axis=1)
+                    loss = tf.keras.losses.Huber()(targets, selected_q)
+
+                gradients = tape.gradient(loss, agent.online.trainable_variables)
+                clipped, _ = tf.clip_by_global_norm(
+                    gradients,
+                    agent.config.training.gradient_clip_norm,
+                )
                 gradient_pairs = [
                     (gradient, variable)
                     for gradient, variable in zip(
-                        gradients,
-                        self.online.trainable_variables,
+                        clipped,
+                        agent.online.trainable_variables,
                         strict=True,
                     )
                     if gradient is not None
                 ]
-                self.online.optimizer.apply_gradients(gradient_pairs)
+                agent.online.optimizer.apply_gradients(gradient_pairs)
                 return loss
 
             self._compiled_train_step = train_step
@@ -390,13 +517,38 @@ class DQNAgent:
     @property
     def _bc_train_step(self):
         if not hasattr(self, "_compiled_bc_train_step"):
+            agent = self
+            tf = agent.tf
 
             @self.tf.function
             def bc_train_step(states, actions):
-                q_values = self.online(states, training=True)
-                action_masks = self.tf.one_hot(actions, self.config.action_count)
-                selected_q = self.tf.reduce_sum(q_values * action_masks, axis=1)
-                return self.tf.reduce_mean(self.tf.square(1.0 - selected_q))
+                with tf.GradientTape() as tape:
+                    q_values = agent.online(states, training=True)
+                    loss = tf.keras.losses.SparseCategoricalCrossentropy(
+                        from_logits=True
+                    )(actions, q_values)
+                gradients = tape.gradient(loss, agent.online.trainable_variables)
+                clipped, _ = tf.clip_by_global_norm(
+                    gradients,
+                    agent.config.training.gradient_clip_norm,
+                )
+                gradient_pairs = [
+                    (gradient, variable)
+                    for gradient, variable in zip(
+                        clipped,
+                        agent.online.trainable_variables,
+                        strict=True,
+                    )
+                    if gradient is not None
+                ]
+                agent.online.optimizer.apply_gradients(gradient_pairs)
+                return loss
 
             self._compiled_bc_train_step = bc_train_step
         return self._compiled_bc_train_step
+
+    def weight_norm(self) -> float:
+        total = 0.0
+        for weight in self.online.get_weights():
+            total += float(np.sum(np.square(weight)))
+        return float(np.sqrt(total))

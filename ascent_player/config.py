@@ -61,33 +61,42 @@ class ObservationConfig:
 
 @dataclass(slots=True)
 class RewardConfig:
-    survival: float = 0.25
-    score_gain: float = 1.0
-    altitude_gain: float = 0.8
-    death: float = -50.0
-    early_death_penalty: float = -25.0
+    survival: float = 0.015
+    score_gain: float = 0.01
+    altitude_gain: float = 0.025
+    death: float = -1.0
+    early_death_penalty: float = -0.5
     early_death_steps: int = 80
-    falling_penalty: float = -0.35
-    idle_penalty: float = -0.03
+    falling_penalty: float = -0.025
+    idle_penalty: float = -0.01
     idle_steps: int = 40
-    wasted_jump_penalty: float = -0.35
-    boost_gain: float = 2.0
-    boost_spent: float = 0.0
-    low_boost_penalty: float = -0.05
+    wasted_jump_penalty: float = -0.08
+    boost_gain: float = 0.05
+    boost_spent: float = -0.04
+    low_boost_penalty: float = -0.005
     boost_jump_threshold: float = 0.06
     boost_min_energy: float = 14.0
-    empty_boost_jump_penalty: float = -1.0
-    survival_step_bonus: float = 0.002
-    platform_align: float = 0.45
-    platform_fall_weight: float = 2.0
+    empty_boost_jump_penalty: float = -0.25
+    survival_step_bonus: float = 0.0001
+    platform_align: float = 0.04
+    platform_fall_weight: float = 1.5
+    score_stagnation_steps: int = 90
+    score_stagnation_penalty: float = -0.02
+    milestone_scores: tuple[int, ...] = (500, 1000, 1500, 2000, 2500)
+    milestone_bonus: float = 0.2
+    reward_clip: float = 1.0
 
 
 @dataclass(slots=True)
 class DemoConfig:
     save_dir: Path = Path("demonstrations")
-    replay_multiplier: int = 3
-    pretrain_steps: int = 300
+    replay_multiplier: int = 2
+    pretrain_steps: int = 800
     use_demos_on_start: bool = True
+    min_episode_score: float = 0.0
+    high_score_weight: float = 2.0
+    bc_loss_weight: float = 0.15
+    hybrid_bc_every: int = 4
     # Keep at least this much RAM free for the OS while loading demos.
     os_memory_reserve_mb: int = 2048
     # Hard cap on unique demo transitions; None = derive from available memory.
@@ -96,7 +105,7 @@ class DemoConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
-    learning_rate: float = 5e-4
+    learning_rate: float = 2e-4
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
@@ -106,16 +115,26 @@ class TrainingConfig:
     batch_size_gpu: int = 64
     min_replay_size: int = 400
     target_sync_interval: int = 800
+    soft_target_tau: float = 0.005
+    gradient_clip_norm: float = 10.0
+    use_double_dqn: bool = True
     frame_skip: int = 1
     game_fps: float = 60.0
     async_training: bool = True
     train_every_cpu: int = 4
     train_every_gpu: int = 2
     checkpoint_path: Path = Path("checkpoints/dqn_latest.keras")
+    sim_checkpoint_path: Path = Path("checkpoints/sim_pretrained.keras")
     auto_load_checkpoint: bool = True
     autosave_every_episodes: int = 1
     autosave_every_steps: int = 250
     baseline_episodes: int = 5
+    sim_mode: bool = False
+    sim_pretrain_steps: int = 0
+    transfer_from_sim: bool = False
+    transfer_learning_rate: float = 1e-4
+    transfer_epsilon_start: float = 0.3
+    mixed_sim_replay_ratio: float = 0.1
     device_mode: DeviceMode = DeviceMode.AUTO
     watch_mode: bool = False
 

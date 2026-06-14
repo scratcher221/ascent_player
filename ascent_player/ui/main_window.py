@@ -56,6 +56,7 @@ class WorkerMetrics:
     best_reward: float
     best_score: float
     recent_avg_reward: float | None
+    score_velocity: float
     autosave_message: str
 
 
@@ -98,9 +99,7 @@ class RecordingWorker(QThread):
                 await backend.wait_ms(env._step_ms())
                 if done:
                     self.status_ready.emit("Run ended — restarting for more recording...")
-                    recorder.reward_tracker.reset()
-                    recorder._last_state = None
-                    recorder._last_action = None
+                    recorder.on_episode_end()
                     await env.reset()
             path = await recorder.stop_and_save()
             self.finished_ok.emit(f"Saved demonstration: {path} ({len(recorder.transitions)} transitions)")
@@ -221,6 +220,8 @@ class TrainingWorker(QThread):
             episode_reward = 0.0
             episode_score = 0.0
             episode_max_score = 0.0
+            prev_step_score = 0.0
+            score_velocity = 0.0
             self.sync_agent_hyperparameters(agent)
             while self.running:
                 if self.paused:
@@ -260,6 +261,8 @@ class TrainingWorker(QThread):
                 if result.frame_state.score is not None:
                     episode_score = float(result.frame_state.score)
                     episode_max_score = max(episode_max_score, episode_score)
+                    score_velocity = episode_score - prev_step_score
+                    prev_step_score = episode_score
 
                 step_ms = (time.perf_counter() - step_started) * 1000.0
                 if step_ms > 0:
@@ -296,6 +299,7 @@ class TrainingWorker(QThread):
                             ),
                             best_score=progress.best_score,
                             recent_avg_reward=progress.recent_avg_reward,
+                            score_velocity=score_velocity,
                             autosave_message=autosave_message,
                         )
                     )
@@ -318,6 +322,8 @@ class TrainingWorker(QThread):
                     episode_reward = 0.0
                     episode_score = 0.0
                     episode_max_score = 0.0
+                    prev_step_score = 0.0
+                    score_velocity = 0.0
                     state = await env.reset()
                 elif agent.maybe_autosave():
                     autosave_message = f"Autosave: step {metrics.total_steps:,} saved"
@@ -543,6 +549,7 @@ class MainWindow(QMainWindow):
             metrics.vs_baseline_pct,
             metrics.best_reward,
         )
+        self.progress_panel.set_score_velocity(metrics.score_velocity)
         self.progress_panel.set_autosave(metrics.autosave_message)
         self.status.setText(
             " | ".join(

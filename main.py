@@ -34,6 +34,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a minimal training loop without the PyQt interface",
     )
+    parser.add_argument(
+        "--sim",
+        action="store_true",
+        help="Use the headless physics simulator instead of the browser",
+    )
+    parser.add_argument(
+        "--pretrain-steps",
+        type=int,
+        default=0,
+        help="Run fast simulator pretraining for N environment steps",
+    )
+    parser.add_argument(
+        "--transfer-from-sim",
+        action="store_true",
+        help="Load the simulator checkpoint and fine-tune in the browser",
+    )
+    parser.add_argument(
+        "--calibrate-sim",
+        action="store_true",
+        help="Run a short random-policy calibration report for the simulator",
+    )
     return parser.parse_args()
 
 
@@ -44,9 +65,14 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     config.browser.chromium_path = args.chromium_path
     config.training.device_mode = DeviceMode(args.device)
     config.training.watch_mode = args.watch
+    config.training.sim_mode = args.sim
+    config.training.sim_pretrain_steps = max(0, int(args.pretrain_steps))
+    config.training.transfer_from_sim = args.transfer_from_sim
     if args.watch:
         config.training.epsilon_start = 0.0
         config.training.epsilon_end = 0.0
+    if args.transfer_from_sim and not args.sim:
+        config.training.frame_skip = max(config.training.frame_skip, 2)
     return config
 
 
@@ -64,8 +90,18 @@ def run_ui(config: AppConfig) -> int:
 def run_no_ui(config: AppConfig) -> int:
     import asyncio
 
-    from ascent_player.training import run_training_no_ui
+    from ascent_player.training import (
+        run_sim_calibration,
+        run_sim_pretrain,
+        run_training_no_ui,
+    )
 
+    if config.training.sim_pretrain_steps > 0:
+        asyncio.run(run_sim_pretrain(config, config.training.sim_pretrain_steps))
+        return 0
+    if config.training.sim_mode and "--calibrate-sim" in sys.argv:
+        asyncio.run(run_sim_calibration(config))
+        return 0
     asyncio.run(run_training_no_ui(config))
     return 0
 
@@ -73,6 +109,22 @@ def run_no_ui(config: AppConfig) -> int:
 def main() -> int:
     args = parse_args()
     config = build_config(args)
+    if args.calibrate_sim:
+        import asyncio
+
+        from ascent_player.training import run_sim_calibration
+
+        config.training.sim_mode = True
+        asyncio.run(run_sim_calibration(config))
+        return 0
+    if args.pretrain_steps > 0:
+        config.training.sim_mode = True
+        import asyncio
+
+        from ascent_player.training import run_sim_pretrain
+
+        asyncio.run(run_sim_pretrain(config, args.pretrain_steps))
+        return 0
     if args.no_ui:
         return run_no_ui(config)
     return run_ui(config)

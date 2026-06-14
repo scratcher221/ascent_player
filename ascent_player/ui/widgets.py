@@ -45,12 +45,14 @@ class ProgressPanel(QGroupBox):
         self.baseline = QLabel("Baseline: measuring…")
         self.best_ever = QLabel("Best score: —")
         self.comparison = QLabel("Vs baseline: —")
+        self.score_velocity = QLabel("Score velocity: —")
         self.autosave = QLabel("Autosave: —")
         layout = QVBoxLayout(self)
         layout.addWidget(self.session)
         layout.addWidget(self.baseline)
         layout.addWidget(self.best_ever)
         layout.addWidget(self.comparison)
+        layout.addWidget(self.score_velocity)
         layout.addWidget(self.autosave)
         self.set_session("Session: not started")
 
@@ -91,6 +93,14 @@ class ProgressPanel(QGroupBox):
             f"Recent avg {current_reward:.1f} | vs baseline {sign}{vs_baseline_pct:.0f}% "
             f"| best {best_reward:.1f}"
         )
+
+    def set_score_velocity(self, velocity: float) -> None:
+        if velocity > 0:
+            self.score_velocity.setText(f"Score velocity: +{velocity:.1f} / step")
+        elif velocity < 0:
+            self.score_velocity.setText(f"Score velocity: {velocity:.1f} / step")
+        else:
+            self.score_velocity.setText("Score velocity: flat")
 
     def set_autosave(self, text: str) -> None:
         self.autosave.setText(text)
