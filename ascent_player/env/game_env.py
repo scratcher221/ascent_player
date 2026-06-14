@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ascent_player.config import AppConfig
-from ascent_player.env.browser_backend import BrowserBackend
+from ascent_player.env.browser_backend import BrowserBackend, HudSnapshot
 from ascent_player.env.rewards import RewardTracker
 from ascent_player.env.state_detector import (
     FrameState,
@@ -78,8 +78,8 @@ class AscentGameEnv:
         await self._release_all()
         await self.backend.force_open_game()
         await self._start_or_restart()
-        frame = await self._capture_frame()
-        frame_state = await self._detect_state(frame)
+        frame, hud = await self._capture_turn()
+        frame_state = await self._detect_state(frame, hud)
         self._last_frame_state = frame_state
         gray = preprocess_frame(frame, self.config.observation)
         self.frame_stack.reset(gray)
@@ -93,9 +93,18 @@ class AscentGameEnv:
     async def step(self, action: int) -> StepResult:
         action = mask_jump_action(action, self.can_boost)
         await self._apply_action(action)
-        await self.backend.wait_ms(self._step_ms())
-        frame = await self._capture_frame()
-        frame_state = await self._detect_state(frame)
+
+        frames = max(1, self.config.training.frame_skip)
+        frame_ms = self._frame_ms()
+        frame: np.ndarray | None = None
+        hud = HudSnapshot()
+        for index in range(frames):
+            await self.backend.wait_ms(frame_ms)
+            if index == frames - 1:
+                frame, hud = await self._capture_turn()
+
+        assert frame is not None
+        frame_state = await self._detect_state(frame, hud)
         self._last_frame_state = frame_state
         self.recent_states.append(frame_state)
         state = build_observation(
@@ -121,16 +130,24 @@ class AscentGameEnv:
         await self._release_all()
         await self.backend.stop()
 
-    async def _capture_frame(self) -> np.ndarray:
-        frame = await self.backend.canvas_screenshot()
+    async def _capture_turn(self) -> tuple[np.ndarray, HudSnapshot]:
+        frame, hud = await self.backend.capture_turn(include_hud=True)
         self.last_raw_frame = frame
-        return frame
+        return frame, hud
 
-    async def _detect_state(self, frame: np.ndarray) -> FrameState:
+    async def _detect_state(
+        self,
+        frame: np.ndarray,
+        hud: HudSnapshot | None = None,
+    ) -> FrameState:
         state = detect_from_frame(frame)
-        hud_score = await self.backend.read_game_score()
-        if hud_score is not None:
-            state.score = hud_score
+        if hud is not None and hud.score is not None:
+            state.score = hud.score
+        if hud is not None:
+            if hud.fell:
+                state.game_over = True
+            if hud.in_menu:
+                state.in_menu = True
         interval = max(1, self.config.browser.dom_poll_interval)
         if self._step_count % interval == 0:
             body_text = await self.backend.text_content()
@@ -186,6 +203,9 @@ class AscentGameEnv:
             finally:
                 self.held_keys.discard(key)
 
+    def _frame_ms(self) -> int:
+        fps = max(30.0, float(self.config.training.game_fps))
+        return max(8, int(round(1000.0 / fps)))
+
     def _step_ms(self) -> int:
-        frame_ms = 1000 / 60
-        return max(16, int(frame_ms * self.config.training.frame_skip))
+        return self._frame_ms() * max(1, self.config.training.frame_skip)

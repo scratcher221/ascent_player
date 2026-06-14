@@ -124,7 +124,7 @@ class HyperparameterPanel(QGroupBox):
 
         self.train_every = QSpinBox()
         self.train_every.setRange(1, 60)
-        self.train_every.setValue(2)
+        self.train_every.setValue(4)
 
         self.min_replay = QSpinBox()
         self.min_replay.setRange(1, 100_000)
@@ -132,7 +132,7 @@ class HyperparameterPanel(QGroupBox):
 
         self.frame_skip = QSpinBox()
         self.frame_skip.setRange(1, 20)
-        self.frame_skip.setValue(4)
+        self.frame_skip.setValue(1)
 
         self.use_demos = QCheckBox("Load demonstrations on start")
         self.use_demos.setChecked(True)

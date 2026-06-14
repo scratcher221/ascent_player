@@ -12,6 +12,43 @@ from PIL import Image
 from ascent_player.config import BrowserConfig
 from ascent_player.env.browser_discovery import CdpTab, discover_ascent_tab
 
+_CAPTURE_TURN_JS = """
+(args) => {
+    const { selector, maxWidth, maxHeight, quality } = args;
+    const hud = { score: null, fell: false, inMenu: false, dataUrl: null };
+    const scoreNode = document.querySelector('#heightScore');
+    if (scoreNode) {
+        const digits = (scoreNode.textContent || '').replace(/\\D/g, '');
+        if (digits) hud.score = parseInt(digits, 10);
+    }
+    const body = document.body ? document.body.innerText.toUpperCase() : '';
+    hud.fell = body.includes('FELL') || body.includes('BACK TO EARTH');
+    hud.inMenu = body.includes('START THE ASCENT') || body.includes('PICK 1 ULTI');
+
+    const canvas = document.querySelector(selector);
+    if (!canvas) return hud;
+    try {
+        const scale = Math.min(
+            maxWidth / Math.max(canvas.width, 1),
+            maxHeight / Math.max(canvas.height, 1),
+            1
+        );
+        const width = Math.max(1, Math.round(canvas.width * scale));
+        const height = Math.max(1, Math.round(canvas.height * scale));
+        const scratch = document.createElement('canvas');
+        scratch.width = width;
+        scratch.height = height;
+        const ctx = scratch.getContext('2d', { willReadFrequently: true });
+        if (!ctx) return hud;
+        ctx.drawImage(canvas, 0, 0, width, height);
+        hud.dataUrl = scratch.toDataURL('image/jpeg', quality);
+    } catch (error) {
+        return hud;
+    }
+    return hud;
+}
+"""
+
 _CANVAS_DATA_URL_JS = """
 (selector) => {
     const canvas = document.querySelector(selector);
@@ -38,6 +75,13 @@ _READ_SCORE_JS = """
     return digits ? parseInt(digits, 10) : 0;
 }
 """
+
+
+@dataclass(slots=True)
+class HudSnapshot:
+    score: int | None = None
+    fell: bool = False
+    in_menu: bool = False
 
 
 @dataclass(slots=True)
@@ -166,23 +210,57 @@ class BrowserBackend:
             pass
 
     async def canvas_screenshot(self) -> np.ndarray:
+        frame, _ = await self.capture_turn(include_hud=False)
+        return frame
+
+    async def capture_turn(self, *, include_hud: bool = True) -> tuple[np.ndarray, HudSnapshot]:
         self._require_page()
         if self.config.use_js_canvas_capture:
-            frame = await self._canvas_screenshot_js()
+            frame, hud = await self._capture_turn_js(include_hud=include_hud)
             if frame is not None:
-                return frame
-        return await self._canvas_screenshot_playwright()
+                return frame, hud
+        frame = await self._canvas_screenshot_playwright()
+        hud = HudSnapshot()
+        if include_hud:
+            hud.score = await self.read_game_score()
+        return frame, hud
 
-    async def _canvas_screenshot_js(self) -> np.ndarray | None:
-        data_url = await self.page.evaluate(
-            _CANVAS_DATA_URL_JS,
-            self.config.canvas_selector,
+    async def _capture_turn_js(
+        self,
+        *,
+        include_hud: bool,
+    ) -> tuple[np.ndarray | None, HudSnapshot]:
+        payload = await self.page.evaluate(
+            _CAPTURE_TURN_JS,
+            {
+                "selector": self.config.canvas_selector,
+                "maxWidth": self.config.capture_max_width,
+                "maxHeight": self.config.capture_max_height,
+                "quality": self.config.capture_jpeg_quality,
+            },
         )
-        if not isinstance(data_url, str) or not data_url.startswith("data:image/png;base64,"):
-            return None
+        if not isinstance(payload, dict):
+            return None, HudSnapshot()
+
+        hud = HudSnapshot()
+        if include_hud:
+            score = payload.get("score")
+            if score is not None:
+                hud.score = int(score)
+            hud.fell = bool(payload.get("fell"))
+            hud.in_menu = bool(payload.get("inMenu"))
+
+        data_url = payload.get("dataUrl")
+        if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+            return None, hud
+
         raw = base64.b64decode(data_url.split(",", 1)[1])
         image = Image.open(io.BytesIO(raw)).convert("RGB")
-        return np.asarray(image)
+        return np.asarray(image), hud
+
+    async def _canvas_screenshot_js(self) -> np.ndarray | None:
+        frame, _ = await self._capture_turn_js(include_hud=False)
+        return frame
 
     async def _canvas_screenshot_playwright(self) -> np.ndarray:
         locator = self.page.locator(self.config.canvas_selector)

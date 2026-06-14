@@ -44,13 +44,16 @@ class DemoRecorder:
         self._last_action = None
 
     async def capture_step(self) -> tuple[np.ndarray, int, bool]:
-        frame = await self.backend.canvas_screenshot()
+        frame, hud = await self.backend.capture_turn(include_hud=True)
         key_state = await read_keyboard_state(self.backend.page)
         action = keys_to_action(key_state)
         frame_state = detect_from_frame(frame)
-        hud_score = await self.backend.read_game_score()
-        if hud_score is not None:
-            frame_state.score = hud_score
+        if hud.score is not None:
+            frame_state.score = hud.score
+        if hud.fell:
+            frame_state.game_over = True
+        if hud.in_menu:
+            frame_state.in_menu = True
         if len(self.transitions) % max(1, self.config.browser.dom_poll_interval) == 0:
             body_text = await self.backend.text_content()
             frame_state = merge_dom_state(frame_state, body_text)

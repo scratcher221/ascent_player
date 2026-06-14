@@ -37,7 +37,12 @@ class BrowserConfig:
     # Read canvas pixels via JS instead of Playwright element screenshots.
     # Element screenshots scroll into view and cause visible flicker.
     use_js_canvas_capture: bool = True
-    dom_poll_interval: int = 12
+    dom_poll_interval: int = 24
+    hud_poll_interval: int = 1
+    # Downscale before JPEG transfer to cut CDP latency (detection uses ratios).
+    capture_max_width: int = 640
+    capture_max_height: int = 360
+    capture_jpeg_quality: float = 0.82
 
 
 @dataclass(slots=True)
@@ -99,9 +104,11 @@ class TrainingConfig:
     batch_size_gpu: int = 64
     min_replay_size: int = 400
     target_sync_interval: int = 800
-    frame_skip: int = 4
-    train_every_cpu: int = 2
-    train_every_gpu: int = 1
+    frame_skip: int = 1
+    game_fps: float = 60.0
+    async_training: bool = True
+    train_every_cpu: int = 4
+    train_every_gpu: int = 2
     checkpoint_path: Path = Path("checkpoints/dqn_latest.keras")
     device_mode: DeviceMode = DeviceMode.AUTO
     watch_mode: bool = False

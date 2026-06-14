@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+import time
 
 from PyQt6.QtCore import QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -14,7 +16,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ascent_player.agent.dqn import DQNAgent
+from ascent_player.agent.dqn import AgentMetrics, DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.demo.recorder import DemoRecorder
 from ascent_player.demo.ingest import ingest_demonstrations
@@ -45,6 +47,7 @@ class WorkerMetrics:
     device: str
     boost_level: float
     can_boost: bool
+    loop_hz: float
 
 
 class RecordingWorker(QThread):
@@ -111,7 +114,23 @@ class TrainingWorker(QThread):
         self.watch_mode = config.training.watch_mode
         self.save_requested = False
         self.load_requested = False
-        self._preview_stride = 2
+        self._preview_stride = 4
+        self._metrics_stride = 2
+        self._train_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dqn-train")
+        self._train_future: Future | None = None
+        self._loop_hz = 0.0
+        self._executor_closed = False
+
+    def shutdown(self) -> None:
+        if self._executor_closed:
+            return
+        self._executor_closed = True
+        if self._train_future is not None and self._train_future.done():
+            try:
+                self._train_future.result()
+            except Exception:
+                pass
+        self._train_executor.shutdown(wait=False, cancel_futures=True)
 
     def stop(self) -> None:
         self.running = False
@@ -128,6 +147,39 @@ class TrainingWorker(QThread):
 
     def request_load(self) -> None:
         self.load_requested = True
+
+    def sync_agent_hyperparameters(self, agent: DQNAgent) -> None:
+        agent.set_train_every(
+            self.config.training.train_every_gpu
+            if agent.device_info.training_device.startswith("/GPU")
+            else self.config.training.train_every_cpu
+        )
+        agent.set_batch_size(
+            self.config.training.batch_size_gpu
+            if agent.device_info.training_device.startswith("/GPU")
+            else self.config.training.batch_size_cpu
+        )
+        agent.set_learning_rate(self.config.training.learning_rate)
+
+    def _collect_train_metrics(self, agent: DQNAgent) -> None:
+        if self._train_future is None or not self._train_future.done():
+            return
+        try:
+            self._train_future.result()
+        except Exception:
+            pass
+        finally:
+            self._train_future = None
+
+    def _schedule_training(self, agent: DQNAgent) -> AgentMetrics:
+        if self.config.training.watch_mode:
+            return agent.metrics
+        if not self.config.training.async_training:
+            return agent.maybe_train()
+        if self._train_future is not None and not self._train_future.done():
+            return agent.metrics
+        self._train_future = self._train_executor.submit(agent.maybe_train)
+        return agent.metrics
 
     def run(self) -> None:
         try:
@@ -155,10 +207,13 @@ class TrainingWorker(QThread):
             state = await env.reset()
             episode_reward = 0.0
             episode_score = 0.0
+            self.sync_agent_hyperparameters(agent)
             while self.running:
                 if self.paused:
                     await asyncio.sleep(0.1)
                     continue
+                self.sync_agent_hyperparameters(agent)
+                self._collect_train_metrics(agent)
                 if self.load_requested:
                     loaded = agent.load()
                     self.status_ready.emit(
@@ -170,6 +225,7 @@ class TrainingWorker(QThread):
                     self.status_ready.emit(f"Saved checkpoint: {path}")
                     self.save_requested = False
 
+                step_started = time.perf_counter()
                 action = agent.act(
                     state,
                     training=not self.watch_mode,
@@ -183,30 +239,37 @@ class TrainingWorker(QThread):
                     result.state,
                     result.done,
                 )
-                metrics = agent.maybe_train()
+                metrics = self._schedule_training(agent)
                 state = result.state
                 episode_reward += result.reward
                 if result.frame_state.score is not None:
                     episode_score = float(result.frame_state.score)
 
+                step_ms = (time.perf_counter() - step_started) * 1000.0
+                if step_ms > 0:
+                    instant_hz = 1000.0 / step_ms
+                    self._loop_hz = (0.85 * self._loop_hz) + (0.15 * instant_hz)
+
                 if metrics.total_steps % self._preview_stride == 0:
                     self.frame_ready.emit(qimage_bytes_from_frame(result.raw_frame))
-                self.metrics_ready.emit(
-                    WorkerMetrics(
-                        episode=episode,
-                        episode_reward=episode_reward,
-                        episode_score=episode_score,
-                        epsilon=agent.epsilon,
-                        action=ACTION_LABELS.get(action, str(action)),
-                        replay_size=metrics.replay_size,
-                        total_steps=metrics.total_steps,
-                        loss=metrics.loss,
-                        train_ms=metrics.train_ms,
-                        device=agent.device_message,
-                        boost_level=env.boost_level,
-                        can_boost=env.can_boost,
+                if metrics.total_steps % self._metrics_stride == 0 or result.done:
+                    self.metrics_ready.emit(
+                        WorkerMetrics(
+                            episode=episode,
+                            episode_reward=episode_reward,
+                            episode_score=episode_score,
+                            epsilon=agent.epsilon,
+                            action=ACTION_LABELS.get(action, str(action)),
+                            replay_size=metrics.replay_size,
+                            total_steps=metrics.total_steps,
+                            loss=metrics.loss,
+                            train_ms=metrics.train_ms,
+                            device=agent.device_message,
+                            boost_level=env.boost_level,
+                            can_boost=env.can_boost,
+                            loop_hz=self._loop_hz,
+                        )
                     )
-                )
 
                 if result.done:
                     self.episode_ready.emit(
@@ -224,7 +287,9 @@ class TrainingWorker(QThread):
                     episode_score = 0.0
                     state = await env.reset()
         finally:
+            self._collect_train_metrics(agent)
             await env.close()
+            self.shutdown()
 
 
 class MainWindow(QMainWindow):
@@ -422,6 +487,7 @@ class MainWindow(QMainWindow):
                     f"steps {metrics.total_steps}",
                     f"loss {loss}",
                     f"train {train_ms}",
+                    f"loop {metrics.loop_hz:.1f}Hz",
                     metrics.device,
                 ]
             )
