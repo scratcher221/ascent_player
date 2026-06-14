@@ -1,4 +1,6 @@
-tensorflow[and-cuda]>=2.15
+# TensorFlow requires Python 3.10–3.12. Python 3.13+ has no stable wheels yet.
+# Create the venv with: python3.11 -m venv .venv
+tensorflow[and-cuda]>=2.15; python_version < "3.13"
 playwright>=1.40
 PyQt6>=6.6
 numpy>=1.24

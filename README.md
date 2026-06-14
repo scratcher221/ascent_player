@@ -14,16 +14,22 @@ The game controls are `A` for left, `D` for right, and `Space` for jump/boost.
 
 ## Setup
 
+**Python 3.10–3.12 required.** TensorFlow does not publish wheels for Python
+3.13+ yet. On this machine, use Python 3.11:
+
 ```bash
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-TensorFlow will use a compatible GPU when one is available. If
-`tensorflow[and-cuda]` is not supported on your system, install the CPU wheel
-instead:
+If you see `No matching distribution found for tensorflow`, your venv was
+probably created with a newer Python (for example 3.14). Recreate it with
+`python3.11 -m venv .venv`.
+
+TensorFlow will use a compatible GPU when one is available via
+`tensorflow[and-cuda]`. For CPU-only installs:
 
 ```bash
 pip install tensorflow
