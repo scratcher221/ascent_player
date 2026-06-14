@@ -38,6 +38,64 @@ class PreviewWidget(QLabel):
         )
 
 
+class ProgressPanel(QGroupBox):
+    def __init__(self) -> None:
+        super().__init__("Training progress")
+        self.session = QLabel("Session: not started")
+        self.baseline = QLabel("Baseline: measuring…")
+        self.best_ever = QLabel("Best score: —")
+        self.comparison = QLabel("Vs baseline: —")
+        self.autosave = QLabel("Autosave: —")
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.session)
+        layout.addWidget(self.baseline)
+        layout.addWidget(self.best_ever)
+        layout.addWidget(self.comparison)
+        layout.addWidget(self.autosave)
+        self.set_session("Session: not started")
+
+    def set_session(self, text: str) -> None:
+        self.session.setText(text)
+
+    def set_baseline(self, reward: float | None, score: float | None) -> None:
+        if reward is None or score is None:
+            self.baseline.setText("Baseline: measuring first episodes…")
+            return
+        self.baseline.setText(f"Baseline: reward {reward:.1f} | score {score:.1f}")
+
+    def set_best_ever(self, best_score: float, best_reward: float) -> None:
+        if best_score <= 0:
+            self.best_ever.setText("Best score: none yet")
+            return
+        reward_text = ""
+        if best_reward > 0 and best_reward != float("inf"):
+            reward_text = f" | best reward {best_reward:.1f}"
+        self.best_ever.setText(f"Best score: {best_score:.0f}{reward_text}")
+
+    def set_comparison(
+        self,
+        current_reward: float | None,
+        vs_baseline_pct: float | None,
+        best_reward: float,
+    ) -> None:
+        if current_reward is None:
+            self.comparison.setText("Vs baseline: —")
+            return
+        if vs_baseline_pct is None:
+            self.comparison.setText(
+                f"Recent avg reward {current_reward:.1f} | best {best_reward:.1f}"
+            )
+            return
+        sign = "+" if vs_baseline_pct >= 0 else ""
+        self.comparison.setText(
+            f"Recent avg {current_reward:.1f} | vs baseline {sign}{vs_baseline_pct:.0f}% "
+            f"| best {best_reward:.1f}"
+        )
+
+    def set_autosave(self, text: str) -> None:
+        self.autosave.setText(text)
+
+
 class BrowserPanel(QGroupBox):
     rescan_requested = pyqtSignal()
     connect_requested = pyqtSignal(str)

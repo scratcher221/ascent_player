@@ -30,6 +30,35 @@ class FrameState:
 JUMP_ACTIONS = frozenset({3, 4, 5})
 
 
+def can_boost_from_levels(
+    energy: float,
+    reserve: float,
+    *,
+    min_energy: float = 14.0,
+) -> bool:
+    """Match game logic: boost costs 14 energy (main + reserve pool)."""
+    return (energy * 100.0 + reserve * 100.0) >= min_energy
+
+
+def apply_hud_boost(
+    state: FrameState,
+    hud_energy: float | None,
+    hud_reserve: float | None,
+    hud_can_boost: bool | None,
+    *,
+    min_energy: float = 14.0,
+) -> FrameState:
+    if hud_energy is not None:
+        reserve = hud_reserve or 0.0
+        state.boost_level = min(1.0, hud_energy + reserve)
+        state.can_boost = (
+            hud_can_boost
+            if hud_can_boost is not None
+            else can_boost_from_levels(hud_energy, reserve, min_energy=min_energy)
+        )
+    return state
+
+
 def mask_jump_action(action: int, can_boost: bool) -> int:
     if can_boost or action not in JUMP_ACTIONS:
         return action
@@ -147,8 +176,12 @@ def detect_boost_bar(frame_rgb: np.ndarray) -> tuple[float, bool]:
         boost_level = min(1.0, green_ratio * 4.0)
 
     red_ratio = float(np.mean(red_mask > 0))
-    can_boost = not (boost_level < 0.05 and red_ratio > 0.18)
-    return boost_level, can_boost
+    total_energy = boost_level + min(1.0, red_ratio * 0.15)
+    can_boost = total_energy * 100.0 >= 14.0
+    if boost_level < 0.12 and red_ratio > 0.12:
+        can_boost = False
+        boost_level = min(boost_level, 0.08)
+    return min(1.0, total_energy), can_boost
 
 
 def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:

@@ -14,8 +14,16 @@ from ascent_player.env.browser_discovery import CdpTab, discover_ascent_tab
 
 _CAPTURE_TURN_JS = """
 (args) => {
-    const { selector, maxWidth, maxHeight, quality } = args;
-    const hud = { score: null, fell: false, inMenu: false, dataUrl: null };
+    const { selector, maxWidth, maxHeight, quality, boostCost } = args;
+    const hud = {
+        score: null,
+        fell: false,
+        inMenu: false,
+        energy: null,
+        reserve: null,
+        canBoost: null,
+        dataUrl: null,
+    };
     const scoreNode = document.querySelector('#heightScore');
     if (scoreNode) {
         const digits = (scoreNode.textContent || '').replace(/\\D/g, '');
@@ -24,6 +32,26 @@ _CAPTURE_TURN_JS = """
     const body = document.body ? document.body.innerText.toUpperCase() : '';
     hud.fell = body.includes('FELL') || body.includes('BACK TO EARTH');
     hud.inMenu = body.includes('START THE ASCENT') || body.includes('PICK 1 ULTI');
+
+    let energyPct = 0;
+    let reservePct = 0;
+    const energyFill = document.querySelector('#energyFill');
+    if (energyFill && energyFill.style.height) {
+        energyPct = parseFloat(energyFill.style.height) || 0;
+    }
+    const reserveFill = document.querySelector('#reserveFill');
+    const reserveWrap = document.getElementById('reserveWrap');
+    if (
+        reserveFill
+        && reserveWrap
+        && reserveWrap.style.display !== 'none'
+        && reserveFill.style.height
+    ) {
+        reservePct = parseFloat(reserveFill.style.height) || 0;
+    }
+    hud.energy = Math.max(0, Math.min(100, energyPct)) / 100;
+    hud.reserve = Math.max(0, Math.min(100, reservePct)) / 100;
+    hud.canBoost = (energyPct + reservePct) >= boostCost;
 
     const canvas = document.querySelector(selector);
     if (!canvas) return hud;
@@ -82,6 +110,9 @@ class HudSnapshot:
     score: int | None = None
     fell: bool = False
     in_menu: bool = False
+    energy: float | None = None
+    reserve: float | None = None
+    can_boost: bool | None = None
 
 
 @dataclass(slots=True)
@@ -237,6 +268,7 @@ class BrowserBackend:
                 "maxWidth": self.config.capture_max_width,
                 "maxHeight": self.config.capture_max_height,
                 "quality": self.config.capture_jpeg_quality,
+                "boostCost": 14,
             },
         )
         if not isinstance(payload, dict):
@@ -249,6 +281,15 @@ class BrowserBackend:
                 hud.score = int(score)
             hud.fell = bool(payload.get("fell"))
             hud.in_menu = bool(payload.get("inMenu"))
+            energy = payload.get("energy")
+            reserve = payload.get("reserve")
+            can_boost = payload.get("canBoost")
+            if energy is not None:
+                hud.energy = float(energy)
+            if reserve is not None:
+                hud.reserve = float(reserve)
+            if can_boost is not None:
+                hud.can_boost = bool(can_boost)
 
         data_url = payload.get("dataUrl")
         if not isinstance(data_url, str) or not data_url.startswith("data:image/"):

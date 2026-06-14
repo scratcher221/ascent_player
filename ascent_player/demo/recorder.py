@@ -11,6 +11,7 @@ from ascent_player.env.browser_backend import BrowserBackend
 from ascent_player.env.game_env import AscentGameEnv
 from ascent_player.env.rewards import RewardTracker
 from ascent_player.env.state_detector import (
+    apply_hud_boost,
     detect_from_frame,
     merge_dom_state,
     platform_mask_from_state,
@@ -48,6 +49,13 @@ class DemoRecorder:
         key_state = await read_keyboard_state(self.backend.page)
         action = keys_to_action(key_state)
         frame_state = detect_from_frame(frame)
+        apply_hud_boost(
+            frame_state,
+            hud.energy,
+            hud.reserve,
+            hud.can_boost,
+            min_energy=self.config.reward.boost_min_energy,
+        )
         if hud.score is not None:
             frame_state.score = hud.score
         if hud.fell:

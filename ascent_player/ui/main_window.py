@@ -29,6 +29,7 @@ from ascent_player.ui.widgets import (
     EpisodePoint,
     HyperparameterPanel,
     PreviewWidget,
+    ProgressPanel,
 )
 from ascent_player.utils.preprocessing import qimage_bytes_from_frame
 
@@ -48,6 +49,14 @@ class WorkerMetrics:
     boost_level: float
     can_boost: bool
     loop_hz: float
+    session_message: str
+    baseline_reward: float | None
+    baseline_score: float | None
+    vs_baseline_pct: float | None
+    best_reward: float
+    best_score: float
+    recent_avg_reward: float | None
+    autosave_message: str
 
 
 class RecordingWorker(QThread):
@@ -104,6 +113,7 @@ class TrainingWorker(QThread):
     status_ready = pyqtSignal(str)
     metrics_ready = pyqtSignal(object)
     episode_ready = pyqtSignal(object)
+    session_ready = pyqtSignal(object)
     error_ready = pyqtSignal(str)
 
     def __init__(self, config: AppConfig) -> None:
@@ -191,7 +201,10 @@ class TrainingWorker(QThread):
         backend = BrowserBackend(self.config.browser)
         env = AscentGameEnv(self.config, backend)
         agent = DQNAgent(self.config)
-        episode = 0
+        load_result = agent.try_autoload()
+        self.session_ready.emit(load_result)
+        episode = agent.progress.episodes_completed
+        autosave_message = "Autosave: pending"
         try:
             self.status_ready.emit("Connecting browser...")
             status = await backend.connect_auto()
@@ -207,6 +220,7 @@ class TrainingWorker(QThread):
             state = await env.reset()
             episode_reward = 0.0
             episode_score = 0.0
+            episode_max_score = 0.0
             self.sync_agent_hyperparameters(agent)
             while self.running:
                 if self.paused:
@@ -222,7 +236,7 @@ class TrainingWorker(QThread):
                     self.load_requested = False
                 if self.save_requested:
                     path = agent.save()
-                    self.status_ready.emit(f"Saved checkpoint: {path}")
+                    autosave_message = f"Autosave: saved {path.name}"
                     self.save_requested = False
 
                 step_started = time.perf_counter()
@@ -230,6 +244,7 @@ class TrainingWorker(QThread):
                     state,
                     training=not self.watch_mode,
                     can_boost=env.can_boost,
+                    boost_level=env.boost_level,
                 )
                 result = await env.step(action)
                 agent.remember(
@@ -244,6 +259,7 @@ class TrainingWorker(QThread):
                 episode_reward += result.reward
                 if result.frame_state.score is not None:
                     episode_score = float(result.frame_state.score)
+                    episode_max_score = max(episode_max_score, episode_score)
 
                 step_ms = (time.perf_counter() - step_started) * 1000.0
                 if step_ms > 0:
@@ -253,6 +269,7 @@ class TrainingWorker(QThread):
                 if metrics.total_steps % self._preview_stride == 0:
                     self.frame_ready.emit(qimage_bytes_from_frame(result.raw_frame))
                 if metrics.total_steps % self._metrics_stride == 0 or result.done:
+                    progress = agent.progress
                     self.metrics_ready.emit(
                         WorkerMetrics(
                             episode=episode,
@@ -268,6 +285,18 @@ class TrainingWorker(QThread):
                             boost_level=env.boost_level,
                             can_boost=env.can_boost,
                             loop_hz=self._loop_hz,
+                            session_message=load_result.message,
+                            baseline_reward=progress.baseline_reward,
+                            baseline_score=progress.baseline_score,
+                            vs_baseline_pct=progress.reward_vs_baseline_pct(),
+                            best_reward=(
+                                progress.best_reward
+                                if progress.best_reward != float("-inf")
+                                else 0.0
+                            ),
+                            best_score=progress.best_score,
+                            recent_avg_reward=progress.recent_avg_reward,
+                            autosave_message=autosave_message,
                         )
                     )
 
@@ -279,15 +308,27 @@ class TrainingWorker(QThread):
                             score=episode_score,
                         )
                     )
+                    agent.record_episode(episode_reward, episode_max_score)
                     agent.end_episode()
-                    if episode > 0 and episode % 10 == 0:
-                        agent.save()
+                    if agent.maybe_autosave(force=True):
+                        autosave_message = (
+                            f"Autosave: episode {agent.progress.episodes_completed} saved"
+                        )
                     episode += 1
                     episode_reward = 0.0
                     episode_score = 0.0
+                    episode_max_score = 0.0
                     state = await env.reset()
+                elif agent.maybe_autosave():
+                    autosave_message = f"Autosave: step {metrics.total_steps:,} saved"
         finally:
             self._collect_train_metrics(agent)
+            try:
+                path = agent.save()
+                autosave_message = f"Autosave: final save {path.name}"
+                self.status_ready.emit(autosave_message)
+            except Exception:
+                pass
             await env.close()
             self.shutdown()
 
@@ -305,6 +346,7 @@ class MainWindow(QMainWindow):
         self.browser_panel = BrowserPanel()
         self.preview = PreviewWidget()
         self.params = HyperparameterPanel()
+        self.progress_panel = ProgressPanel()
         self.chart = EpisodeChart()
         self.status = QLabel("Ready")
 
@@ -327,6 +369,7 @@ class MainWindow(QMainWindow):
         body.addWidget(self.preview, stretch=3)
         side = QVBoxLayout()
         side.addWidget(self.params)
+        side.addWidget(self.progress_panel)
         side.addWidget(self.chart)
         side.addWidget(self.start_button)
         side.addWidget(self.pause_button)
@@ -413,6 +456,7 @@ class MainWindow(QMainWindow):
         self.worker.status_ready.connect(self.browser_panel.set_status)
         self.worker.status_ready.connect(self.status.setText)
         self.worker.metrics_ready.connect(self.update_metrics)
+        self.worker.session_ready.connect(self.on_session_ready)
         self.worker.episode_ready.connect(self.chart.add_point)
         self.worker.error_ready.connect(self.show_error)
         self.worker.finished.connect(self.worker_finished)
@@ -462,6 +506,21 @@ class MainWindow(QMainWindow):
         ]
         self.browser_panel.set_windows(labels)
 
+    def on_session_ready(self, load_result) -> None:
+        title = "Training resumed" if load_result.loaded else "Fresh training session"
+        self.progress_panel.set_session(f"Session: {load_result.message}")
+        if load_result.progress is not None:
+            progress = load_result.progress
+            self.progress_panel.set_baseline(
+                progress.baseline_reward,
+                progress.baseline_score,
+            )
+            self.progress_panel.set_best_ever(
+                progress.best_score,
+                progress.best_reward if progress.best_reward != float("-inf") else 0.0,
+            )
+        QMessageBox.information(self, title, load_result.message)
+
     def save_checkpoint(self) -> None:
         if self.worker is not None:
             self.worker.request_save()
@@ -473,16 +532,28 @@ class MainWindow(QMainWindow):
     def update_metrics(self, metrics: WorkerMetrics) -> None:
         loss = "-" if metrics.loss is None else f"{metrics.loss:.4f}"
         train_ms = "-" if metrics.train_ms is None else f"{metrics.train_ms:.1f}ms"
+        boost_label = f"boost {metrics.boost_level:.0%}"
+        if not metrics.can_boost:
+            boost_label += " (depleted)"
+        self.progress_panel.set_session(f"Session: {metrics.session_message}")
+        self.progress_panel.set_baseline(metrics.baseline_reward, metrics.baseline_score)
+        self.progress_panel.set_best_ever(metrics.best_score, metrics.best_reward)
+        self.progress_panel.set_comparison(
+            metrics.recent_avg_reward,
+            metrics.vs_baseline_pct,
+            metrics.best_reward,
+        )
+        self.progress_panel.set_autosave(metrics.autosave_message)
         self.status.setText(
             " | ".join(
                 [
                     f"ep {metrics.episode}",
                     f"reward {metrics.episode_reward:.1f}",
                     f"score {metrics.episode_score:.1f}",
+                    f"best {metrics.best_score:.0f}",
                     f"eps {metrics.epsilon:.3f}",
                     f"action {metrics.action}",
-                    f"boost {metrics.boost_level:.0%}"
-                    + ("" if metrics.can_boost else " (empty)"),
+                    boost_label,
                     f"replay {metrics.replay_size}",
                     f"steps {metrics.total_steps}",
                     f"loss {loss}",

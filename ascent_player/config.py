@@ -75,6 +75,8 @@ class RewardConfig:
     boost_spent: float = 0.0
     low_boost_penalty: float = -0.05
     boost_jump_threshold: float = 0.06
+    boost_min_energy: float = 14.0
+    empty_boost_jump_penalty: float = -1.0
     survival_step_bonus: float = 0.002
     platform_align: float = 0.45
     platform_fall_weight: float = 2.0
@@ -110,6 +112,10 @@ class TrainingConfig:
     train_every_cpu: int = 4
     train_every_gpu: int = 2
     checkpoint_path: Path = Path("checkpoints/dqn_latest.keras")
+    auto_load_checkpoint: bool = True
+    autosave_every_episodes: int = 1
+    autosave_every_steps: int = 250
+    baseline_episodes: int = 5
     device_mode: DeviceMode = DeviceMode.AUTO
     watch_mode: bool = False
 

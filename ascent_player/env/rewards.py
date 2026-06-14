@@ -94,7 +94,9 @@ class RewardTracker:
             reward += boost_delta * self.config.boost_gain
 
         if action in JUMP_ACTIONS:
-            if previous.boost_level < self.config.boost_jump_threshold:
+            if not previous.can_boost:
+                reward += self.config.empty_boost_jump_penalty
+            elif previous.boost_level < self.config.boost_jump_threshold:
                 reward += self.config.wasted_jump_penalty
             elif (
                 boost_delta < -0.04

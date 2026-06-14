@@ -7,6 +7,12 @@ import time
 
 import numpy as np
 
+from ascent_player.agent.checkpoint import (
+    LoadResult,
+    TrainingProgress,
+    load_progress,
+    save_progress,
+)
 from ascent_player.agent.model import build_q_network
 from ascent_player.agent.replay_buffer import ReplayBuffer, TransitionBatch
 from ascent_player.config import AppConfig
@@ -45,6 +51,12 @@ class DQNAgent:
         self.epsilon = config.training.epsilon_start
         self.metrics = AgentMetrics(epsilon=self.epsilon)
         self.replay = ReplayBuffer(config.training.replay_buffer_size)
+        self.progress = TrainingProgress(
+            baseline_episodes=config.training.baseline_episodes,
+            epsilon=config.training.epsilon_start,
+        )
+        self._baseline_samples: list[tuple[float, float]] = []
+        self._last_autosave_steps = 0
         input_shape = (
             config.observation.height,
             config.observation.width,
@@ -71,8 +83,14 @@ class DQNAgent:
             self.device_info,
         )
 
-    def act(self, state: np.ndarray, training: bool = True, can_boost: bool = True) -> int:
-        valid = self._valid_actions(can_boost)
+    def act(
+        self,
+        state: np.ndarray,
+        training: bool = True,
+        can_boost: bool = True,
+        boost_level: float = 1.0,
+    ) -> int:
+        valid = self._valid_actions(can_boost, boost_level)
         if training and random.random() < self.epsilon:
             return random.choice(valid)
         with self.tf.device(self.device_info.inference_device):
@@ -86,8 +104,8 @@ class DQNAgent:
         return int(np.argmax(masked))
 
     @staticmethod
-    def _valid_actions(can_boost: bool) -> list[int]:
-        if can_boost:
+    def _valid_actions(can_boost: bool, boost_level: float = 1.0) -> list[int]:
+        if can_boost and boost_level * 100.0 >= 14.0:
             return list(range(6))
         return [0, 1, 2]
 
@@ -223,11 +241,68 @@ class DQNAgent:
                 self.epsilon * self.config.training.epsilon_decay,
             )
         self.metrics.epsilon = self.epsilon
+        self.progress.epsilon = self.epsilon
+
+    def record_episode(self, reward: float, score: float) -> None:
+        self.progress.episodes_completed += 1
+        self.progress.recent_rewards.append(reward)
+        self.progress.recent_scores.append(score)
+        if len(self.progress.recent_rewards) > 20:
+            self.progress.recent_rewards = self.progress.recent_rewards[-20:]
+            self.progress.recent_scores = self.progress.recent_scores[-20:]
+
+        if self.progress.baseline_reward is None:
+            self._baseline_samples.append((reward, score))
+            if len(self._baseline_samples) >= self.progress.baseline_episodes:
+                rewards = [item[0] for item in self._baseline_samples]
+                scores = [item[1] for item in self._baseline_samples]
+                self.progress.baseline_reward = float(sum(rewards) / len(rewards))
+                self.progress.baseline_score = float(sum(scores) / len(scores))
+
+        if reward > self.progress.best_reward:
+            self.progress.best_reward = reward
+        if score > self.progress.best_score:
+            self.progress.best_score = score
+
+    def maybe_autosave(self, *, force: bool = False) -> bool:
+        steps = self.metrics.total_steps
+        every_steps = max(1, self.config.training.autosave_every_steps)
+        if not force and (steps - self._last_autosave_steps) < every_steps:
+            return False
+        self.save()
+        self._last_autosave_steps = steps
+        return True
+
+    def try_autoload(self) -> LoadResult:
+        target = self.config.training.checkpoint_path
+        if not self.config.training.auto_load_checkpoint:
+            return LoadResult(False, "Auto-load disabled — starting from scratch.")
+        if not target.exists():
+            return LoadResult(False, "No checkpoint found — starting from scratch.")
+        if not self.load():
+            return LoadResult(
+                False,
+                "Checkpoint missing or incompatible — starting from scratch.",
+            )
+        message = (
+            f"Resumed training — {self.progress.episodes_completed} episodes, "
+            f"{self.progress.total_steps:,} steps, ε={self.progress.epsilon:.3f}"
+        )
+        if self.progress.has_baseline:
+            message += (
+                f" | baseline reward {self.progress.baseline_reward:.1f}, "
+                f"score {self.progress.baseline_score:.1f}"
+            )
+        message += f" | best score {self.progress.best_score:.0f}"
+        return LoadResult(True, message, self.progress)
 
     def save(self, path: Path | None = None) -> Path:
         target = path or self.config.training.checkpoint_path
         target.parent.mkdir(parents=True, exist_ok=True)
+        self.progress.total_steps = self.metrics.total_steps
+        self.progress.epsilon = self.epsilon
         self.online.save(target)
+        save_progress(target, self.progress)
         return target
 
     def load(self, path: Path | None = None) -> bool:
@@ -243,6 +318,19 @@ class DQNAgent:
                 self.target.set_weights(loaded.get_weights())
         except Exception:
             return False
+
+        progress = load_progress(target)
+        if progress is not None:
+            if progress.best_score <= 0 and progress.recent_scores:
+                progress.best_score = max(progress.recent_scores)
+            if progress.baseline_score is not None:
+                progress.best_score = max(progress.best_score, progress.baseline_score)
+            self.progress = progress
+            self.epsilon = progress.epsilon
+            self.metrics.epsilon = progress.epsilon
+            self.metrics.total_steps = progress.total_steps
+            self._last_autosave_steps = progress.total_steps
+            self._baseline_samples = []
         return True
 
     def _train_batch(self, batch: TransitionBatch):

@@ -10,6 +10,7 @@ from ascent_player.env.browser_backend import BrowserBackend, HudSnapshot
 from ascent_player.env.rewards import RewardTracker
 from ascent_player.env.state_detector import (
     FrameState,
+    apply_hud_boost,
     detect_from_frame,
     mask_jump_action,
     merge_dom_state,
@@ -141,6 +142,13 @@ class AscentGameEnv:
         hud: HudSnapshot | None = None,
     ) -> FrameState:
         state = detect_from_frame(frame)
+        apply_hud_boost(
+            state,
+            hud.energy if hud is not None else None,
+            hud.reserve if hud is not None else None,
+            hud.can_boost if hud is not None else None,
+            min_energy=self.config.reward.boost_min_energy,
+        )
         if hud is not None and hud.score is not None:
             state.score = hud.score
         if hud is not None:
@@ -193,7 +201,7 @@ class AscentGameEnv:
             await self.backend.key_down(key)
             self.held_keys.add(key)
 
-        if action in (3, 4, 5):
+        if action in (3, 4, 5) and self.can_boost:
             await self.backend.press("Space")
 
     async def _release_all(self) -> None:
