@@ -42,6 +42,7 @@ class RewardTracker:
             reward += self._idle_penalty(previous, state, action)
             reward += self._boost_reward(previous, state, action)
             reward += self._platform_reward(previous, state, action)
+            reward += self._combo_streak_reward(previous, state)
             reward += self._stagnation_penalty(previous, state)
             reward += self._milestone_reward(state)
 
@@ -65,7 +66,8 @@ class RewardTracker:
         if delta > 0:
             self.stagnant_steps = 0
             self.last_score = state.score
-        return delta * self.config.score_gain
+        scale = max(1.0, state.score_multiplier)
+        return delta * self.config.score_gain * scale
 
     def _altitude_reward(self, previous: FrameState, state: FrameState) -> float:
         if previous.orb_y is None or state.orb_y is None:
@@ -78,7 +80,7 @@ class RewardTracker:
             and state.score is not None
             and state.score > previous.score
         )
-        scale = 1.0 if score_confirmed else 0.25
+        scale = 1.0 if score_confirmed else 0.2
         return max(0.0, altitude_gain / 100.0) * self.config.altitude_gain * scale
 
     def _falling_penalty(self, previous: FrameState, state: FrameState) -> float:
@@ -87,7 +89,8 @@ class RewardTracker:
         fall = state.orb_y - previous.orb_y
         if fall <= 6:
             return 0.0
-        return (fall / 100.0) * self.config.falling_penalty
+        weight = 1.0 + state.streak * 0.15
+        return (fall / 100.0) * self.config.falling_penalty * weight
 
     def _idle_penalty(
         self,
@@ -136,7 +139,8 @@ class RewardTracker:
                     and state.orb_y is not None
                     and state.orb_y < previous.orb_y - 8
                 )
-                if not gained_score and not gained_altitude:
+                landed = state.platform_landed
+                if not gained_score and not gained_altitude and not landed:
                     reward += self.config.boost_spent
                 self.recent_boost_spend = 8
 
@@ -145,6 +149,28 @@ class RewardTracker:
 
         if state.boost_level < 0.05:
             reward += self.config.low_boost_penalty
+
+        return reward
+
+    def _combo_streak_reward(self, previous: FrameState, state: FrameState) -> float:
+        reward = 0.0
+        landed = state.platform_landed or state.combo > previous.combo
+        if landed:
+            reward += self.config.platform_land
+            reward += self.config.combo_gain * max(1, state.combo)
+
+        if state.combo > previous.combo:
+            reward += self.config.combo_gain * (state.combo - previous.combo) * 0.5
+        elif state.combo < previous.combo:
+            reward += self.config.combo_break_penalty
+
+        if state.streak > previous.streak:
+            delta = state.streak - previous.streak
+            reward += self.config.streak_level_bonus * (state.streak ** 1.4) * delta
+
+        multiplier_delta = state.score_multiplier - previous.score_multiplier
+        if multiplier_delta > 0.01:
+            reward += multiplier_delta * self.config.multiplier_gain
 
         return reward
 
@@ -160,33 +186,38 @@ class RewardTracker:
         falling = (
             previous.orb_y is not None
             and state.orb_y is not None
-            and state.orb_y > previous.orb_y + 4
+            and state.orb_y > previous.orb_y + 3
         )
-        ascending = (
-            previous.orb_y is not None
-            and state.orb_y is not None
-            and state.orb_y < previous.orb_y - 2
+        platform_below = (
+            state.nearest_platform_dy is not None and state.nearest_platform_dy > 0.02
         )
-        if not falling and not ascending:
+        if not falling and not platform_below:
             return 0.0
 
         reward = 0.0
         dx = state.nearest_platform_dx
+        steer_scale = self.config.platform_fall_weight if falling else 1.0
+        steer_scale *= 1.0 + state.streak * 0.2
+
         if dx < -0.02 and action in (1, 4):
-            reward += self.config.platform_align * min(abs(dx) * 3.0, 1.0)
+            reward += self.config.platform_align * min(abs(dx) * 4.0, 1.5) * steer_scale
         elif dx > 0.02 and action in (2, 5):
-            reward += self.config.platform_align * min(abs(dx) * 3.0, 1.0)
+            reward += self.config.platform_align * min(abs(dx) * 4.0, 1.5) * steer_scale
+        elif falling:
+            wrong_dir = (dx < -0.04 and action in (2, 5)) or (dx > 0.04 and action in (1, 4))
+            if wrong_dir:
+                reward += self.config.off_platform_penalty * min(abs(dx) * 3.0, 1.0)
 
         if previous.nearest_platform_dx is not None:
             prev_dist = abs(previous.nearest_platform_dx)
             curr_dist = abs(state.nearest_platform_dx)
             if curr_dist < prev_dist:
-                weight = (
-                    self.config.platform_fall_weight
-                    if falling
-                    else self.config.platform_align
+                reward += (
+                    (prev_dist - curr_dist)
+                    * self.config.platform_align
+                    * steer_scale
+                    * 2.0
                 )
-                reward += (prev_dist - curr_dist) * self.config.platform_align * weight
 
         if (
             previous.nearest_platform_dy is not None
@@ -195,7 +226,7 @@ class RewardTracker:
         ):
             dy_gain = previous.nearest_platform_dy - state.nearest_platform_dy
             if dy_gain > 0:
-                reward += dy_gain * self.config.platform_align
+                reward += dy_gain * self.config.platform_align * steer_scale
 
         return reward
 
@@ -219,5 +250,5 @@ class RewardTracker:
                 continue
             if state.score >= milestone:
                 self.milestones_hit.add(milestone)
-                reward += self.config.milestone_bonus
+                reward += self.config.milestone_bonus * max(1.0, state.score_multiplier)
         return reward

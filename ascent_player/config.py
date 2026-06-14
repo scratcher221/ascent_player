@@ -67,9 +67,9 @@ class RewardConfig:
     death: float = -1.0
     early_death_penalty: float = -0.5
     early_death_steps: int = 80
-    falling_penalty: float = -0.025
-    idle_penalty: float = -0.01
-    idle_steps: int = 40
+    falling_penalty: float = -0.04
+    idle_penalty: float = -0.02
+    idle_steps: int = 25
     wasted_jump_penalty: float = -0.08
     boost_gain: float = 0.05
     boost_spent: float = -0.04
@@ -78,13 +78,19 @@ class RewardConfig:
     boost_min_energy: float = 14.0
     empty_boost_jump_penalty: float = -0.25
     survival_step_bonus: float = 0.0001
-    platform_align: float = 0.04
-    platform_fall_weight: float = 1.5
-    score_stagnation_steps: int = 90
-    score_stagnation_penalty: float = -0.02
-    milestone_scores: tuple[int, ...] = (500, 1000, 1500, 2000, 2500)
+    platform_align: float = 0.08
+    platform_fall_weight: float = 3.5
+    platform_land: float = 0.35
+    combo_gain: float = 0.06
+    streak_level_bonus: float = 0.65
+    multiplier_gain: float = 0.25
+    combo_break_penalty: float = -0.4
+    off_platform_penalty: float = -0.05
+    score_stagnation_steps: int = 30
+    score_stagnation_penalty: float = -0.04
+    milestone_scores: tuple[int, ...] = (500, 1000, 1500, 2000, 2500, 3000)
     milestone_bonus: float = 0.2
-    reward_clip: float = 1.0
+    reward_clip: float = 2.0
 
 
 @dataclass(slots=True)
@@ -93,7 +99,7 @@ class DemoConfig:
     replay_multiplier: int = 2
     pretrain_steps: int = 800
     use_demos_on_start: bool = True
-    min_episode_score: float = 0.0
+    min_episode_score: float = 1500.0
     high_score_weight: float = 2.0
     bc_loss_weight: float = 0.15
     hybrid_bc_every: int = 4
@@ -132,9 +138,19 @@ class TrainingConfig:
     sim_mode: bool = False
     sim_pretrain_steps: int = 0
     transfer_from_sim: bool = False
-    transfer_learning_rate: float = 1e-4
-    transfer_epsilon_start: float = 0.3
-    mixed_sim_replay_ratio: float = 0.1
+    transfer_learning_rate: float = 5e-5
+    transfer_epsilon_start: float = 0.5
+    transfer_epsilon_restart: float = 0.45
+    transfer_demo_delay_episodes: int = 12
+    transfer_plateau_episodes: int = 12
+    transfer_frame_skip: int = 6
+    finetune_max_seconds: int = 600
+    mixed_sim_replay_ratio: float = 0.0
+    sim_epsilon_end: float = 0.12
+    sim_epsilon_decay: float = 0.995
+    sim_min_best_score: int = 1000
+    sim_max_steps_multiplier: float = 2.0
+    target_score: int = 3000
     device_mode: DeviceMode = DeviceMode.GPU
     watch_mode: bool = False
     # Fast headless pretrain: parallel envs, batched inference, lightweight obs.

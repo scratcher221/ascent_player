@@ -63,10 +63,19 @@ def demo_transition_count(path: Path) -> int:
 def demo_peak_score(path: Path) -> float:
     with np.load(path, mmap_mode="r") as payload:
         if "peak_score" in payload:
-            return float(payload["peak_score"])
+            peak = float(payload["peak_score"])
+            if peak > 0:
+                return peak
         if "scores" in payload:
             return float(np.max(payload["scores"]))
     return 0.0
+
+
+def demo_has_score_metadata(path: Path) -> bool:
+    with np.load(path, mmap_mode="r") as payload:
+        if "peak_score" in payload and float(payload["peak_score"]) > 0:
+            return True
+        return "scores" in payload
 
 
 @contextmanager

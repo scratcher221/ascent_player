@@ -37,6 +37,8 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     config.training.frame_skip = 1
     env_count = _sim_env_count(config)
     target_steps = steps or config.training.sim_pretrain_steps or 500_000
+    max_steps = int(target_steps * config.training.sim_max_steps_multiplier)
+    min_best = config.training.sim_min_best_score
 
     envs = [
         AscentSimEnv(config, fast_mode=True, env_index=index)
@@ -69,7 +71,10 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     print(f"Training log: {logger.path}")
 
     try:
-        while agent.metrics.total_steps < target_steps:
+        while agent.metrics.total_steps < target_steps or (
+            agent.progress.best_score < min_best
+            and agent.metrics.total_steps < max_steps
+        ):
             can_boost = np.asarray([env.can_boost for env in envs], dtype=bool)
             boost_levels = np.asarray(
                 [env.boost_level for env in envs],
@@ -108,8 +113,8 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                 if result.done:
                     ep_reward = episode_rewards[index]
                     ep_score = episode_max_scores[index]
-                    agent.record_episode(ep_reward, ep_score)
-                    agent.end_episode()
+                    agent.record_episode(ep_reward, ep_score, sim_pretrain=True)
+                    agent.end_episode(sim_pretrain=True)
                     logger.log_episode_end(
                         agent,
                         episode,
@@ -159,17 +164,24 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                 sps = metrics.total_steps / max(elapsed, 1e-6)
                 print(
                     f"sim step={metrics.total_steps}/{target_steps} "
-                    f"sps={sps:.0f} loss={metrics.loss} "
-                    f"eps={agent.epsilon:.3f} replay={metrics.replay_size}"
+                    f"(max={max_steps}) sps={sps:.0f} loss={metrics.loss} "
+                    f"eps={agent.epsilon:.3f} best={agent.progress.best_score:.0f} "
+                    f"replay={metrics.replay_size}"
                 )
     finally:
-        agent.save_sim_checkpoint()
+        if agent.progress.best_score >= min_best:
+            agent.save_sim_checkpoint()
+            gate_msg = "passed"
+        else:
+            agent.save_sim_checkpoint()
+            gate_msg = f"below gate ({agent.progress.best_score:.0f} < {min_best})"
         elapsed = time.perf_counter() - started
         sps = agent.metrics.total_steps / max(elapsed, 1e-6)
         logger.close(agent)
         print(
             f"Saved sim checkpoint to {config.training.sim_checkpoint_path} "
-            f"({agent.metrics.total_steps} steps in {elapsed:.1f}s, {sps:.0f} sps)"
+            f"({agent.metrics.total_steps} steps in {elapsed:.1f}s, {sps:.0f} sps, "
+            f"best_score={agent.progress.best_score:.0f}, gate={gate_msg})"
         )
         print(f"Training log: {logger.path}")
 
@@ -177,10 +189,16 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
 async def run_training_no_ui(
     config: AppConfig,
     max_episodes: int | None = None,
-) -> None:
+    max_seconds: int | None = None,
+) -> dict[str, float]:
     phase = "sim" if config.training.sim_mode else "browser"
     logger = TrainingLogger(config, phase)
     backend = None if config.training.sim_mode else BrowserBackend(config.browser)
+    if config.training.transfer_from_sim and not config.training.sim_mode:
+        config.training.frame_skip = max(
+            config.training.frame_skip,
+            config.training.transfer_frame_skip,
+        )
     env = create_env(config, backend)
     agent = DQNAgent(config)
     load_result = agent.try_autoload()
@@ -188,14 +206,19 @@ async def run_training_no_ui(
     logger.log_session_start(
         agent,
         message=load_result.message,
-        extra={"headless": True, "watch_mode": config.training.watch_mode},
+        extra={
+            "headless": True,
+            "watch_mode": config.training.watch_mode,
+            "frame_skip": config.training.frame_skip,
+            "max_seconds": max_seconds,
+        },
     )
     print(f"Training log: {logger.path}")
-    if config.demo.use_demos_on_start and not config.training.sim_mode:
-        result = ingest_demonstrations(agent, config)
-        if result.transitions_added or result.transitions_skipped:
-            print(result.status_message)
-            logger.log_note(f"demo_ingest={result.status_message}")
+    demos_ingested = False
+    transfer_episodes = 0
+    deadline = (
+        time.perf_counter() + max_seconds if max_seconds and max_seconds > 0 else None
+    )
     episode_steps = 0
     try:
         if not config.training.sim_mode:
@@ -214,6 +237,10 @@ async def run_training_no_ui(
         score_velocity = 0.0
         loop_hz = 0.0
         while max_episodes is None or episode < max_episodes:
+            if deadline is not None and time.perf_counter() >= deadline:
+                print(f"Finetune time limit reached ({max_seconds}s)")
+                logger.log_note(f"finetune_timeout={max_seconds}s")
+                break
             step_started = time.perf_counter()
             action = agent.act(
                 state,
@@ -296,6 +323,23 @@ async def run_training_no_ui(
                 agent.end_episode()
                 agent.maybe_autosave(force=True)
                 episode += 1
+                if config.training.transfer_from_sim:
+                    transfer_episodes += 1
+                if (
+                    config.demo.use_demos_on_start
+                    and not demos_ingested
+                    and not config.training.sim_mode
+                    and (
+                        not config.training.transfer_from_sim
+                        or transfer_episodes
+                        >= config.training.transfer_demo_delay_episodes
+                    )
+                ):
+                    demo_result = ingest_demonstrations(agent, config)
+                    if demo_result.transitions_added or demo_result.transitions_skipped:
+                        print(demo_result.status_message)
+                        logger.log_note(f"demo_ingest={demo_result.status_message}")
+                    demos_ingested = True
                 episode_reward = 0.0
                 episode_max_score = 0.0
                 episode_steps = 0
@@ -307,6 +351,15 @@ async def run_training_no_ui(
         await env.close()
         logger.close(agent)
         print(f"Training log: {logger.path}")
+    recent = agent.progress.recent_scores[-10:]
+    return {
+        "best_score": agent.progress.best_score,
+        "recent_avg": float(sum(recent) / len(recent)) if recent else 0.0,
+        "recent_min": float(min(recent)) if recent else 0.0,
+        "recent_max": float(max(recent)) if recent else 0.0,
+        "episodes": float(agent.progress.episodes_completed),
+        "log_path": str(logger.path),
+    }
 
 
 async def run_random_smoke(config: AppConfig, steps: int = 100) -> None:
@@ -342,6 +395,9 @@ async def run_sim_calibration(config: AppConfig, episodes: int = 10) -> None:
     print(
         "sim calibration:",
         f"episodes={int(stats['episodes'])}",
-        f"mean_score={stats['mean_score']:.1f}",
+        f"random_mean={stats['mean_score']:.1f}",
+        f"climb_mean={stats['climb_mean_score']:.1f}",
+        f"max={stats['max_score']:.1f}",
+        f"p90={stats['p90_score']:.1f}",
         f"mean_length={stats['mean_length']:.1f}",
     )

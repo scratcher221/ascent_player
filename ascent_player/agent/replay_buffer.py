@@ -68,6 +68,10 @@ class ReplayBuffer:
             dones=np.asarray(dones, dtype=np.float32),
         )
 
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)

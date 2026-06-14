@@ -152,6 +152,9 @@ class AscentGameEnv:
         if hud is not None and hud.score is not None:
             state.score = hud.score
         if hud is not None:
+            state.combo = hud.combo
+            state.streak = hud.streak
+            state.score_multiplier = hud.multiplier
             if hud.fell:
                 state.game_over = True
             if hud.in_menu:

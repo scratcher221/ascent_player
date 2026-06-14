@@ -7,7 +7,13 @@ import numpy as np
 
 from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig
-from ascent_player.demo.storage import demo_peak_score, demo_transition_count, list_demo_files, open_demo
+from ascent_player.demo.storage import (
+    demo_has_score_metadata,
+    demo_peak_score,
+    demo_transition_count,
+    list_demo_files,
+    open_demo,
+)
 from ascent_player.env.state_detector import mask_jump_action
 from ascent_player.utils.memory import max_demo_transitions, memory_headroom_ok
 
@@ -125,9 +131,14 @@ def ingest_demonstrations(agent: DQNAgent, config: AppConfig) -> DemoIngestResul
     )
 
     for path in ranked_paths:
-        if demo_peak_score(path) < config.demo.min_episode_score:
+        has_scores = demo_has_score_metadata(path)
+        peak = demo_peak_score(path)
+        if has_scores and peak < config.demo.min_episode_score:
             skipped += demo_transition_count(path)
             continue
+        min_transition_score = (
+            config.demo.min_episode_score if has_scores else 0.0
+        )
         file_count = demo_transition_count(path)
         if unique_loaded >= transition_cap or not memory_headroom_ok(config):
             skipped += file_count
@@ -141,7 +152,7 @@ def ingest_demonstrations(agent: DQNAgent, config: AppConfig) -> DemoIngestResul
                 demo,
                 take,
                 rng,
-                min_episode_score=config.demo.min_episode_score,
+                min_episode_score=min_transition_score,
                 high_score_weight=config.demo.high_score_weight,
             )
             if len(indices) == 0:

@@ -22,6 +22,9 @@ _CAPTURE_TURN_JS = """
         energy: null,
         reserve: null,
         canBoost: null,
+        combo: 0,
+        streak: 0,
+        multiplier: 1,
         dataUrl: null,
     };
     const scoreNode = document.querySelector('#heightScore');
@@ -52,6 +55,20 @@ _CAPTURE_TURN_JS = """
     hud.energy = Math.max(0, Math.min(100, energyPct)) / 100;
     hud.reserve = Math.max(0, Math.min(100, reservePct)) / 100;
     hud.canBoost = (energyPct + reservePct) >= boostCost;
+
+    const multChip = document.getElementById('multChip');
+    if (multChip) {
+        const multMatch = (multChip.textContent || '').match(/[×x]([\\d.]+)/i);
+        if (multMatch) hud.multiplier = parseFloat(multMatch[1]) || 1;
+    }
+    const comboBadge = document.getElementById('comboBadge');
+    if (comboBadge) {
+        const comboMatch = (comboBadge.textContent || '').match(/x(\\d+)/i);
+        if (comboMatch) {
+            hud.combo = parseInt(comboMatch[1], 10) || 0;
+            hud.streak = Math.floor(hud.combo / 10);
+        }
+    }
 
     const canvas = document.querySelector(selector);
     if (!canvas) return hud;
@@ -113,6 +130,9 @@ class HudSnapshot:
     energy: float | None = None
     reserve: float | None = None
     can_boost: bool | None = None
+    combo: int = 0
+    streak: int = 0
+    multiplier: float = 1.0
 
 
 @dataclass(slots=True)
@@ -290,6 +310,15 @@ class BrowserBackend:
                 hud.reserve = float(reserve)
             if can_boost is not None:
                 hud.can_boost = bool(can_boost)
+            combo = payload.get("combo")
+            streak = payload.get("streak")
+            multiplier = payload.get("multiplier")
+            if combo is not None:
+                hud.combo = int(combo)
+            if streak is not None:
+                hud.streak = int(streak)
+            if multiplier is not None:
+                hud.multiplier = float(multiplier)
 
         data_url = payload.get("dataUrl")
         if not isinstance(data_url, str) or not data_url.startswith("data:image/"):

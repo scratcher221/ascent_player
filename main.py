@@ -66,6 +66,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Parallel simulator envs for pretrain (0 = auto from CPU count)",
     )
+    parser.add_argument(
+        "--finetune-seconds",
+        type=int,
+        default=0,
+        help="Cap browser fine-tune duration (0 = no limit)",
+    )
+    parser.add_argument(
+        "--run-pipeline",
+        action="store_true",
+        help="Run calibrate → sim pretrain → browser fine-tune loop until target score",
+    )
     return parser.parse_args()
 
 
@@ -80,11 +91,16 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     config.training.sim_pretrain_steps = max(0, int(args.pretrain_steps))
     config.training.transfer_from_sim = args.transfer_from_sim
     config.training.sim_pretrain_envs = max(0, int(args.sim_envs))
+    if args.finetune_seconds > 0:
+        config.training.finetune_max_seconds = int(args.finetune_seconds)
     if args.watch:
         config.training.epsilon_start = 0.0
         config.training.epsilon_end = 0.0
     if args.transfer_from_sim and not args.sim:
-        config.training.frame_skip = max(config.training.frame_skip, 2)
+        config.training.frame_skip = max(
+            config.training.frame_skip,
+            config.training.transfer_frame_skip,
+        )
     return config
 
 
@@ -114,7 +130,12 @@ def run_no_ui(config: AppConfig) -> int:
     if config.training.sim_mode and "--calibrate-sim" in sys.argv:
         asyncio.run(run_sim_calibration(config))
         return 0
-    asyncio.run(run_training_no_ui(config))
+    max_seconds = (
+        config.training.finetune_max_seconds
+        if config.training.finetune_max_seconds > 0
+        else None
+    )
+    asyncio.run(run_training_no_ui(config, max_seconds=max_seconds))
     return 0
 
 
@@ -134,6 +155,19 @@ def main() -> int:
         from ascent_player.training import run_sim_pretrain
 
         run_sim_pretrain(config, args.pretrain_steps)
+        return 0
+    if args.run_pipeline:
+        import asyncio
+
+        from ascent_player.pipeline import run_pipeline
+
+        asyncio.run(
+            run_pipeline(
+                config,
+                sim_steps=max(config.training.sim_pretrain_steps, 300_000),
+                finetune_seconds=config.training.finetune_max_seconds,
+            )
+        )
         return 0
     if args.no_ui:
         return run_no_ui(config)

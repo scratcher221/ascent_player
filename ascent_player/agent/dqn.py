@@ -59,6 +59,8 @@ class DQNAgent:
         )
         self._baseline_samples: list[tuple[float, float]] = []
         self._last_autosave_steps = 0
+        self._episodes_since_best = 0
+        self._sim_pretrain_mode = False
         input_shape = (
             config.observation.height,
             config.observation.width,
@@ -88,12 +90,16 @@ class DQNAgent:
 
     def apply_sim_pretrain_profile(self) -> None:
         training = self.config.training
+        self._sim_pretrain_mode = True
         self.train_every = max(1, training.sim_pretrain_train_every)
         self.batch_size = max(self.batch_size, training.sim_pretrain_batch_size)
         self.config.training.min_replay_size = min(
             self.config.training.min_replay_size,
             training.sim_pretrain_min_replay,
         )
+        self.epsilon = training.epsilon_start
+        self.metrics.epsilon = self.epsilon
+        self.progress.epsilon = self.epsilon
 
     def _build_batch_predict(self):
         agent = self
@@ -340,18 +346,38 @@ class DQNAgent:
             dones=np.concatenate([part.dones for part in parts], axis=0),
         )
 
-    def end_episode(self) -> None:
+    def end_episode(self, *, sim_pretrain: bool | None = None) -> None:
+        sim_mode = (
+            self._sim_pretrain_mode if sim_pretrain is None else sim_pretrain
+        )
         if self.config.training.watch_mode:
             self.epsilon = 0.0
         else:
-            self.epsilon = max(
-                self.config.training.epsilon_end,
-                self.epsilon * self.config.training.epsilon_decay,
+            decay = (
+                self.config.training.sim_epsilon_decay
+                if sim_mode
+                else self.config.training.epsilon_decay
             )
+            epsilon_end = (
+                self.config.training.sim_epsilon_end
+                if sim_mode
+                else self.config.training.epsilon_end
+            )
+            self.epsilon = max(epsilon_end, self.epsilon * decay)
         self.metrics.epsilon = self.epsilon
         self.progress.epsilon = self.epsilon
 
-    def record_episode(self, reward: float, score: float) -> None:
+    def record_episode(
+        self,
+        reward: float,
+        score: float,
+        *,
+        sim_pretrain: bool | None = None,
+    ) -> None:
+        sim_mode = (
+            self._sim_pretrain_mode if sim_pretrain is None else sim_pretrain
+        )
+        improved_score = score > self.progress.best_score
         self.progress.episodes_completed += 1
         self.progress.recent_rewards.append(reward)
         self.progress.recent_scores.append(score)
@@ -369,8 +395,18 @@ class DQNAgent:
 
         if reward > self.progress.best_reward:
             self.progress.best_reward = reward
-        if score > self.progress.best_score:
+        if improved_score:
             self.progress.best_score = score
+            self._episodes_since_best = 0
+        elif not sim_mode and not self.config.training.watch_mode:
+            self._episodes_since_best += 1
+            plateau = self.config.training.transfer_plateau_episodes
+            if self._episodes_since_best >= plateau:
+                restart = self.config.training.transfer_epsilon_restart
+                self.epsilon = max(self.epsilon, restart)
+                self.metrics.epsilon = self.epsilon
+                self.progress.epsilon = self.epsilon
+                self._episodes_since_best = 0
 
     def maybe_autosave(self, *, force: bool = False) -> bool:
         steps = self.metrics.total_steps
@@ -382,28 +418,25 @@ class DQNAgent:
         return True
 
     def prepare_transfer_from_sim(self) -> None:
+        self.replay.clear()
+        self.sim_replay.clear()
+        self.demo_replay.clear()
+        self._sim_pretrain_mode = False
         self.set_learning_rate(self.config.training.transfer_learning_rate)
         self.epsilon = self.config.training.transfer_epsilon_start
         self.metrics.epsilon = self.epsilon
         self.progress.epsilon = self.epsilon
-        self._promote_replay_for_mixed_transfer()
+        self.progress.best_score = 0.0
+        self.progress.best_reward = float("-inf")
+        self.progress.recent_scores = []
+        self.progress.recent_rewards = []
+        self.progress.episodes_completed = 0
+        self.metrics.total_steps = 0
+        self._episodes_since_best = 0
+        self._last_autosave_steps = 0
 
     def _promote_replay_for_mixed_transfer(self) -> None:
-        ratio = self.config.training.mixed_sim_replay_ratio
-        if ratio <= 0 or len(self.replay) == 0:
-            return
-        keep = min(len(self.replay), int(self.replay.capacity * ratio * 2))
-        if keep <= 0:
-            return
-        batch = self.replay.sample(min(keep, len(self.replay)))
-        for idx in range(len(batch.actions)):
-            self.sim_replay.add(
-                batch.states[idx],
-                int(batch.actions[idx]),
-                float(batch.rewards[idx]),
-                batch.next_states[idx],
-                bool(batch.dones[idx]),
-            )
+        return
 
     def try_autoload(self) -> LoadResult:
         target = self.config.training.checkpoint_path
@@ -486,6 +519,7 @@ class DQNAgent:
         loss = self._train_step(states, actions, rewards, next_states, dones)
         if (
             len(self.demo_replay) > 0
+            and self.progress.best_score >= 1000
             and self.metrics.total_steps % max(1, self.config.demo.hybrid_bc_every) == 0
         ):
             demo_batch = self.demo_replay.sample(

@@ -113,6 +113,10 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
         can_boost=world.can_boost,
         nearest_platform_dx=platform_dx,
         nearest_platform_dy=platform_dy,
+        combo=world.combo,
+        streak=world.streak,
+        score_multiplier=world.score_multiplier,
+        platform_landed=world.platform_landed,
         platform_mask=build_platform_mask_from_list(
             platforms,
             frame_rgb.shape[:2],
@@ -236,6 +240,10 @@ class AscentSimEnv:
             can_boost=self.world.can_boost,
             nearest_platform_dx=platform_dx,
             nearest_platform_dy=platform_dy,
+            combo=self.world.combo,
+            streak=self.world.streak,
+            score_multiplier=self.world.score_multiplier,
+            platform_landed=self.world.platform_landed,
             platform_mask=fast_platform_mask(self.world, self.config.observation),
             game_over=False,
         )
@@ -318,27 +326,57 @@ class AscentSimEnv:
 
 
 async def calibrate_sim_physics(config: AppConfig, episodes: int = 10) -> dict[str, float]:
-    env = AscentSimEnv(config)
-    scores: list[float] = []
-    lengths: list[int] = []
     import random
 
-    state = await env.reset()
+    env = AscentSimEnv(config)
+    random_scores: list[float] = []
+    random_lengths: list[int] = []
+    climb_scores: list[float] = []
+
     for _ in range(episodes):
         steps = 0
-        while steps < 1200:
+        max_score = 0.0
+        await env.reset()
+        while steps < 800:
             action = random.randrange(config.action_count)
             result = await env.step(action)
-            state = result.state
             steps += 1
-            if result.done:
-                scores.append(float(result.frame_state.score or 0))
-                lengths.append(steps)
-                state = await env.reset()
+            if result.frame_state.score is not None:
+                max_score = max(max_score, float(result.frame_state.score))
+            if result.done or steps >= 800:
+                random_scores.append(max_score)
+                random_lengths.append(steps)
                 break
+
+    for _ in range(episodes):
+        steps = 0
+        max_score = 0.0
+        await env.reset()
+        while steps < 800:
+            action = random.choice([0, 2, 3, 5, 2, 3, 5])
+            result = await env.step(action)
+            steps += 1
+            if result.frame_state.score is not None:
+                max_score = max(max_score, float(result.frame_state.score))
+            if result.done or steps >= 800:
+                climb_scores.append(max_score)
+                break
+
     await env.close()
+    all_scores = random_scores + climb_scores
+    sorted_scores = sorted(all_scores)
+    p90 = sorted_scores[int(len(sorted_scores) * 0.9)] if sorted_scores else 0.0
     return {
-        "episodes": float(len(scores)),
-        "mean_score": float(sum(scores) / len(scores)) if scores else 0.0,
-        "mean_length": float(sum(lengths) / len(lengths)) if lengths else 0.0,
+        "episodes": float(len(random_scores)),
+        "mean_score": float(sum(random_scores) / len(random_scores))
+        if random_scores
+        else 0.0,
+        "mean_length": float(sum(random_lengths) / len(random_lengths))
+        if random_lengths
+        else 0.0,
+        "climb_mean_score": float(sum(climb_scores) / len(climb_scores))
+        if climb_scores
+        else 0.0,
+        "max_score": float(max(all_scores)) if all_scores else 0.0,
+        "p90_score": float(p90),
     }

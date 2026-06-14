@@ -23,6 +23,10 @@ class FrameState:
     nearest_platform_dx: float | None = None
     nearest_platform_dy: float | None = None
     platform_mask: np.ndarray | None = None
+    combo: int = 0
+    streak: int = 0
+    score_multiplier: float = 1.0
+    platform_landed: bool = False
     game_over: bool = False
     in_menu: bool = False
 
@@ -218,6 +222,20 @@ def platform_mask_from_state(frame_state: FrameState, frame_rgb: np.ndarray) -> 
     return build_platform_mask(frame_rgb)
 
 
+def parse_combo_from_text(text: str) -> int | None:
+    match = re.search(r"x(\d+)\s*STREAK", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def parse_multiplier_from_text(text: str) -> float | None:
+    match = re.search(r"[×x]([\d.]+)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
 def merge_dom_state(frame_state: FrameState, body_text: str) -> FrameState:
     text = body_text.upper()
     frame_state.game_over = "FELL" in text or "BACK TO EARTH" in text
@@ -225,4 +243,11 @@ def merge_dom_state(frame_state: FrameState, body_text: str) -> FrameState:
     parsed_score = parse_score_from_text(body_text)
     if parsed_score is not None:
         frame_state.score = parsed_score
+    combo = parse_combo_from_text(body_text)
+    if combo is not None:
+        frame_state.combo = combo
+        frame_state.streak = combo // 10
+    multiplier = parse_multiplier_from_text(body_text)
+    if multiplier is not None:
+        frame_state.score_multiplier = multiplier
     return frame_state
