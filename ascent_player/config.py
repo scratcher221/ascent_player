@@ -34,6 +34,10 @@ class BrowserConfig:
     viewport_height: int = 720
     rescan_seconds: int = 5
     canvas_selector: str = "#gameCanvas"
+    # Read canvas pixels via JS instead of Playwright element screenshots.
+    # Element screenshots scroll into view and cause visible flicker.
+    use_js_canvas_capture: bool = True
+    dom_poll_interval: int = 12
 
 
 @dataclass(slots=True)

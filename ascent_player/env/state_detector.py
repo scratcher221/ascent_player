@@ -60,10 +60,25 @@ def estimate_score(frame_rgb: np.ndarray) -> int | None:
     return total
 
 
+def detect_game_over_visual(frame_rgb: np.ndarray) -> bool:
+    """Heuristic game-over overlay detection without DOM queries."""
+    if frame_rgb.size == 0:
+        return False
+    height, width = frame_rgb.shape[:2]
+    center = frame_rgb[
+        int(height * 0.28) : int(height * 0.72),
+        int(width * 0.18) : int(width * 0.82),
+    ]
+    gray = cv2.cvtColor(center, cv2.COLOR_RGB2GRAY)
+    bright = gray > 185
+    # Death screen shows large bright title text in the center.
+    return float(np.mean(bright)) > 0.04 and float(np.std(gray)) > 35.0
+
+
 def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
     orb = detect_orb(frame_rgb)
     score = estimate_score(frame_rgb)
-    state = FrameState(score=score)
+    state = FrameState(score=score, game_over=detect_game_over_visual(frame_rgb))
     if orb is not None:
         state.orb_x, state.orb_y = orb
     return state

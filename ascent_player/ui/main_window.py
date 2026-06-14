@@ -58,6 +58,7 @@ class TrainingWorker(QThread):
         self.watch_mode = config.training.watch_mode
         self.save_requested = False
         self.load_requested = False
+        self._preview_stride = 2
 
     def stop(self) -> None:
         self.running = False
@@ -124,7 +125,8 @@ class TrainingWorker(QThread):
                 episode_reward += result.reward
                 episode_score = float(result.frame_state.score or episode_score)
 
-                self.frame_ready.emit(qimage_bytes_from_frame(result.raw_frame))
+                if metrics.total_steps % self._preview_stride == 0:
+                    self.frame_ready.emit(qimage_bytes_from_frame(result.raw_frame))
                 self.metrics_ready.emit(
                     WorkerMetrics(
                         episode=episode,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,18 @@ from PIL import Image
 
 from ascent_player.config import BrowserConfig
 from ascent_player.env.browser_discovery import CdpTab, discover_ascent_tab
+
+_CANVAS_DATA_URL_JS = """
+(selector) => {
+    const canvas = document.querySelector(selector);
+    if (!canvas) return null;
+    try {
+        return canvas.toDataURL('image/png');
+    } catch (error) {
+        return null;
+    }
+}
+"""
 
 
 @dataclass(slots=True)
@@ -31,6 +44,7 @@ class BrowserBackend:
         self.page: Any | None = None
         self.launched_browser = False
         self.status = BrowserStatus()
+        self._focused_once = False
 
     async def start(self) -> None:
         if self.playwright is not None:
@@ -121,7 +135,11 @@ class BrowserBackend:
         self._require_page()
         if navigate_if_needed and self.config.host_match not in self.page.url:
             await self.page.goto(self.config.ascent_url, wait_until="domcontentloaded")
-        await self.page.bring_to_front()
+        # Only raise the tab once at connect/reset — repeated bring_to_front()
+        # during play steals focus and can make the window appear to flicker.
+        if not getattr(self, "_focused_once", False):
+            await self.page.bring_to_front()
+            self._focused_once = True
         try:
             await self.page.wait_for_selector(
                 self.config.canvas_selector,
@@ -134,8 +152,30 @@ class BrowserBackend:
 
     async def canvas_screenshot(self) -> np.ndarray:
         self._require_page()
+        if self.config.use_js_canvas_capture:
+            frame = await self._canvas_screenshot_js()
+            if frame is not None:
+                return frame
+        return await self._canvas_screenshot_playwright()
+
+    async def _canvas_screenshot_js(self) -> np.ndarray | None:
+        data_url = await self.page.evaluate(
+            _CANVAS_DATA_URL_JS,
+            self.config.canvas_selector,
+        )
+        if not isinstance(data_url, str) or not data_url.startswith("data:image/png;base64,"):
+            return None
+        raw = base64.b64decode(data_url.split(",", 1)[1])
+        image = Image.open(io.BytesIO(raw)).convert("RGB")
+        return np.asarray(image)
+
+    async def _canvas_screenshot_playwright(self) -> np.ndarray:
         locator = self.page.locator(self.config.canvas_selector)
-        png = await locator.screenshot(type="png")
+        png = await locator.screenshot(
+            type="png",
+            animations="disabled",
+            caret="hide",
+        )
         image = Image.open(io.BytesIO(png)).convert("RGB")
         return np.asarray(image)
 
@@ -189,6 +229,7 @@ class BrowserBackend:
         self.page = None
         self.launched_browser = False
         self.status = BrowserStatus()
+        self._focused_once = False
 
     async def stop(self) -> None:
         await self.disconnect(close_user_browser=False)

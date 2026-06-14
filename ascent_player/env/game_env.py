@@ -40,6 +40,7 @@ class AscentGameEnv:
         self.held_keys: set[str] = set()
         self.last_raw_frame: np.ndarray | None = None
         self.recent_states: deque[FrameState] = deque(maxlen=8)
+        self._step_count = 0
 
     async def connect(self) -> None:
         await self.backend.connect_auto()
@@ -48,6 +49,7 @@ class AscentGameEnv:
         self.reward_tracker.reset()
         self.frame_stack.clear()
         self.recent_states.clear()
+        self._step_count = 0
         await self._release_all()
         await self.backend.force_open_game()
         await self._start_or_restart()
@@ -87,8 +89,12 @@ class AscentGameEnv:
 
     async def _detect_state(self, frame: np.ndarray) -> FrameState:
         state = detect_from_frame(frame)
-        body_text = await self.backend.text_content()
-        return merge_dom_state(state, body_text)
+        interval = max(1, self.config.browser.dom_poll_interval)
+        if self._step_count % interval == 0:
+            body_text = await self.backend.text_content()
+            state = merge_dom_state(state, body_text)
+        self._step_count += 1
+        return state
 
     async def _start_or_restart(self) -> None:
         body = (await self.backend.text_content()).upper()
