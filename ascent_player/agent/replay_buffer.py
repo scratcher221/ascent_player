@@ -36,6 +36,26 @@ class ReplayBuffer:
         with self._lock:
             self._items.append((state.copy(), action, reward, next_state.copy(), done))
 
+    def add_many(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray,
+    ) -> None:
+        with self._lock:
+            for idx in range(len(actions)):
+                self._items.append(
+                    (
+                        states[idx].copy(),
+                        int(actions[idx]),
+                        float(rewards[idx]),
+                        next_states[idx].copy(),
+                        bool(dones[idx]),
+                    )
+                )
+
     def sample(self, batch_size: int) -> TransitionBatch:
         with self._lock:
             batch = random.sample(self._items, batch_size)

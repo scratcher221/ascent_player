@@ -8,6 +8,7 @@ import numpy as np
 from ascent_player.config import AppConfig, RewardConfig
 from ascent_player.env.game_env import ACTION_LABELS, StepResult
 from ascent_player.env.platform_detector import Platform, nearest_safe_platform
+from ascent_player.env.fast_sim_obs import fast_build_observation
 from ascent_player.env.rewards import RewardTracker
 from ascent_player.env.sim_physics import SimPhysicsConfig, SimWorld
 from ascent_player.env.state_detector import FrameState, mask_jump_action
@@ -122,20 +123,32 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
 
 
 class AscentSimEnv:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        fast_mode: bool | None = None,
+        env_index: int = 0,
+    ) -> None:
         self.config = config
+        self.fast_mode = (
+            config.training.sim_fast_observations
+            if fast_mode is None
+            else fast_mode
+        )
         self.reward_tracker = RewardTracker(config.reward)
         self.frame_stack = FrameStack(config.observation.frame_stack)
         self.world = SimWorld(
             SimPhysicsConfig(
                 width=640,
                 height=360,
-                seed=config.training.baseline_episodes,
+                seed=config.training.baseline_episodes + env_index * 7919,
             )
         )
         self.held_left = False
         self.held_right = False
         self._last_frame_state: FrameState | None = None
+        self._current_state: np.ndarray | None = None
 
     @property
     def can_boost(self) -> bool:
@@ -149,15 +162,37 @@ class AscentSimEnv:
             return 1.0
         return self._last_frame_state.boost_level
 
+    @property
+    def current_state(self) -> np.ndarray:
+        if self._current_state is None:
+            raise RuntimeError("Environment has not been reset.")
+        return self._current_state
+
     async def connect(self) -> None:
         return None
 
-    async def reset(self) -> np.ndarray:
+    def reset_sync(self) -> np.ndarray:
         self.reward_tracker.reset()
         self.frame_stack.clear()
         self.held_left = False
         self.held_right = False
         self.world.reset()
+        self._current_state = self._build_state()
+        return self._current_state
+
+    async def reset(self) -> np.ndarray:
+        return self.reset_sync()
+
+    def _build_state(self) -> np.ndarray:
+        if self.fast_mode:
+            frame_state = self._frame_state_fast()
+            self._last_frame_state = frame_state
+            return fast_build_observation(
+                self.world,
+                self.frame_stack,
+                self.config.observation,
+            )
+
         frame = render_sim_frame(self.world)
         frame_state = frame_state_from_world(self.world, frame)
         self._last_frame_state = frame_state
@@ -170,7 +205,42 @@ class AscentSimEnv:
             frame_state.platform_mask,
         )
 
-    async def step(self, action: int) -> StepResult:
+    def _frame_state_fast(self) -> FrameState:
+        ball = self.world.ball
+        screen_y = ball.y - self.world.camera_y
+        scale_x = self.config.observation.width / self.world.config.width
+        scale_y = self.config.observation.height / self.world.config.height
+        platforms = [
+            Platform(
+                cx=platform.cx * scale_x,
+                cy=(platform.cy - self.world.camera_y) * scale_y,
+                width=platform.width * scale_x,
+                height=platform.height * scale_y,
+                is_hazard=platform.is_hazard,
+            )
+            for platform in self.world.platforms
+        ]
+        platform_dx, platform_dy = nearest_safe_platform(
+            ball.x * scale_x,
+            screen_y * scale_y,
+            platforms,
+            (self.config.observation.height, self.config.observation.width),
+        )
+        from ascent_player.env.fast_sim_obs import fast_platform_mask
+
+        return FrameState(
+            orb_x=ball.x * scale_x,
+            orb_y=screen_y * scale_y,
+            score=self.world.score,
+            boost_level=self.world.boost_level,
+            can_boost=self.world.can_boost,
+            nearest_platform_dx=platform_dx,
+            nearest_platform_dy=platform_dy,
+            platform_mask=fast_platform_mask(self.world, self.config.observation),
+            game_over=False,
+        )
+
+    def step_sync(self, action: int) -> StepResult:
         action = mask_jump_action(action, self.can_boost)
         self._apply_action(action)
         jump_once = action in (3, 4, 5) and self.can_boost
@@ -187,31 +257,53 @@ class AscentSimEnv:
             if done:
                 break
 
-        frame = render_sim_frame(self.world)
-        frame_state = frame_state_from_world(self.world, frame)
-        frame_state.game_over = (
-            self.world.ball.y
-            > self.world.camera_y
-            + self.world.config.height
-            + self.world.config.death_margin_below_camera
-        )
-        self._last_frame_state = frame_state
-        state = build_observation(
-            frame,
-            self.frame_stack,
-            self.config.observation,
-            frame_state.boost_level,
-            frame_state.platform_mask,
-        )
+        if self.fast_mode:
+            frame_state = self._frame_state_fast()
+            frame_state.game_over = done or (
+                self.world.ball.y
+                > self.world.camera_y
+                + self.world.config.height
+                + self.world.config.death_margin_below_camera
+            )
+            self._last_frame_state = frame_state
+            state = fast_build_observation(
+                self.world,
+                self.frame_stack,
+                self.config.observation,
+            )
+            raw_frame = np.zeros((1, 1, 3), dtype=np.uint8)
+        else:
+            frame = render_sim_frame(self.world)
+            frame_state = frame_state_from_world(self.world, frame)
+            frame_state.game_over = (
+                self.world.ball.y
+                > self.world.camera_y
+                + self.world.config.height
+                + self.world.config.death_margin_below_camera
+            )
+            self._last_frame_state = frame_state
+            state = build_observation(
+                frame,
+                self.frame_stack,
+                self.config.observation,
+                frame_state.boost_level,
+                frame_state.platform_mask,
+            )
+            raw_frame = frame
+
         reward = self.reward_tracker.compute(frame_state, action)
         done = frame_state.game_over
+        self._current_state = state
         return StepResult(
             state=state,
             reward=reward,
             done=done,
-            raw_frame=frame,
+            raw_frame=raw_frame,
             frame_state=frame_state,
         )
+
+    async def step(self, action: int) -> StepResult:
+        return self.step_sync(action)
 
     async def close(self) -> None:
         return None

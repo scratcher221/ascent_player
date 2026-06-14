@@ -3,6 +3,11 @@ from __future__ import annotations
 import argparse
 import sys
 
+# Configure NVIDIA pip library paths before TensorFlow can be imported anywhere.
+from ascent_player.utils.gpu_env import bootstrap_gpu_environment
+
+bootstrap_gpu_environment()
+
 from ascent_player.config import AppConfig, DeviceMode
 
 
@@ -22,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         choices=[mode.value for mode in DeviceMode],
-        default=DeviceMode.AUTO.value,
+        default=DeviceMode.GPU.value,
         help="Compute device preference for TensorFlow",
     )
     parser.add_argument(
@@ -55,6 +60,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run a short random-policy calibration report for the simulator",
     )
+    parser.add_argument(
+        "--sim-envs",
+        type=int,
+        default=0,
+        help="Parallel simulator envs for pretrain (0 = auto from CPU count)",
+    )
     return parser.parse_args()
 
 
@@ -68,6 +79,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     config.training.sim_mode = args.sim
     config.training.sim_pretrain_steps = max(0, int(args.pretrain_steps))
     config.training.transfer_from_sim = args.transfer_from_sim
+    config.training.sim_pretrain_envs = max(0, int(args.sim_envs))
     if args.watch:
         config.training.epsilon_start = 0.0
         config.training.epsilon_end = 0.0
@@ -97,7 +109,7 @@ def run_no_ui(config: AppConfig) -> int:
     )
 
     if config.training.sim_pretrain_steps > 0:
-        asyncio.run(run_sim_pretrain(config, config.training.sim_pretrain_steps))
+        run_sim_pretrain(config, config.training.sim_pretrain_steps)
         return 0
     if config.training.sim_mode and "--calibrate-sim" in sys.argv:
         asyncio.run(run_sim_calibration(config))
@@ -119,11 +131,9 @@ def main() -> int:
         return 0
     if args.pretrain_steps > 0:
         config.training.sim_mode = True
-        import asyncio
-
         from ascent_player.training import run_sim_pretrain
 
-        asyncio.run(run_sim_pretrain(config, args.pretrain_steps))
+        run_sim_pretrain(config, args.pretrain_steps)
         return 0
     if args.no_ui:
         return run_no_ui(config)

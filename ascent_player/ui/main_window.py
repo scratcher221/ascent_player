@@ -32,6 +32,7 @@ from ascent_player.ui.widgets import (
     ProgressPanel,
 )
 from ascent_player.utils.preprocessing import qimage_bytes_from_frame
+from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
 
 
 @dataclass(slots=True)
@@ -201,20 +202,34 @@ class TrainingWorker(QThread):
         env = AscentGameEnv(self.config, backend)
         agent = DQNAgent(self.config)
         load_result = agent.try_autoload()
+        logger = TrainingLogger(self.config, "browser")
+        logger.log_session_start(
+            agent,
+            message=load_result.message,
+            extra={"ui_mode": not self.config.training.watch_mode},
+        )
+        load_result = type(load_result)(
+            load_result.loaded,
+            f"{load_result.message}\n\nTraining log:\n{logger.path}",
+            load_result.progress,
+        )
         self.session_ready.emit(load_result)
         episode = agent.progress.episodes_completed
-        autosave_message = "Autosave: pending"
+        autosave_message = f"Training log: {logger.path.name}"
         try:
-            self.status_ready.emit("Connecting browser...")
+            self.status_ready.emit(f"Connecting browser... | log: {logger.path.name}")
             status = await backend.connect_auto()
             self.status_ready.emit(_format_browser_status(status))
             if not status.connected:
+                logger.log_note(f"browser_connect_failed={status.message}")
+                logger.close(agent)
                 return
 
             if self.config.demo.use_demos_on_start:
                 result = ingest_demonstrations(agent, self.config)
                 if result.transitions_added or result.transitions_skipped:
                     self.status_ready.emit(result.status_message)
+                    logger.log_note(f"demo_ingest={result.status_message}")
 
             state = await env.reset()
             episode_reward = 0.0
@@ -234,10 +249,14 @@ class TrainingWorker(QThread):
                     self.status_ready.emit(
                         "Loaded checkpoint" if loaded else "No checkpoint found"
                     )
+                    logger.log_note(
+                        f"checkpoint_load={'ok' if loaded else 'missing'}"
+                    )
                     self.load_requested = False
                 if self.save_requested:
                     path = agent.save()
                     autosave_message = f"Autosave: saved {path.name}"
+                    logger.log_note(f"checkpoint_save={path}")
                     self.save_requested = False
 
                 step_started = time.perf_counter()
@@ -248,6 +267,10 @@ class TrainingWorker(QThread):
                     boost_level=env.boost_level,
                 )
                 result = await env.step(action)
+                step_ms = (time.perf_counter() - step_started) * 1000.0
+                if step_ms > 0:
+                    instant_hz = 1000.0 / step_ms
+                    self._loop_hz = (0.85 * self._loop_hz) + (0.15 * instant_hz)
                 agent.remember(
                     state,
                     action,
@@ -256,18 +279,33 @@ class TrainingWorker(QThread):
                     result.done,
                 )
                 metrics = self._schedule_training(agent)
-                state = result.state
+                self._collect_train_metrics(agent)
                 episode_reward += result.reward
                 if result.frame_state.score is not None:
                     episode_score = float(result.frame_state.score)
                     episode_max_score = max(episode_max_score, episode_score)
                     score_velocity = episode_score - prev_step_score
                     prev_step_score = episode_score
-
-                step_ms = (time.perf_counter() - step_started) * 1000.0
-                if step_ms > 0:
-                    instant_hz = 1000.0 / step_ms
-                    self._loop_hz = (0.85 * self._loop_hz) + (0.15 * instant_hz)
+                logger.record_browser_step(
+                    action,
+                    result.reward,
+                    result.frame_state,
+                    agent,
+                    can_boost=env.can_boost,
+                    boost_level=env.boost_level,
+                    done=result.done,
+                    context=BrowserStepContext(
+                        step_ms=step_ms,
+                        loop_hz=self._loop_hz,
+                        score_velocity=score_velocity,
+                        episode_reward=episode_reward,
+                        total_steps=agent.metrics.total_steps,
+                    ),
+                    train_loss=agent.metrics.loss,
+                    train_ms=agent.metrics.train_ms,
+                )
+                logger.maybe_flush(agent, agent.metrics.total_steps)
+                state = result.state
 
                 if metrics.total_steps % self._preview_stride == 0:
                     self.frame_ready.emit(qimage_bytes_from_frame(result.raw_frame))
@@ -313,6 +351,12 @@ class TrainingWorker(QThread):
                         )
                     )
                     agent.record_episode(episode_reward, episode_max_score)
+                    logger.log_episode_end(
+                        agent,
+                        episode,
+                        episode_reward,
+                        episode_max_score,
+                    )
                     agent.end_episode()
                     if agent.maybe_autosave(force=True):
                         autosave_message = (
@@ -335,6 +379,8 @@ class TrainingWorker(QThread):
                 self.status_ready.emit(autosave_message)
             except Exception:
                 pass
+            logger.close(agent)
+            self.status_ready.emit(f"Training log saved: {logger.path}")
             await env.close()
             self.shutdown()
 

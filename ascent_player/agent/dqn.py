@@ -84,6 +84,25 @@ class DQNAgent:
             sample,
             self.device_info,
         )
+        self._batch_predict = self._build_batch_predict()
+
+    def apply_sim_pretrain_profile(self) -> None:
+        training = self.config.training
+        self.train_every = max(1, training.sim_pretrain_train_every)
+        self.batch_size = max(self.batch_size, training.sim_pretrain_batch_size)
+        self.config.training.min_replay_size = min(
+            self.config.training.min_replay_size,
+            training.sim_pretrain_min_replay,
+        )
+
+    def _build_batch_predict(self):
+        agent = self
+
+        @self.tf.function(reduce_retracing=True)
+        def batch_predict(states):
+            return agent.online(states, training=False)
+
+        return batch_predict
 
     def act(
         self,
@@ -104,6 +123,43 @@ class DQNAgent:
         for action in valid:
             masked[action] = q_values[action]
         return int(np.argmax(masked))
+
+    def act_batch(
+        self,
+        states: np.ndarray,
+        *,
+        training: bool = True,
+        can_boost: np.ndarray | list[bool] | None = None,
+        boost_levels: np.ndarray | list[float] | None = None,
+    ) -> np.ndarray:
+        batch_size = len(states)
+        if can_boost is None:
+            can_boost = np.ones(batch_size, dtype=bool)
+        if boost_levels is None:
+            boost_levels = np.ones(batch_size, dtype=np.float32)
+
+        actions = np.zeros(batch_size, dtype=np.int32)
+        explore_mask = np.zeros(batch_size, dtype=bool)
+        if training and self.epsilon > 0.0:
+            explore_mask = np.random.random(batch_size) < self.epsilon
+
+        greedy_indices = np.flatnonzero(~explore_mask)
+        if len(greedy_indices) > 0:
+            with self.tf.device(self.device_info.inference_device):
+                q_values = self._batch_predict(
+                    self.tf.convert_to_tensor(states[greedy_indices], dtype=self.tf.float32)
+                ).numpy()
+            for offset, index in enumerate(greedy_indices):
+                valid = self._valid_actions(bool(can_boost[index]), float(boost_levels[index]))
+                masked = np.full(self.config.action_count, -np.inf, dtype=np.float32)
+                for action in valid:
+                    masked[action] = q_values[offset, action]
+                actions[index] = int(np.argmax(masked))
+
+        for index in np.flatnonzero(explore_mask):
+            valid = self._valid_actions(bool(can_boost[index]), float(boost_levels[index]))
+            actions[index] = random.choice(valid)
+        return actions
 
     @staticmethod
     def _valid_actions(can_boost: bool, boost_level: float = 1.0) -> list[int]:
@@ -218,8 +274,24 @@ class DQNAgent:
         buffer.add(state, action, reward, next_state, done)
         self.metrics.replay_size = len(self.replay)
 
-    def maybe_train(self) -> AgentMetrics:
-        self.metrics.total_steps += 1
+    def remember_batch(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray,
+        *,
+        sim: bool = False,
+    ) -> None:
+        buffer = self.sim_replay if sim else self.replay
+        buffer.add_many(states, actions, rewards, next_states, dones)
+        self.metrics.replay_size = len(self.replay)
+
+    def advance_steps(self, count: int = 1) -> AgentMetrics:
+        if count <= 0:
+            return self.metrics
+        self.metrics.total_steps += count
         if self.config.training.watch_mode:
             return self.metrics
         if len(self.replay) < self.config.training.min_replay_size:
@@ -240,6 +312,9 @@ class DQNAgent:
         else:
             self._sync_target_network(hard=False)
         return self.metrics
+
+    def maybe_train(self) -> AgentMetrics:
+        return self.advance_steps(1)
 
     def _sample_training_batch(self) -> TransitionBatch:
         batch_size = self.batch_size

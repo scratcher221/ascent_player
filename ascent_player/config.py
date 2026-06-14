@@ -135,8 +135,19 @@ class TrainingConfig:
     transfer_learning_rate: float = 1e-4
     transfer_epsilon_start: float = 0.3
     mixed_sim_replay_ratio: float = 0.1
-    device_mode: DeviceMode = DeviceMode.AUTO
+    device_mode: DeviceMode = DeviceMode.GPU
     watch_mode: bool = False
+    # Fast headless pretrain: parallel envs, batched inference, lightweight obs.
+    sim_pretrain_envs: int = 0
+    sim_pretrain_train_every: int = 32
+    sim_pretrain_batch_size: int = 128
+    sim_pretrain_min_replay: int = 256
+    sim_fast_observations: bool = True
+    log_dir: Path = Path("logs")
+    log_interval_steps: int = 500
+    log_interval_steps_sim: int = 2500
+    log_browser_detail_steps: int = 100
+    log_weight_norm_every: int = 5000
 
 
 @dataclass(slots=True)

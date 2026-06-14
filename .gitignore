@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 checkpoints/
+logs/
 *.keras
 # Human demonstrations (optional, large)
 demonstrations/*.npz

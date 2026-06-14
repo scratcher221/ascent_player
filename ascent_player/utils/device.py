@@ -7,6 +7,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from ascent_player.config import DeviceMode
+from ascent_player.utils.gpu_env import bootstrap_gpu_environment, nvidia_library_dirs
+
+
+class GpuNotAvailableError(RuntimeError):
+    """Raised when GPU training was requested but TensorFlow cannot use a GPU."""
 
 
 @dataclass(slots=True)
@@ -22,6 +27,8 @@ class DeviceInfo:
 def import_tensorflow(device_mode: DeviceMode):
     if device_mode == DeviceMode.CPU:
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+    else:
+        bootstrap_gpu_environment()
 
     import tensorflow as tf
 
@@ -39,6 +46,21 @@ def resolve_device(device_mode: DeviceMode) -> DeviceInfo:
         except RuntimeError:
             pass
         gpu_names.append(gpu.name)
+
+    if device_mode != DeviceMode.CPU and not gpus:
+        lib_dirs = nvidia_library_dirs()
+        preloaded = bootstrap_gpu_environment()
+        hint = (
+            "TensorFlow could not load the GPU. On Linux with pip CUDA wheels, "
+            "NVIDIA libraries must be on LD_LIBRARY_PATH before TensorFlow imports. "
+            "Reinstall with: pip install 'tensorflow[and-cuda]>=2.15' "
+            "and ensure the NVIDIA driver works (nvidia-smi)."
+        )
+        if lib_dirs:
+            hint += f" Found {len(lib_dirs)} NVIDIA lib dirs, preloaded {preloaded} libraries."
+        else:
+            hint += " No nvidia-* pip packages found in the active environment."
+        raise GpuNotAvailableError(hint)
 
     if device_mode == DeviceMode.CPU or not gpus:
         return DeviceInfo(
@@ -61,13 +83,9 @@ def resolve_device(device_mode: DeviceMode) -> DeviceInfo:
 
 
 def benchmark_inference_device(model, sample: np.ndarray, info: DeviceInfo) -> str:
-    if info.mode != DeviceMode.AUTO or not info.gpu_available:
+    if info.mode == DeviceMode.CPU or not info.gpu_available:
         return info.inference_device
-
-    tf = import_tensorflow(DeviceMode.AUTO)
-    cpu_ms = _time_forward(tf, model, sample, "/CPU:0")
-    gpu_ms = _time_forward(tf, model, sample, "/GPU:0")
-    return "/GPU:0" if gpu_ms < cpu_ms else "/CPU:0"
+    return "/GPU:0"
 
 
 def _time_forward(tf, model, sample: np.ndarray, device: str) -> float:
@@ -78,6 +96,5 @@ def _time_forward(tf, model, sample: np.ndarray, device: str) -> float:
         start = time.perf_counter()
         for _ in range(10):
             _ = model(tensor, training=False)
-        # Ensure pending device work is materialized.
         _ = model(tensor, training=False).numpy()
     return (time.perf_counter() - start) * 1000 / 10

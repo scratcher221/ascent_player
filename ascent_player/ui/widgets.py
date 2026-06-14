@@ -166,7 +166,8 @@ class HyperparameterPanel(QGroupBox):
         self.mode = QComboBox()
         self.mode.addItems(["train", "watch", "paused"])
         self.device = QComboBox()
-        self.device.addItems(["auto", "gpu", "cpu"])
+        self.device.addItems(["gpu", "auto", "cpu"])
+        self.device.setCurrentText("gpu")
 
         self.learning_rate = QDoubleSpinBox()
         self.learning_rate.setDecimals(6)
