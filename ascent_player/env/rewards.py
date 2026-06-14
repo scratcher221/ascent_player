@@ -33,6 +33,7 @@ class RewardTracker:
             reward += self._falling_penalty(previous, state)
             reward += self._idle_penalty(previous, state, action)
             reward += self._boost_reward(previous, state, action)
+            reward += self._platform_reward(previous, state, action)
 
         if state.game_over:
             reward += self.config.death
@@ -105,5 +106,50 @@ class RewardTracker:
 
         if state.boost_level < 0.05:
             reward += self.config.low_boost_penalty
+
+        return reward
+
+    def _platform_reward(
+        self,
+        previous: FrameState,
+        state: FrameState,
+        action: int,
+    ) -> float:
+        if state.nearest_platform_dx is None:
+            return 0.0
+
+        falling = (
+            previous.orb_y is not None
+            and state.orb_y is not None
+            and state.orb_y > previous.orb_y + 4
+        )
+        if not falling:
+            return 0.0
+
+        reward = 0.0
+        dx = state.nearest_platform_dx
+        if dx < -0.02 and action in (1, 4):
+            reward += self.config.platform_align * min(abs(dx) * 3.0, 1.0)
+        elif dx > 0.02 and action in (2, 5):
+            reward += self.config.platform_align * min(abs(dx) * 3.0, 1.0)
+
+        if previous.nearest_platform_dx is not None:
+            prev_dist = abs(previous.nearest_platform_dx)
+            curr_dist = abs(state.nearest_platform_dx)
+            if curr_dist < prev_dist:
+                reward += (
+                    (prev_dist - curr_dist)
+                    * self.config.platform_align
+                    * self.config.platform_fall_weight
+                )
+
+        if (
+            previous.nearest_platform_dy is not None
+            and state.nearest_platform_dy is not None
+            and state.nearest_platform_dy > 0
+        ):
+            dy_gain = previous.nearest_platform_dy - state.nearest_platform_dy
+            if dy_gain > 0:
+                reward += dy_gain * self.config.platform_align
 
         return reward

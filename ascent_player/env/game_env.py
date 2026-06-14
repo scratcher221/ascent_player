@@ -13,6 +13,7 @@ from ascent_player.env.state_detector import (
     detect_from_frame,
     mask_jump_action,
     merge_dom_state,
+    platform_mask_from_state,
 )
 from ascent_player.utils.preprocessing import (
     FrameStack,
@@ -86,6 +87,7 @@ class AscentGameEnv:
             self.frame_stack.array(),
             self.config.observation,
             frame_state.boost_level,
+            platform_mask_from_state(frame_state, frame),
         )
 
     async def step(self, action: int) -> StepResult:
@@ -101,6 +103,7 @@ class AscentGameEnv:
             self.frame_stack,
             self.config.observation,
             frame_state.boost_level,
+            platform_mask_from_state(frame_state, frame),
         )
         reward = self.reward_tracker.compute(frame_state, action)
         done = frame_state.game_over
@@ -125,6 +128,9 @@ class AscentGameEnv:
 
     async def _detect_state(self, frame: np.ndarray) -> FrameState:
         state = detect_from_frame(frame)
+        hud_score = await self.backend.read_game_score()
+        if hud_score is not None:
+            state.score = hud_score
         interval = max(1, self.config.browser.dom_poll_interval)
         if self._step_count % interval == 0:
             body_text = await self.backend.text_content()

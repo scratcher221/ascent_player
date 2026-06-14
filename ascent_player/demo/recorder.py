@@ -10,7 +10,11 @@ from ascent_player.demo.storage import DemoTransition, new_demo_path, save_demo
 from ascent_player.env.browser_backend import BrowserBackend
 from ascent_player.env.game_env import AscentGameEnv
 from ascent_player.env.rewards import RewardTracker
-from ascent_player.env.state_detector import detect_from_frame, merge_dom_state
+from ascent_player.env.state_detector import (
+    detect_from_frame,
+    merge_dom_state,
+    platform_mask_from_state,
+)
 
 
 @dataclass(slots=True)
@@ -44,6 +48,9 @@ class DemoRecorder:
         key_state = await read_keyboard_state(self.backend.page)
         action = keys_to_action(key_state)
         frame_state = detect_from_frame(frame)
+        hud_score = await self.backend.read_game_score()
+        if hud_score is not None:
+            frame_state.score = hud_score
         if len(self.transitions) % max(1, self.config.browser.dom_poll_interval) == 0:
             body_text = await self.backend.text_content()
             frame_state = merge_dom_state(frame_state, body_text)
@@ -55,6 +62,7 @@ class DemoRecorder:
             self.env.frame_stack,
             self.config.observation,
             frame_state.boost_level,
+            platform_mask_from_state(frame_state, frame),
         )
         done = frame_state.game_over
 

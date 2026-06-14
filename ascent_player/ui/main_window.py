@@ -186,7 +186,8 @@ class TrainingWorker(QThread):
                 metrics = agent.maybe_train()
                 state = result.state
                 episode_reward += result.reward
-                episode_score = float(result.frame_state.score or episode_score)
+                if result.frame_state.score is not None:
+                    episode_score = float(result.frame_state.score)
 
                 if metrics.total_steps % self._preview_stride == 0:
                     self.frame_ready.emit(qimage_bytes_from_frame(result.raw_frame))

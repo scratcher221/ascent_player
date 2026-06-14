@@ -46,10 +46,12 @@ class ObservationConfig:
     height: int = 84
     frame_stack: int = 4
     include_boost_channel: bool = True
+    include_platform_channel: bool = True
 
     @property
     def channel_count(self) -> int:
-        return self.frame_stack + (1 if self.include_boost_channel else 0)
+        extra = int(self.include_boost_channel) + int(self.include_platform_channel)
+        return self.frame_stack + extra
 
 
 @dataclass(slots=True)
@@ -69,6 +71,8 @@ class RewardConfig:
     low_boost_penalty: float = -0.05
     boost_jump_threshold: float = 0.06
     survival_step_bonus: float = 0.002
+    platform_align: float = 0.45
+    platform_fall_weight: float = 2.0
 
 
 @dataclass(slots=True)

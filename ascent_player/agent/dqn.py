@@ -117,6 +117,13 @@ class DQNAgent:
         multiplier: int = 1,
         indices: np.ndarray | None = None,
     ) -> int:
+        expected_channels = self.config.observation.channel_count
+        if (
+            states.ndim != 4
+            or states.shape[-1] != expected_channels
+            or next_states.shape[-1] != expected_channels
+        ):
+            return 0
         if indices is None:
             indices = np.arange(len(actions), dtype=np.int64)
         added = 0
@@ -227,10 +234,15 @@ class DQNAgent:
         target = path or self.config.training.checkpoint_path
         if not target.exists():
             return False
-        with self.tf.device(self.device_info.training_device):
-            loaded = self.tf.keras.models.load_model(target)
-            self.online.set_weights(loaded.get_weights())
-            self.target.set_weights(loaded.get_weights())
+        try:
+            with self.tf.device(self.device_info.training_device):
+                loaded = self.tf.keras.models.load_model(target)
+                if tuple(loaded.input_shape[1:]) != tuple(self.online.input_shape[1:]):
+                    return False
+                self.online.set_weights(loaded.get_weights())
+                self.target.set_weights(loaded.get_weights())
+        except Exception:
+            return False
         return True
 
     def _train_batch(self, batch: TransitionBatch):

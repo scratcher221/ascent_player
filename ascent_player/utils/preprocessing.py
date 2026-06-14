@@ -8,19 +8,41 @@ import numpy as np
 from ascent_player.config import ObservationConfig
 
 
+def _resize_mask(mask: np.ndarray, config: ObservationConfig) -> np.ndarray:
+    resized = cv2.resize(
+        mask,
+        (config.width, config.height),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized.astype(np.float32) / 255.0
+
+
 def append_observation_channels(
     stacked_frames: np.ndarray,
     config: ObservationConfig,
     boost_level: float,
+    platform_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    if not config.include_boost_channel:
+    channels: list[np.ndarray] = [stacked_frames]
+    if config.include_boost_channel:
+        boost_plane = np.full(
+            (config.height, config.width),
+            float(np.clip(boost_level, 0.0, 1.0)),
+            dtype=np.float32,
+        )
+        channels.append(boost_plane[..., np.newaxis])
+    if config.include_platform_channel:
+        if platform_mask is None or platform_mask.size == 0:
+            platform_plane = np.zeros(
+                (config.height, config.width, 1),
+                dtype=np.float32,
+            )
+        else:
+            platform_plane = _resize_mask(platform_mask, config)[..., np.newaxis]
+        channels.append(platform_plane)
+    if len(channels) == 1:
         return stacked_frames
-    boost_plane = np.full(
-        (config.height, config.width),
-        float(np.clip(boost_level, 0.0, 1.0)),
-        dtype=np.float32,
-    )
-    return np.concatenate([stacked_frames, boost_plane[..., np.newaxis]], axis=-1)
+    return np.concatenate(channels, axis=-1)
 
 
 def preprocess_frame(frame_rgb: np.ndarray, config: ObservationConfig) -> np.ndarray:
@@ -40,10 +62,16 @@ def build_observation(
     frame_stack: FrameStack,
     config: ObservationConfig,
     boost_level: float,
+    platform_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     gray = preprocess_frame(frame_rgb, config)
     stacked = frame_stack.append(gray)
-    return append_observation_channels(stacked, config, boost_level)
+    return append_observation_channels(
+        stacked,
+        config,
+        boost_level,
+        platform_mask,
+    )
 
 
 class FrameStack:

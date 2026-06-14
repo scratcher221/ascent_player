@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+from ascent_player.env.platform_detector import (
+    build_platform_mask,
+    detect_platforms,
+    nearest_safe_platform,
+)
 
 
 @dataclass(slots=True)
@@ -13,6 +20,9 @@ class FrameState:
     score: int | None = None
     boost_level: float = 1.0
     can_boost: bool = True
+    nearest_platform_dx: float | None = None
+    nearest_platform_dy: float | None = None
+    platform_mask: np.ndarray | None = None
     game_over: bool = False
     in_menu: bool = False
 
@@ -53,26 +63,40 @@ def detect_orb(frame_rgb: np.ndarray) -> tuple[float, float] | None:
     return moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
 
 
-def estimate_score(frame_rgb: np.ndarray) -> int | None:
-    """Rough HUD score estimate.
+def parse_score_from_text(text: str) -> int | None:
+    match = re.search(r"SCORE\s*(\d[\d\s_]*)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    digits = re.sub(r"\D", "", match.group(1))
+    if not digits:
+        return None
+    return int(digits)
 
-    This intentionally avoids a heavy OCR dependency. It detects bright score
-    glyph activity in the top-left HUD and returns a monotonic-ish proxy. The
-    reward layer only uses positive deltas, so noisy readings are tolerable.
-    """
+
+def estimate_score(frame_rgb: np.ndarray) -> int | None:
+    """Visual fallback for score digits in the HUD row."""
     if frame_rgb.size == 0:
         return None
     height, width = frame_rgb.shape[:2]
-    crop = frame_rgb[0 : max(1, int(height * 0.14)), 0 : max(1, int(width * 0.2))]
+    crop = frame_rgb[
+        int(height * 0.01) : max(2, int(height * 0.12)),
+        int(width * 0.08) : max(3, int(width * 0.28)),
+    ]
+    if crop.size == 0:
+        return None
+
     gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-    _, threshold = cv2.threshold(gray, 170, 255, cv2.THRESH_BINARY)
+    _, threshold = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
     components, _, stats, _ = cv2.connectedComponentsWithStats(threshold)
-    total = 0
-    for idx in range(1, components):
-        area = int(stats[idx, cv2.CC_STAT_AREA])
-        if 3 <= area <= 500:
-            total += area
-    return total
+    digit_areas = [
+        int(stats[idx, cv2.CC_STAT_AREA])
+        for idx in range(1, components)
+        if 8 <= int(stats[idx, cv2.CC_STAT_AREA]) <= 800
+    ]
+    if not digit_areas:
+        return None
+    # Monotonic proxy when OCR is ambiguous; DOM parsing is preferred.
+    return sum(digit_areas)
 
 
 def detect_game_over_visual(frame_rgb: np.ndarray) -> bool:
@@ -131,19 +155,41 @@ def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
     orb = detect_orb(frame_rgb)
     score = estimate_score(frame_rgb)
     boost_level, can_boost = detect_boost_bar(frame_rgb)
+    platforms = detect_platforms(frame_rgb)
+    platform_dx = None
+    platform_dy = None
+    if orb is not None:
+        platform_dx, platform_dy = nearest_safe_platform(
+            orb[0],
+            orb[1],
+            platforms,
+            frame_rgb.shape,
+        )
     state = FrameState(
         score=score,
         boost_level=boost_level,
         can_boost=can_boost,
+        nearest_platform_dx=platform_dx,
+        nearest_platform_dy=platform_dy,
         game_over=detect_game_over_visual(frame_rgb),
     )
     if orb is not None:
         state.orb_x, state.orb_y = orb
+    state.platform_mask = build_platform_mask(frame_rgb, platforms)
     return state
+
+
+def platform_mask_from_state(frame_state: FrameState, frame_rgb: np.ndarray) -> np.ndarray:
+    if frame_state.platform_mask is not None:
+        return frame_state.platform_mask
+    return build_platform_mask(frame_rgb)
 
 
 def merge_dom_state(frame_state: FrameState, body_text: str) -> FrameState:
     text = body_text.upper()
     frame_state.game_over = "FELL" in text or "BACK TO EARTH" in text
     frame_state.in_menu = "START THE ASCENT" in text or "PICK 1 ULTI" in text
+    parsed_score = parse_score_from_text(body_text)
+    if parsed_score is not None:
+        frame_state.score = parsed_score
     return frame_state

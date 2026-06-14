@@ -24,6 +24,21 @@ _CANVAS_DATA_URL_JS = """
 }
 """
 
+_READ_SCORE_JS = """
+() => {
+    const scoreNode = document.querySelector('#heightScore');
+    if (scoreNode) {
+        const digits = (scoreNode.textContent || '').replace(/\\D/g, '');
+        if (digits) return parseInt(digits, 10);
+    }
+    const body = document.body ? document.body.innerText : '';
+    const match = body.match(/SCORE\\s*([0-9][0-9\\s_]*)/i);
+    if (!match) return null;
+    const digits = match[1].replace(/\\D/g, '');
+    return digits ? parseInt(digits, 10) : 0;
+}
+"""
+
 
 @dataclass(slots=True)
 class BrowserStatus:
@@ -192,6 +207,16 @@ class BrowserBackend:
             return await self.page.locator("body").inner_text(timeout=500)
         except Exception:
             return ""
+
+    async def read_game_score(self) -> int | None:
+        self._require_page()
+        try:
+            score = await self.page.evaluate(_READ_SCORE_JS)
+            if score is None:
+                return None
+            return int(score)
+        except Exception:
+            return None
 
     async def click_text(self, text: str, timeout: int = 1_000) -> bool:
         self._require_page()
