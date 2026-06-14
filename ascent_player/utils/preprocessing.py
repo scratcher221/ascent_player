@@ -8,6 +8,21 @@ import numpy as np
 from ascent_player.config import ObservationConfig
 
 
+def append_observation_channels(
+    stacked_frames: np.ndarray,
+    config: ObservationConfig,
+    boost_level: float,
+) -> np.ndarray:
+    if not config.include_boost_channel:
+        return stacked_frames
+    boost_plane = np.full(
+        (config.height, config.width),
+        float(np.clip(boost_level, 0.0, 1.0)),
+        dtype=np.float32,
+    )
+    return np.concatenate([stacked_frames, boost_plane[..., np.newaxis]], axis=-1)
+
+
 def preprocess_frame(frame_rgb: np.ndarray, config: ObservationConfig) -> np.ndarray:
     if frame_rgb.ndim != 3:
         raise ValueError(f"Expected RGB frame, got shape {frame_rgb.shape}")
@@ -18,6 +33,17 @@ def preprocess_frame(frame_rgb: np.ndarray, config: ObservationConfig) -> np.nda
         interpolation=cv2.INTER_AREA,
     )
     return resized.astype(np.float32) / 255.0
+
+
+def build_observation(
+    frame_rgb: np.ndarray,
+    frame_stack: FrameStack,
+    config: ObservationConfig,
+    boost_level: float,
+) -> np.ndarray:
+    gray = preprocess_frame(frame_rgb, config)
+    stacked = frame_stack.append(gray)
+    return append_observation_channels(stacked, config, boost_level)
 
 
 class FrameStack:

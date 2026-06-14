@@ -48,7 +48,7 @@ class DQNAgent:
         input_shape = (
             config.observation.height,
             config.observation.width,
-            config.observation.frame_stack,
+            config.observation.channel_count,
         )
 
         with self.tf.device(self.device_info.training_device):
@@ -71,15 +71,25 @@ class DQNAgent:
             self.device_info,
         )
 
-    def act(self, state: np.ndarray, training: bool = True) -> int:
+    def act(self, state: np.ndarray, training: bool = True, can_boost: bool = True) -> int:
+        valid = self._valid_actions(can_boost)
         if training and random.random() < self.epsilon:
-            return random.randrange(self.config.action_count)
+            return random.choice(valid)
         with self.tf.device(self.device_info.inference_device):
             q_values = self.online(
                 self.tf.convert_to_tensor(state[None, ...], dtype=self.tf.float32),
                 training=False,
-            )
-        return int(self.tf.argmax(q_values[0]).numpy())
+            )[0].numpy()
+        masked = np.full(self.config.action_count, -np.inf, dtype=np.float32)
+        for action in valid:
+            masked[action] = q_values[action]
+        return int(np.argmax(masked))
+
+    @staticmethod
+    def _valid_actions(can_boost: bool) -> list[int]:
+        if can_boost:
+            return list(range(6))
+        return [0, 1, 2]
 
     def remember(
         self,

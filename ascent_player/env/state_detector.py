@@ -11,8 +11,23 @@ class FrameState:
     orb_x: float | None = None
     orb_y: float | None = None
     score: int | None = None
+    boost_level: float = 1.0
+    can_boost: bool = True
     game_over: bool = False
     in_menu: bool = False
+
+
+JUMP_ACTIONS = frozenset({3, 4, 5})
+
+
+def mask_jump_action(action: int, can_boost: bool) -> int:
+    if can_boost or action not in JUMP_ACTIONS:
+        return action
+    if action == 3:
+        return 0
+    if action == 4:
+        return 1
+    return 2
 
 
 def detect_orb(frame_rgb: np.ndarray) -> tuple[float, float] | None:
@@ -75,10 +90,53 @@ def detect_game_over_visual(frame_rgb: np.ndarray) -> bool:
     return float(np.mean(bright)) > 0.04 and float(np.std(gray)) > 35.0
 
 
+def detect_boost_bar(frame_rgb: np.ndarray) -> tuple[float, bool]:
+    """Estimate boost energy from the vertical bar at the bottom-left HUD."""
+    if frame_rgb.size == 0:
+        return 1.0, True
+
+    height, width = frame_rgb.shape[:2]
+    crop = frame_rgb[
+        int(height * 0.52) : int(height * 0.9),
+        int(width * 0.0) : max(2, int(width * 0.045)),
+    ]
+    if crop.size == 0:
+        return 1.0, True
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    green_mask = cv2.inRange(hsv, np.array([40, 70, 70]), np.array([95, 255, 255]))
+    red_mask1 = cv2.inRange(hsv, np.array([0, 70, 70]), np.array([12, 255, 255]))
+    red_mask2 = cv2.inRange(hsv, np.array([165, 70, 70]), np.array([180, 255, 255]))
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+
+    bar_height = max(1, green_mask.shape[0])
+    filled_rows = 0
+    for row in range(bar_height - 1, -1, -1):
+        if float(np.mean(green_mask[row])) > 18.0:
+            filled_rows += 1
+        elif filled_rows > 0:
+            break
+
+    boost_level = min(1.0, filled_rows / bar_height)
+    if boost_level < 0.08:
+        green_ratio = float(np.mean(green_mask > 0))
+        boost_level = min(1.0, green_ratio * 4.0)
+
+    red_ratio = float(np.mean(red_mask > 0))
+    can_boost = boost_level >= 0.14 and not (boost_level < 0.08 and red_ratio > 0.12)
+    return boost_level, can_boost
+
+
 def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
     orb = detect_orb(frame_rgb)
     score = estimate_score(frame_rgb)
-    state = FrameState(score=score, game_over=detect_game_over_visual(frame_rgb))
+    boost_level, can_boost = detect_boost_bar(frame_rgb)
+    state = FrameState(
+        score=score,
+        boost_level=boost_level,
+        can_boost=can_boost,
+        game_over=detect_game_over_visual(frame_rgb),
+    )
     if orb is not None:
         state.orb_x, state.orb_y = orb
     return state

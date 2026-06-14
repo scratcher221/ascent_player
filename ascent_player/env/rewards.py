@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ascent_player.config import RewardConfig
-from ascent_player.env.state_detector import FrameState
+from ascent_player.env.state_detector import JUMP_ACTIONS, FrameState
 
 
 @dataclass(slots=True)
@@ -24,6 +24,7 @@ class RewardTracker:
             reward += self._score_reward(previous, state)
             reward += self._altitude_reward(previous, state)
             reward += self._idle_penalty(previous, state, action)
+            reward += self._boost_reward(previous, state, action)
 
         if state.game_over:
             reward += self.config.death
@@ -62,3 +63,32 @@ class RewardTracker:
         if self.idle_steps > self.config.idle_steps:
             return self.config.idle_penalty
         return 0.0
+
+    def _boost_reward(
+        self,
+        previous: FrameState,
+        state: FrameState,
+        action: int,
+    ) -> float:
+        reward = 0.0
+        boost_delta = state.boost_level - previous.boost_level
+        if boost_delta > 0.03:
+            reward += boost_delta * self.config.boost_gain
+
+        if action in JUMP_ACTIONS:
+            reward += self.config.jump_penalty
+            if previous.boost_level < self.config.boost_jump_threshold:
+                reward += self.config.wasted_jump_penalty
+            elif boost_delta < -0.04:
+                reward += self.config.boost_spent
+                if (
+                    previous.orb_y is not None
+                    and state.orb_y is not None
+                    and state.orb_y >= previous.orb_y - 8
+                ):
+                    reward += self.config.wasted_jump_penalty * 0.5
+
+        if state.boost_level < 0.12:
+            reward += self.config.low_boost_penalty
+
+        return reward

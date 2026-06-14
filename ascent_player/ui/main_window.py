@@ -41,6 +41,8 @@ class WorkerMetrics:
     loss: float | None
     train_ms: float | None
     device: str
+    boost_level: float
+    can_boost: bool
 
 
 class TrainingWorker(QThread):
@@ -111,7 +113,11 @@ class TrainingWorker(QThread):
                     self.status_ready.emit(f"Saved checkpoint: {path}")
                     self.save_requested = False
 
-                action = agent.act(state, training=not self.watch_mode)
+                action = agent.act(
+                    state,
+                    training=not self.watch_mode,
+                    can_boost=env.can_boost,
+                )
                 result = await env.step(action)
                 agent.remember(
                     state,
@@ -139,6 +145,8 @@ class TrainingWorker(QThread):
                         loss=metrics.loss,
                         train_ms=metrics.train_ms,
                         device=agent.device_message,
+                        boost_level=env.boost_level,
+                        can_boost=env.can_boost,
                     )
                 )
 
@@ -313,6 +321,8 @@ class MainWindow(QMainWindow):
                     f"score {metrics.episode_score:.1f}",
                     f"eps {metrics.epsilon:.3f}",
                     f"action {metrics.action}",
+                    f"boost {metrics.boost_level:.0%}"
+                    + ("" if metrics.can_boost else " (empty)"),
                     f"replay {metrics.replay_size}",
                     f"steps {metrics.total_steps}",
                     f"loss {loss}",

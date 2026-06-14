@@ -21,7 +21,11 @@ async def run_training_no_ui(config: AppConfig, max_episodes: int | None = None)
         episode = 0
         episode_reward = 0.0
         while max_episodes is None or episode < max_episodes:
-            action = agent.act(state, training=not config.training.watch_mode)
+            action = agent.act(
+                state,
+                training=not config.training.watch_mode,
+                can_boost=env.can_boost,
+            )
             result = await env.step(action)
             agent.remember(state, action, result.reward, result.state, result.done)
             metrics = agent.maybe_train()
@@ -30,8 +34,8 @@ async def run_training_no_ui(config: AppConfig, max_episodes: int | None = None)
             if metrics.total_steps % 25 == 0:
                 print(
                     f"step={metrics.total_steps} action={ACTION_LABELS[action]} "
-                    f"reward={episode_reward:.1f} replay={metrics.replay_size} "
-                    f"loss={metrics.loss}"
+                    f"boost={env.boost_level:.0%} reward={episode_reward:.1f} "
+                    f"replay={metrics.replay_size} loss={metrics.loss}"
                 )
             if result.done:
                 print(

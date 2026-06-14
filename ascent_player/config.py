@@ -45,6 +45,11 @@ class ObservationConfig:
     width: int = 84
     height: int = 84
     frame_stack: int = 4
+    include_boost_channel: bool = True
+
+    @property
+    def channel_count(self) -> int:
+        return self.frame_stack + (1 if self.include_boost_channel else 0)
 
 
 @dataclass(slots=True)
@@ -55,6 +60,12 @@ class RewardConfig:
     death: float = -50.0
     idle_penalty: float = -0.05
     idle_steps: int = 30
+    jump_penalty: float = -0.12
+    wasted_jump_penalty: float = -0.8
+    boost_gain: float = 3.0
+    boost_spent: float = -0.05
+    low_boost_penalty: float = -0.15
+    boost_jump_threshold: float = 0.18
 
 
 @dataclass(slots=True)

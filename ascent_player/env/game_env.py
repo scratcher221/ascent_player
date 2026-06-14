@@ -8,8 +8,18 @@ import numpy as np
 from ascent_player.config import AppConfig
 from ascent_player.env.browser_backend import BrowserBackend
 from ascent_player.env.rewards import RewardTracker
-from ascent_player.env.state_detector import FrameState, detect_from_frame, merge_dom_state
-from ascent_player.utils.preprocessing import FrameStack, preprocess_frame
+from ascent_player.env.state_detector import (
+    FrameState,
+    detect_from_frame,
+    mask_jump_action,
+    merge_dom_state,
+)
+from ascent_player.utils.preprocessing import (
+    FrameStack,
+    append_observation_channels,
+    build_observation,
+    preprocess_frame,
+)
 
 
 ACTION_LABELS = {
@@ -41,6 +51,19 @@ class AscentGameEnv:
         self.last_raw_frame: np.ndarray | None = None
         self.recent_states: deque[FrameState] = deque(maxlen=8)
         self._step_count = 0
+        self._last_frame_state: FrameState | None = None
+
+    @property
+    def can_boost(self) -> bool:
+        if self._last_frame_state is None:
+            return True
+        return self._last_frame_state.can_boost
+
+    @property
+    def boost_level(self) -> float:
+        if self._last_frame_state is None:
+            return 1.0
+        return self._last_frame_state.boost_level
 
     async def connect(self) -> None:
         await self.backend.connect_auto()
@@ -50,22 +73,35 @@ class AscentGameEnv:
         self.frame_stack.clear()
         self.recent_states.clear()
         self._step_count = 0
+        self._last_frame_state = None
         await self._release_all()
         await self.backend.force_open_game()
         await self._start_or_restart()
         frame = await self._capture_frame()
-        processed = preprocess_frame(frame, self.config.observation)
-        self.frame_stack.reset(processed)
-        return self.frame_stack.array()
+        frame_state = await self._detect_state(frame)
+        self._last_frame_state = frame_state
+        gray = preprocess_frame(frame, self.config.observation)
+        self.frame_stack.reset(gray)
+        return append_observation_channels(
+            self.frame_stack.array(),
+            self.config.observation,
+            frame_state.boost_level,
+        )
 
     async def step(self, action: int) -> StepResult:
+        action = mask_jump_action(action, self.can_boost)
         await self._apply_action(action)
         await self.backend.wait_ms(self._step_ms())
         frame = await self._capture_frame()
         frame_state = await self._detect_state(frame)
+        self._last_frame_state = frame_state
         self.recent_states.append(frame_state)
-        processed = preprocess_frame(frame, self.config.observation)
-        state = self.frame_stack.append(processed)
+        state = build_observation(
+            frame,
+            self.frame_stack,
+            self.config.observation,
+            frame_state.boost_level,
+        )
         reward = self.reward_tracker.compute(frame_state, action)
         done = frame_state.game_over
         if done:
