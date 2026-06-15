@@ -77,6 +77,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run calibrate → sim pretrain → browser fine-tune loop until target score",
     )
+    parser.add_argument(
+        "--overnight-train",
+        action="store_true",
+        help="Unsupervised browser training loop (9h budget, adaptive session length)",
+    )
+    parser.add_argument(
+        "--budget-hours",
+        type=float,
+        default=9.0,
+        help="Overnight total budget in hours (default 9)",
+    )
+    parser.add_argument(
+        "--initial-minutes",
+        type=int,
+        default=2,
+        help="Overnight initial session length in minutes (default 2)",
+    )
+    parser.add_argument(
+        "--max-session-minutes",
+        type=int,
+        default=60,
+        help="Overnight max session length in minutes (default 60)",
+    )
+    parser.add_argument(
+        "--target-score",
+        type=int,
+        default=10_000,
+        help="Overnight early-stop target score (default 10000)",
+    )
     return parser.parse_args()
 
 
@@ -166,6 +195,30 @@ def main() -> int:
                 config,
                 sim_steps=max(config.training.sim_pretrain_steps, 300_000),
                 finetune_seconds=config.training.finetune_max_seconds,
+            )
+        )
+        return 0
+    if args.overnight_train:
+        import asyncio
+
+        from ascent_player.overnight_browser import run_overnight_session
+        import ascent_player.overnight_browser as overnight_mod
+
+        overnight_mod.TARGET_SCORE = int(args.target_score)
+        overnight_mod.TOTAL_BUDGET_SECONDS = int(args.budget_hours * 3600)
+        overnight_mod.INITIAL_SESSION_SECONDS = max(
+            120, int(args.initial_minutes * 60)
+        )
+        overnight_mod.MIN_SESSION_SECONDS = overnight_mod.INITIAL_SESSION_SECONDS
+        overnight_mod.MAX_SESSION_SECONDS = max(
+            overnight_mod.INITIAL_SESSION_SECONDS,
+            int(args.max_session_minutes * 60),
+        )
+        asyncio.run(
+            run_overnight_session(
+                config,
+                total_budget_s=float(overnight_mod.TOTAL_BUDGET_SECONDS),
+                initial_session_s=overnight_mod.INITIAL_SESSION_SECONDS,
             )
         )
         return 0

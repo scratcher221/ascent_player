@@ -11,6 +11,11 @@ from ascent_player.env.platform_detector import (
     detect_platforms,
     nearest_safe_platform,
 )
+from ascent_player.env.target_detector import (
+    detect_green_boosters,
+    detect_yellow_orbs,
+    nearest_navigation_target,
+)
 
 
 @dataclass(slots=True)
@@ -23,6 +28,9 @@ class FrameState:
     nearest_platform_dx: float | None = None
     nearest_platform_dy: float | None = None
     platform_mask: np.ndarray | None = None
+    target_dx: float | None = None
+    target_dy: float | None = None
+    target_kind: str | None = None
     combo: int = 0
     streak: int = 0
     score_multiplier: float = 1.0
@@ -193,13 +201,26 @@ def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
     score = estimate_score(frame_rgb)
     boost_level, can_boost = detect_boost_bar(frame_rgb)
     platforms = detect_platforms(frame_rgb)
+    yellow_orbs = detect_yellow_orbs(frame_rgb)
+    green_boosters = detect_green_boosters(frame_rgb)
     platform_dx = None
     platform_dy = None
+    target_dx = None
+    target_dy = None
+    target_kind = None
     if orb is not None:
         platform_dx, platform_dy = nearest_safe_platform(
             orb[0],
             orb[1],
             platforms,
+            frame_rgb.shape,
+        )
+        target_dx, target_dy, target_kind = nearest_navigation_target(
+            orb[0],
+            orb[1],
+            platforms,
+            yellow_orbs,
+            green_boosters,
             frame_rgb.shape,
         )
     state = FrameState(
@@ -208,6 +229,9 @@ def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
         can_boost=can_boost,
         nearest_platform_dx=platform_dx,
         nearest_platform_dy=platform_dy,
+        target_dx=target_dx,
+        target_dy=target_dy,
+        target_kind=target_kind,
         game_over=detect_game_over_visual(frame_rgb),
     )
     if orb is not None:

@@ -8,6 +8,7 @@ import numpy as np
 from ascent_player.config import AppConfig, RewardConfig
 from ascent_player.env.game_env import ACTION_LABELS, StepResult
 from ascent_player.env.platform_detector import Platform, nearest_safe_platform
+from ascent_player.env.target_detector import platform_targets_from_sim
 from ascent_player.env.fast_sim_obs import fast_build_observation
 from ascent_player.env.rewards import RewardTracker
 from ascent_player.env.sim_physics import SimPhysicsConfig, SimWorld
@@ -105,6 +106,12 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
         platforms,
         frame_rgb.shape,
     )
+    target_dx, target_dy, target_kind = platform_targets_from_sim(
+        platforms,
+        ball.x,
+        screen_y,
+        frame_rgb.shape[:2],
+    )
     return FrameState(
         orb_x=ball.x,
         orb_y=screen_y,
@@ -113,6 +120,9 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
         can_boost=world.can_boost,
         nearest_platform_dx=platform_dx,
         nearest_platform_dy=platform_dy,
+        target_dx=target_dx,
+        target_dy=target_dy,
+        target_kind=target_kind,
         combo=world.combo,
         streak=world.streak,
         score_multiplier=world.score_multiplier,
@@ -230,6 +240,12 @@ class AscentSimEnv:
             platforms,
             (self.config.observation.height, self.config.observation.width),
         )
+        target_dx, target_dy, target_kind = platform_targets_from_sim(
+            platforms,
+            ball.x * scale_x,
+            screen_y * scale_y,
+            (self.config.observation.height, self.config.observation.width),
+        )
         from ascent_player.env.fast_sim_obs import fast_platform_mask
 
         return FrameState(
@@ -240,6 +256,9 @@ class AscentSimEnv:
             can_boost=self.world.can_boost,
             nearest_platform_dx=platform_dx,
             nearest_platform_dy=platform_dy,
+            target_dx=target_dx,
+            target_dy=target_dy,
+            target_kind=target_kind,
             combo=self.world.combo,
             streak=self.world.streak,
             score_multiplier=self.world.score_multiplier,

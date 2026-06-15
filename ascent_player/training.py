@@ -13,7 +13,49 @@ from ascent_player.env.browser_backend import BrowserBackend
 from ascent_player.env.game_env import ACTION_LABELS, AscentGameEnv
 from ascent_player.env.sim_env import AscentSimEnv, calibrate_sim_physics
 from ascent_player.env.state_detector import FrameState
+from pathlib import Path
 from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
+
+
+def _empty_training_stats(log_path: Path, *, error: str = "") -> dict[str, float]:
+    return {
+        "best_score": 0.0,
+        "recent_avg": 0.0,
+        "recent_min": 0.0,
+        "recent_max": 0.0,
+        "episodes": 0.0,
+        "log_path": str(log_path),
+        "error": error,
+    }
+
+
+async def run_eval_watch(
+    config: AppConfig,
+    *,
+    max_episodes: int = 5,
+) -> dict[str, float]:
+    """Run epsilon=0 evaluation episodes in the browser."""
+    from dataclasses import replace
+
+    eval_config = AppConfig()
+    eval_config.browser = config.browser
+    eval_config.observation = config.observation
+    eval_config.reward = config.reward
+    eval_config.demo = config.demo
+    eval_config.training = replace(
+        config.training,
+        sim_mode=False,
+        transfer_from_sim=False,
+        watch_mode=True,
+        epsilon_start=0.0,
+        epsilon_end=0.0,
+        frame_skip=max(1, min(config.training.transfer_frame_skip, config.training.frame_skip)),
+    )
+    return await run_training_no_ui(
+        eval_config,
+        max_episodes=max_episodes,
+        ingest_demos=False,
+    )
 
 
 def create_env(config: AppConfig, backend: BrowserBackend | None = None):
@@ -190,6 +232,8 @@ async def run_training_no_ui(
     config: AppConfig,
     max_episodes: int | None = None,
     max_seconds: int | None = None,
+    *,
+    ingest_demos: bool | None = None,
 ) -> dict[str, float]:
     phase = "sim" if config.training.sim_mode else "browser"
     logger = TrainingLogger(config, phase)
@@ -214,7 +258,12 @@ async def run_training_no_ui(
         },
     )
     print(f"Training log: {logger.path}")
-    demos_ingested = False
+    demos_ingested = ingest_demos is False
+    demo_policy = (
+        config.demo.use_demos_on_start
+        if ingest_demos is None
+        else ingest_demos
+    )
     transfer_episodes = 0
     deadline = (
         time.perf_counter() + max_seconds if max_seconds and max_seconds > 0 else None
@@ -228,7 +277,7 @@ async def run_training_no_ui(
                 print(status.message)
                 logger.log_note(f"browser_connect_failed={status.message}")
                 logger.close(agent)
-                return
+                return _empty_training_stats(logger.path, error="browser_connect_failed")
         state = await env.reset()
         episode = agent.progress.episodes_completed
         episode_reward = 0.0
@@ -326,7 +375,7 @@ async def run_training_no_ui(
                 if config.training.transfer_from_sim:
                     transfer_episodes += 1
                 if (
-                    config.demo.use_demos_on_start
+                    demo_policy
                     and not demos_ingested
                     and not config.training.sim_mode
                     and (
@@ -359,6 +408,7 @@ async def run_training_no_ui(
         "recent_max": float(max(recent)) if recent else 0.0,
         "episodes": float(agent.progress.episodes_completed),
         "log_path": str(logger.path),
+        "epsilon": agent.epsilon,
     }
 
 

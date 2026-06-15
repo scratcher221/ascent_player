@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from ascent_player.config import RewardConfig
 from ascent_player.env.state_detector import JUMP_ACTIONS, FrameState
 
+LEFT_ACTIONS = frozenset({1, 4})
+RIGHT_ACTIONS = frozenset({2, 5})
+
 
 @dataclass(slots=True)
 class RewardTracker:
@@ -16,6 +19,7 @@ class RewardTracker:
     last_score: int | None = None
     milestones_hit: set[int] | None = None
     recent_boost_spend: int = 0
+    last_steer_dir: int = 0
 
     def reset(self) -> None:
         self.last_state = None
@@ -25,23 +29,19 @@ class RewardTracker:
         self.last_score = None
         self.milestones_hit = set()
         self.recent_boost_spend = 0
+        self.last_steer_dir = 0
 
     def compute(self, state: FrameState, action: int) -> float:
         self.episode_steps += 1
         reward = self.config.survival
-        reward += min(
-            self.episode_steps * self.config.survival_step_bonus,
-            self.config.survival * 2.0,
-        )
         previous = self.last_state
 
         if previous is not None:
+            reward += self._target_steering_reward(previous, state, action)
             reward += self._score_reward(previous, state)
             reward += self._altitude_reward(previous, state)
             reward += self._falling_penalty(previous, state)
-            reward += self._idle_penalty(previous, state, action)
             reward += self._boost_reward(previous, state, action)
-            reward += self._platform_reward(previous, state, action)
             reward += self._combo_streak_reward(previous, state)
             reward += self._stagnation_penalty(previous, state)
             reward += self._milestone_reward(state)
@@ -58,6 +58,87 @@ class RewardTracker:
                 min(self.config.reward_clip, reward),
             )
         )
+
+    def _target_dx(self, state: FrameState) -> float | None:
+        if state.target_dx is not None:
+            return state.target_dx
+        return state.nearest_platform_dx
+
+    def _target_dy(self, state: FrameState) -> float | None:
+        if state.target_dy is not None:
+            return state.target_dy
+        return state.nearest_platform_dy
+
+    def _target_steering_reward(
+        self,
+        previous: FrameState,
+        state: FrameState,
+        action: int,
+    ) -> float:
+        dx = self._target_dx(state)
+        if dx is None:
+            return 0.0
+
+        reward = 0.0
+        prev_dx = self._target_dx(previous)
+        if prev_dx is not None:
+            prev_dist = abs(prev_dx)
+            curr_dist = abs(dx)
+            if curr_dist < prev_dist:
+                reward += (
+                    (prev_dist - curr_dist)
+                    * self.config.target_approach_gain
+                    * 4.0
+                )
+
+        steer_gain = self.config.target_steer_gain
+        if state.target_kind == "yellow_orb":
+            steer_gain *= 1.15
+        elif state.target_kind == "green_booster":
+            steer_gain *= 1.1
+
+        if dx < -0.012:
+            if action in LEFT_ACTIONS:
+                reward += steer_gain * min(abs(dx) * 6.0, 2.0)
+                reward += self._steer_flip_penalty(-1)
+            elif action in RIGHT_ACTIONS:
+                reward += self.config.target_wrong_way_penalty * min(abs(dx) * 4.0, 1.5)
+                self._set_steer_dir(1)
+            elif action == 0:
+                reward += self.config.target_idle_penalty * min(abs(dx) * 3.0, 1.0)
+        elif dx > 0.012:
+            if action in RIGHT_ACTIONS:
+                reward += steer_gain * min(abs(dx) * 6.0, 2.0)
+                reward += self._steer_flip_penalty(1)
+            elif action in LEFT_ACTIONS:
+                reward += self.config.target_wrong_way_penalty * min(abs(dx) * 4.0, 1.5)
+                self._set_steer_dir(-1)
+            elif action == 0:
+                reward += self.config.target_idle_penalty * min(abs(dx) * 3.0, 1.0)
+        else:
+            if action in (0, 3):
+                reward += self.config.target_aligned_bonus
+
+        dy = self._target_dy(state)
+        if dy is not None and dy > 0.02 and action in JUMP_ACTIONS:
+            reward += self.config.target_aligned_bonus * 0.5
+
+        return reward
+
+    def _steer_flip_penalty(self, direction: int) -> float:
+        penalty = 0.0
+        if (
+            self.last_steer_dir != 0
+            and direction != 0
+            and self.last_steer_dir != direction
+        ):
+            penalty = self.config.direction_flip_penalty
+        self._set_steer_dir(direction)
+        return penalty
+
+    def _set_steer_dir(self, direction: int) -> None:
+        if direction != 0:
+            self.last_steer_dir = direction
 
     def _score_reward(self, previous: FrameState, state: FrameState) -> float:
         if previous.score is None or state.score is None:
@@ -80,7 +161,7 @@ class RewardTracker:
             and state.score is not None
             and state.score > previous.score
         )
-        scale = 1.0 if score_confirmed else 0.2
+        scale = 1.0 if score_confirmed else 0.15
         return max(0.0, altitude_gain / 100.0) * self.config.altitude_gain * scale
 
     def _falling_penalty(self, previous: FrameState, state: FrameState) -> float:
@@ -89,28 +170,10 @@ class RewardTracker:
         fall = state.orb_y - previous.orb_y
         if fall <= 6:
             return 0.0
-        weight = 1.0 + state.streak * 0.15
+        dx = self._target_dx(state)
+        misaligned = dx is not None and abs(dx) > 0.08
+        weight = 1.2 if misaligned else 1.0
         return (fall / 100.0) * self.config.falling_penalty * weight
-
-    def _idle_penalty(
-        self,
-        previous: FrameState,
-        state: FrameState,
-        action: int,
-    ) -> float:
-        horizontal_action = action in (1, 2, 4, 5)
-        falling = (
-            previous.orb_y is not None
-            and state.orb_y is not None
-            and state.orb_y > previous.orb_y + 4
-        )
-        if horizontal_action or not falling:
-            self.idle_steps = 0
-            return 0.0
-        self.idle_steps += 1
-        if self.idle_steps > self.config.idle_steps:
-            return self.config.idle_penalty
-        return 0.0
 
     def _boost_reward(
         self,
@@ -171,62 +234,6 @@ class RewardTracker:
         multiplier_delta = state.score_multiplier - previous.score_multiplier
         if multiplier_delta > 0.01:
             reward += multiplier_delta * self.config.multiplier_gain
-
-        return reward
-
-    def _platform_reward(
-        self,
-        previous: FrameState,
-        state: FrameState,
-        action: int,
-    ) -> float:
-        if state.nearest_platform_dx is None:
-            return 0.0
-
-        falling = (
-            previous.orb_y is not None
-            and state.orb_y is not None
-            and state.orb_y > previous.orb_y + 3
-        )
-        platform_below = (
-            state.nearest_platform_dy is not None and state.nearest_platform_dy > 0.02
-        )
-        if not falling and not platform_below:
-            return 0.0
-
-        reward = 0.0
-        dx = state.nearest_platform_dx
-        steer_scale = self.config.platform_fall_weight if falling else 1.0
-        steer_scale *= 1.0 + state.streak * 0.2
-
-        if dx < -0.02 and action in (1, 4):
-            reward += self.config.platform_align * min(abs(dx) * 4.0, 1.5) * steer_scale
-        elif dx > 0.02 and action in (2, 5):
-            reward += self.config.platform_align * min(abs(dx) * 4.0, 1.5) * steer_scale
-        elif falling:
-            wrong_dir = (dx < -0.04 and action in (2, 5)) or (dx > 0.04 and action in (1, 4))
-            if wrong_dir:
-                reward += self.config.off_platform_penalty * min(abs(dx) * 3.0, 1.0)
-
-        if previous.nearest_platform_dx is not None:
-            prev_dist = abs(previous.nearest_platform_dx)
-            curr_dist = abs(state.nearest_platform_dx)
-            if curr_dist < prev_dist:
-                reward += (
-                    (prev_dist - curr_dist)
-                    * self.config.platform_align
-                    * steer_scale
-                    * 2.0
-                )
-
-        if (
-            previous.nearest_platform_dy is not None
-            and state.nearest_platform_dy is not None
-            and state.nearest_platform_dy > 0
-        ):
-            dy_gain = previous.nearest_platform_dy - state.nearest_platform_dy
-            if dy_gain > 0:
-                reward += dy_gain * self.config.platform_align * steer_scale
 
         return reward
 
