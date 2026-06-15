@@ -196,7 +196,11 @@ def detect_boost_bar(frame_rgb: np.ndarray) -> tuple[float, bool]:
     return min(1.0, total_energy), can_boost
 
 
-def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
+def detect_from_frame(
+    frame_rgb: np.ndarray,
+    *,
+    platform_only: bool = False,
+) -> FrameState:
     orb = detect_orb(frame_rgb)
     score = estimate_score(frame_rgb)
     boost_level, can_boost = detect_boost_bar(frame_rgb)
@@ -219,8 +223,8 @@ def detect_from_frame(frame_rgb: np.ndarray) -> FrameState:
             orb[0],
             orb[1],
             platforms,
-            yellow_orbs,
-            green_boosters,
+            [] if platform_only else yellow_orbs,
+            [] if platform_only else green_boosters,
             frame_rgb.shape,
         )
     state = FrameState(

@@ -17,6 +17,8 @@ from ascent_player.demo.storage import (
 from ascent_player.env.state_detector import mask_jump_action
 from ascent_player.utils.memory import max_demo_transitions, memory_headroom_ok
 
+STEERING_ACTIONS = frozenset({1, 2, 4, 5})
+
 
 @dataclass(slots=True)
 class DemoIngestResult:
@@ -54,17 +56,24 @@ def _transition_weight(
     *,
     min_episode_score: float,
     high_score_weight: float,
+    steering_action_weight: float = 1.0,
 ) -> float:
     if demo.scores is None:
-        return 1.0
-    score = float(demo.scores[index])
-    if score < min_episode_score:
-        return 0.0
-    if score >= 1500:
-        return high_score_weight
-    if score >= 1000:
-        return max(1.0, high_score_weight * 0.6)
-    return 1.0
+        weight = 1.0
+    else:
+        score = float(demo.scores[index])
+        if score < min_episode_score:
+            return 0.0
+        if score >= 1500:
+            weight = high_score_weight
+        elif score >= 1000:
+            weight = max(1.0, high_score_weight * 0.6)
+        else:
+            weight = 1.0
+    action = int(demo.actions[index])
+    if action in STEERING_ACTIONS and steering_action_weight > 1.0:
+        weight *= steering_action_weight
+    return weight
 
 
 def _weighted_subsample(
@@ -74,6 +83,7 @@ def _weighted_subsample(
     *,
     min_episode_score: float,
     high_score_weight: float,
+    steering_action_weight: float = 1.0,
 ) -> np.ndarray:
     weights = np.asarray(
         [
@@ -82,6 +92,7 @@ def _weighted_subsample(
                 idx,
                 min_episode_score=min_episode_score,
                 high_score_weight=high_score_weight,
+                steering_action_weight=steering_action_weight,
             )
             for idx in range(len(demo))
         ],
@@ -108,10 +119,18 @@ def _mask_demo_actions(demo, indices: np.ndarray) -> np.ndarray:
     return actions
 
 
-def ingest_demonstrations(agent: DQNAgent, config: AppConfig) -> DemoIngestResult:
+def ingest_demonstrations(
+    agent: DQNAgent,
+    config: AppConfig,
+    *,
+    replace_buffer: bool = False,
+) -> DemoIngestResult:
     paths = list_demo_files(config)
     if not paths:
         return DemoIngestResult(0, 0, 0)
+
+    if replace_buffer:
+        agent.demo_replay.clear()
 
     transition_cap = max_demo_transitions(config)
     total_available = sum(demo_transition_count(path) for path in paths)
@@ -154,6 +173,7 @@ def ingest_demonstrations(agent: DQNAgent, config: AppConfig) -> DemoIngestResul
                 rng,
                 min_episode_score=min_transition_score,
                 high_score_weight=config.demo.high_score_weight,
+                steering_action_weight=config.demo.steering_action_weight,
             )
             if len(indices) == 0:
                 skipped += file_count

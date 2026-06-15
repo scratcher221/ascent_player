@@ -298,6 +298,10 @@ class TrainingLogger:
       parts.append(f"plat_dx={frame_state.nearest_platform_dx:.0f}")
     if frame_state.nearest_platform_dy is not None:
       parts.append(f"plat_dy={frame_state.nearest_platform_dy:.0f}")
+    if frame_state.target_kind is not None:
+      parts.append(f"target={frame_state.target_kind}")
+    if frame_state.target_dx is not None:
+      parts.append(f"target_dx={frame_state.target_dx:.3f}")
     if frame_state.in_menu:
       parts.append("in_menu=True")
     if context is not None:

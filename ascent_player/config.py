@@ -85,6 +85,8 @@ class RewardConfig:
     target_aligned_bonus: float = 0.10
     target_idle_penalty: float = -0.14
     direction_flip_penalty: float = -0.10
+    direction_persistence_steps: int = 3
+    direction_persistence_bonus: float = 0.06
     platform_align: float = 0.06
     platform_fall_weight: float = 2.5
     platform_land: float = 0.30
@@ -110,6 +112,8 @@ class DemoConfig:
     high_score_weight: float = 2.0
     bc_loss_weight: float = 0.15
     hybrid_bc_every: int = 4
+    steering_action_weight: float = 1.5
+    demo_reingest_every_runs: int = 20
     # Keep at least this much RAM free for the OS while loading demos.
     os_memory_reserve_mb: int = 2048
     # Hard cap on unique demo transitions; None = derive from available memory.
@@ -135,7 +139,7 @@ class TrainingConfig:
     game_fps: float = 60.0
     async_training: bool = True
     train_every_cpu: int = 4
-    train_every_gpu: int = 2
+    train_every_gpu: int = 1
     checkpoint_path: Path = Path("checkpoints/dqn_latest.keras")
     sim_checkpoint_path: Path = Path("checkpoints/sim_pretrained.keras")
     auto_load_checkpoint: bool = True
@@ -150,7 +154,20 @@ class TrainingConfig:
     transfer_epsilon_restart: float = 0.45
     transfer_demo_delay_episodes: int = 12
     transfer_plateau_episodes: int = 12
-    transfer_frame_skip: int = 6
+    transfer_frame_skip: int = 4
+    browser_epsilon_cap: float = 0.35
+    browser_epsilon_floor: float = 0.05
+    browser_plateau_epsilon_decay: float = 0.97
+    score_sanity_cap: float = 5000.0
+    replay_trim_size: int = 35_000
+    gpu_restart_every_runs: int = 25
+    curriculum_stage_a_max: float = 800.0
+    curriculum_stage_b_max: float = 1500.0
+    sim_refresh_plateau_runs: int = 30
+    sim_refresh_steps: int = 50_000
+    target_platform_only: bool = False
+    target_detection_min_samples: int = 80
+    target_special_min_rate: float = 0.02
     finetune_max_seconds: int = 600
     mixed_sim_replay_ratio: float = 0.0
     sim_epsilon_end: float = 0.12

@@ -141,7 +141,10 @@ class AscentGameEnv:
         frame: np.ndarray,
         hud: HudSnapshot | None = None,
     ) -> FrameState:
-        state = detect_from_frame(frame)
+        state = detect_from_frame(
+            frame,
+            platform_only=self.config.training.target_platform_only,
+        )
         apply_hud_boost(
             state,
             hud.energy if hud is not None else None,

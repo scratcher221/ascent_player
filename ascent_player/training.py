@@ -14,7 +14,27 @@ from ascent_player.env.game_env import ACTION_LABELS, AscentGameEnv
 from ascent_player.env.sim_env import AscentSimEnv, calibrate_sim_physics
 from ascent_player.env.state_detector import FrameState
 from pathlib import Path
+from ascent_player.utils.gpu_session import release_gpu_between_runs
 from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
+from ascent_player.env.target_detector import TargetDetectionTracker
+
+
+def curriculum_stage_from_score(recent_avg: float, config: AppConfig) -> str:
+    if recent_avg >= config.training.curriculum_stage_b_max:
+        return "C"
+    if recent_avg >= config.training.curriculum_stage_a_max:
+        return "B"
+    return "A"
+
+
+def apply_curriculum(config: AppConfig, agent: DQNAgent, env) -> str:
+    recent = agent.progress.recent_scores[-10:]
+    recent_avg = float(sum(recent) / len(recent)) if recent else 0.0
+    stage = curriculum_stage_from_score(recent_avg, config)
+    agent.curriculum_stage = stage
+    if hasattr(env, "reward_tracker"):
+        env.reward_tracker.set_curriculum_stage(stage)
+    return stage
 
 
 def _empty_training_stats(log_path: Path, *, error: str = "") -> dict[str, float]:
@@ -234,6 +254,7 @@ async def run_training_no_ui(
     max_seconds: int | None = None,
     *,
     ingest_demos: bool | None = None,
+    force_demo_reingest: bool = False,
 ) -> dict[str, float]:
     phase = "sim" if config.training.sim_mode else "browser"
     logger = TrainingLogger(config, phase)
@@ -258,18 +279,36 @@ async def run_training_no_ui(
         },
     )
     print(f"Training log: {logger.path}")
-    demos_ingested = ingest_demos is False
+    demos_ingested = ingest_demos is False and not force_demo_reingest
     demo_policy = (
         config.demo.use_demos_on_start
         if ingest_demos is None
-        else ingest_demos
+        else ingest_demos or force_demo_reingest
     )
     transfer_episodes = 0
+    target_tracker = (
+        TargetDetectionTracker(
+            min_samples=config.training.target_detection_min_samples,
+            min_special_rate=config.training.target_special_min_rate,
+        )
+        if not config.training.sim_mode
+        else None
+    )
     deadline = (
         time.perf_counter() + max_seconds if max_seconds and max_seconds > 0 else None
     )
     episode_steps = 0
     try:
+        if (
+            force_demo_reingest
+            and demo_policy
+            and not config.training.sim_mode
+        ):
+            demo_result = ingest_demonstrations(agent, config, replace_buffer=True)
+            if demo_result.transitions_added or demo_result.transitions_skipped:
+                print(demo_result.status_message)
+                logger.log_note(f"demo_reingest={demo_result.status_message}")
+            demos_ingested = True
         if not config.training.sim_mode:
             assert backend is not None
             status = await backend.connect_auto()
@@ -279,6 +318,7 @@ async def run_training_no_ui(
                 logger.close(agent)
                 return _empty_training_stats(logger.path, error="browser_connect_failed")
         state = await env.reset()
+        apply_curriculum(config, agent, env)
         episode = agent.progress.episodes_completed
         episode_reward = 0.0
         episode_max_score = 0.0
@@ -348,6 +388,17 @@ async def run_training_no_ui(
                     train_loss=metrics.loss,
                     train_ms=metrics.train_ms,
                 )
+            if target_tracker is not None:
+                target_tracker.record(result.frame_state.target_kind)
+                config.training.target_platform_only = target_tracker.use_platform_only
+                if (
+                    metrics.total_steps > 0
+                    and metrics.total_steps % config.training.log_interval_steps == 0
+                ):
+                    logger.log_note(
+                        f"target_detection {target_tracker.summary()} "
+                        f"platform_only={config.training.target_platform_only}"
+                    )
             logger.maybe_flush(agent, metrics.total_steps)
             state = result.state
             if metrics.total_steps % 25 == 0:
@@ -359,6 +410,7 @@ async def run_training_no_ui(
                 )
             if result.done:
                 agent.record_episode(episode_reward, episode_max_score)
+                apply_curriculum(config, agent, env)
                 logger.log_episode_end(
                     agent,
                     episode,
@@ -384,7 +436,11 @@ async def run_training_no_ui(
                         >= config.training.transfer_demo_delay_episodes
                     )
                 ):
-                    demo_result = ingest_demonstrations(agent, config)
+                    demo_result = ingest_demonstrations(
+                        agent,
+                        config,
+                        replace_buffer=force_demo_reingest,
+                    )
                     if demo_result.transitions_added or demo_result.transitions_skipped:
                         print(demo_result.status_message)
                         logger.log_note(f"demo_ingest={demo_result.status_message}")
@@ -396,6 +452,10 @@ async def run_training_no_ui(
                 score_velocity = 0.0
                 state = await env.reset()
     finally:
+        removed = agent.trim_replay_buffers()
+        if removed:
+            print(f"Trimmed {removed} replay transitions")
+        release_gpu_between_runs()
         agent.save()
         await env.close()
         logger.close(agent)
@@ -409,6 +469,10 @@ async def run_training_no_ui(
         "episodes": float(agent.progress.episodes_completed),
         "log_path": str(logger.path),
         "epsilon": agent.epsilon,
+        "demo_replay_size": float(len(agent.demo_replay)),
+        "curriculum_stage": float(
+            {"A": 0.0, "B": 1.0, "C": 2.0}.get(agent.curriculum_stage, 0.0)
+        ),
     }
 
 

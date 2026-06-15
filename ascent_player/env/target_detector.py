@@ -169,3 +169,46 @@ def platform_targets_from_sim(
     if dx is None:
         return None, None, None
     return dx, dy, "platform"
+
+
+class TargetDetectionTracker:
+    """Track target_kind hit rates; fall back to platform-only when CV is unreliable."""
+
+    def __init__(
+        self,
+        *,
+        min_samples: int = 80,
+        min_special_rate: float = 0.02,
+    ) -> None:
+        self.min_samples = min_samples
+        self.min_special_rate = min_special_rate
+        self._counts: dict[str, int] = {
+            "platform": 0,
+            "yellow_orb": 0,
+            "green_booster": 0,
+            "none": 0,
+        }
+
+    def record(self, kind: str | None) -> None:
+        key = kind if kind in self._counts else "none"
+        self._counts[key] += 1
+
+    @property
+    def total(self) -> int:
+        return sum(self._counts.values())
+
+    @property
+    def use_platform_only(self) -> bool:
+        total = self.total
+        if total < self.min_samples:
+            return False
+        special = self._counts["yellow_orb"] + self._counts["green_booster"]
+        return (special / total) < self.min_special_rate
+
+    def summary(self) -> str:
+        total = max(1, self.total)
+        parts = [
+            f"{key}={self._counts[key] / total:.0%}"
+            for key in ("platform", "yellow_orb", "green_booster", "none")
+        ]
+        return " ".join(parts)

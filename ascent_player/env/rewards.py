@@ -20,6 +20,12 @@ class RewardTracker:
     milestones_hit: set[int] | None = None
     recent_boost_spend: int = 0
     last_steer_dir: int = 0
+    persist_steer_dir: int = 0
+    persist_steer_steps: int = 0
+    curriculum_stage: str = "A"
+
+    def set_curriculum_stage(self, stage: str) -> None:
+        self.curriculum_stage = stage if stage in {"A", "B", "C"} else "A"
 
     def reset(self) -> None:
         self.last_state = None
@@ -30,6 +36,8 @@ class RewardTracker:
         self.milestones_hit = set()
         self.recent_boost_spend = 0
         self.last_steer_dir = 0
+        self.persist_steer_dir = 0
+        self.persist_steer_steps = 0
 
     def compute(self, state: FrameState, action: int) -> float:
         self.episode_steps += 1
@@ -38,13 +46,18 @@ class RewardTracker:
 
         if previous is not None:
             reward += self._target_steering_reward(previous, state, action)
-            reward += self._score_reward(previous, state)
+            if self.curriculum_stage != "A":
+                reward += self._combo_streak_reward(previous, state)
+            if self.curriculum_stage == "C":
+                reward += self._score_reward(previous, state)
+                reward += self._milestone_reward(state)
+            elif self.curriculum_stage == "B" and state.combo >= 3:
+                reward += self._score_reward(previous, state)
             reward += self._altitude_reward(previous, state)
+            if self.curriculum_stage != "A":
+                reward += self._stagnation_penalty(previous, state)
             reward += self._falling_penalty(previous, state)
             reward += self._boost_reward(previous, state, action)
-            reward += self._combo_streak_reward(previous, state)
-            reward += self._stagnation_penalty(previous, state)
-            reward += self._milestone_reward(state)
 
         if state.game_over:
             reward += self.config.death
@@ -92,32 +105,44 @@ class RewardTracker:
                 )
 
         steer_gain = self.config.target_steer_gain
-        if state.target_kind == "yellow_orb":
+        if self.curriculum_stage == "A":
             steer_gain *= 1.15
-        elif state.target_kind == "green_booster":
+        elif self.curriculum_stage == "C":
+            steer_gain *= 0.92
+
+        if state.target_kind == "yellow_orb" and self.curriculum_stage != "A":
+            steer_gain *= 1.15
+        elif state.target_kind == "green_booster" and self.curriculum_stage != "A":
             steer_gain *= 1.1
 
         if dx < -0.012:
             if action in LEFT_ACTIONS:
                 reward += steer_gain * min(abs(dx) * 6.0, 2.0)
-                reward += self._steer_flip_penalty(-1)
+                reward += self._steer_flip_penalty(-1, abs_dx=abs(dx))
+                reward += self._persistence_bonus(-1)
             elif action in RIGHT_ACTIONS:
                 reward += self.config.target_wrong_way_penalty * min(abs(dx) * 4.0, 1.5)
                 self._set_steer_dir(1)
+                self._reset_persistence()
             elif action == 0:
                 reward += self.config.target_idle_penalty * min(abs(dx) * 3.0, 1.0)
+                self._reset_persistence()
         elif dx > 0.012:
             if action in RIGHT_ACTIONS:
                 reward += steer_gain * min(abs(dx) * 6.0, 2.0)
-                reward += self._steer_flip_penalty(1)
+                reward += self._steer_flip_penalty(1, abs_dx=abs(dx))
+                reward += self._persistence_bonus(1)
             elif action in LEFT_ACTIONS:
                 reward += self.config.target_wrong_way_penalty * min(abs(dx) * 4.0, 1.5)
                 self._set_steer_dir(-1)
+                self._reset_persistence()
             elif action == 0:
                 reward += self.config.target_idle_penalty * min(abs(dx) * 3.0, 1.0)
+                self._reset_persistence()
         else:
             if action in (0, 3):
                 reward += self.config.target_aligned_bonus
+            self._reset_persistence()
 
         dy = self._target_dy(state)
         if dy is not None and dy > 0.02 and action in JUMP_ACTIONS:
@@ -125,23 +150,44 @@ class RewardTracker:
 
         return reward
 
-    def _steer_flip_penalty(self, direction: int) -> float:
+    def _steer_flip_penalty(self, direction: int, *, abs_dx: float = 0.0) -> float:
         penalty = 0.0
         if (
             self.last_steer_dir != 0
             and direction != 0
             and self.last_steer_dir != direction
         ):
-            penalty = self.config.direction_flip_penalty
+            scale = min(max(abs_dx, 0.05) * 4.0, 1.5)
+            penalty = self.config.direction_flip_penalty * scale
         self._set_steer_dir(direction)
         return penalty
+
+    def _persistence_bonus(self, direction: int) -> float:
+        if direction == 0:
+            return 0.0
+        if self.persist_steer_dir == direction:
+            self.persist_steer_steps += 1
+        else:
+            self.persist_steer_dir = direction
+            self.persist_steer_steps = 1
+        if self.persist_steer_steps >= self.config.direction_persistence_steps:
+            return self.config.direction_persistence_bonus
+        return 0.0
+
+    def _reset_persistence(self) -> None:
+        self.persist_steer_dir = 0
+        self.persist_steer_steps = 0
 
     def _set_steer_dir(self, direction: int) -> None:
         if direction != 0:
             self.last_steer_dir = direction
 
     def _score_reward(self, previous: FrameState, state: FrameState) -> float:
+        if self.curriculum_stage == "A":
+            return 0.0
         if previous.score is None or state.score is None:
+            return 0.0
+        if self.curriculum_stage == "B" and state.combo < 3:
             return 0.0
         delta = max(0, state.score - previous.score)
         if delta > 0:
@@ -220,7 +266,8 @@ class RewardTracker:
         landed = state.platform_landed or state.combo > previous.combo
         if landed:
             reward += self.config.platform_land
-            reward += self.config.combo_gain * max(1, state.combo)
+            if state.combo >= 3 or self.curriculum_stage == "C":
+                reward += self.config.combo_gain * max(1, state.combo)
 
         if state.combo > previous.combo:
             reward += self.config.combo_gain * (state.combo - previous.combo) * 0.5

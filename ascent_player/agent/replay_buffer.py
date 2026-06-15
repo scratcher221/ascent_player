@@ -72,6 +72,16 @@ class ReplayBuffer:
         with self._lock:
             self._items.clear()
 
+    def trim_to(self, max_size: int) -> int:
+        """Drop oldest transitions until at most *max_size* remain."""
+        max_size = max(1, max_size)
+        removed = 0
+        with self._lock:
+            while len(self._items) > max_size:
+                self._items.popleft()
+                removed += 1
+        return removed
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)

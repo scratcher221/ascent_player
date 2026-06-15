@@ -13,6 +13,7 @@ from ascent_player.agent.checkpoint import (
     load_progress,
     save_progress,
 )
+from ascent_player.agent.progress_sanitize import sanitize_browser_progress
 from ascent_player.agent.model import build_q_network
 from ascent_player.agent.replay_buffer import ReplayBuffer, TransitionBatch
 from ascent_player.config import AppConfig
@@ -61,6 +62,7 @@ class DQNAgent:
         self._last_autosave_steps = 0
         self._episodes_since_best = 0
         self._sim_pretrain_mode = False
+        self.curriculum_stage = "A"
         input_shape = (
             config.observation.height,
             config.observation.width,
@@ -364,8 +366,41 @@ class DQNAgent:
                 else self.config.training.epsilon_end
             )
             self.epsilon = max(epsilon_end, self.epsilon * decay)
+        if not sim_mode and not self.config.training.watch_mode:
+            self._cap_browser_epsilon()
         self.metrics.epsilon = self.epsilon
         self.progress.epsilon = self.epsilon
+
+    def _cap_browser_epsilon(self) -> None:
+        cap = self.config.training.browser_epsilon_cap
+        floor = self.config.training.browser_epsilon_floor
+        self.epsilon = max(floor, min(cap, self.epsilon))
+
+    def _browser_training_active(self) -> bool:
+        return (
+            not self._sim_pretrain_mode
+            and not self.config.training.sim_mode
+            and not self.config.training.watch_mode
+        )
+
+    def trim_replay_buffers(self) -> int:
+        trim_size = self.config.training.replay_trim_size
+        removed = self.replay.trim_to(trim_size)
+        removed += self.demo_replay.trim_to(trim_size)
+        removed += self.sim_replay.trim_to(trim_size)
+        return removed
+
+    def patch_epsilon_on_plateau(self) -> float:
+        """Decay exploration on browser plateau instead of restarting it."""
+        if not self._browser_training_active():
+            return self.epsilon
+        decay = self.config.training.browser_plateau_epsilon_decay
+        floor = self.config.training.browser_epsilon_floor
+        self.epsilon = max(floor, self.epsilon * decay)
+        self._cap_browser_epsilon()
+        self.metrics.epsilon = self.epsilon
+        self.progress.epsilon = self.epsilon
+        return self.epsilon
 
     def record_episode(
         self,
@@ -402,10 +437,13 @@ class DQNAgent:
             self._episodes_since_best += 1
             plateau = self.config.training.transfer_plateau_episodes
             if self._episodes_since_best >= plateau:
-                restart = self.config.training.transfer_epsilon_restart
-                self.epsilon = max(self.epsilon, restart)
-                self.metrics.epsilon = self.epsilon
-                self.progress.epsilon = self.epsilon
+                if self._browser_training_active():
+                    self.patch_epsilon_on_plateau()
+                else:
+                    restart = self.config.training.transfer_epsilon_restart
+                    self.epsilon = max(self.epsilon, restart)
+                    self.metrics.epsilon = self.epsilon
+                    self.progress.epsilon = self.epsilon
                 self._episodes_since_best = 0
 
     def maybe_autosave(self, *, force: bool = False) -> bool:
@@ -500,11 +538,21 @@ class DQNAgent:
         if progress is not None:
             if progress.best_score <= 0 and progress.recent_scores:
                 progress.best_score = max(progress.recent_scores)
-            if progress.baseline_score is not None:
+            if not self.config.training.sim_mode:
+                progress, sanitize_notes = sanitize_browser_progress(
+                    progress,
+                    score_cap=self.config.training.score_sanity_cap,
+                    epsilon_cap=self.config.training.browser_epsilon_cap,
+                )
+                for note in sanitize_notes:
+                    print(f"Progress sanitize: {note}")
+            elif progress.baseline_score is not None:
                 progress.best_score = max(progress.best_score, progress.baseline_score)
             self.progress = progress
             self.epsilon = progress.epsilon
-            self.metrics.epsilon = progress.epsilon
+            self._cap_browser_epsilon()
+            self.progress.epsilon = self.epsilon
+            self.metrics.epsilon = self.epsilon
             self.metrics.total_steps = progress.total_steps
             self._last_autosave_steps = progress.total_steps
             self._baseline_samples = []
@@ -519,7 +567,10 @@ class DQNAgent:
         loss = self._train_step(states, actions, rewards, next_states, dones)
         if (
             len(self.demo_replay) > 0
-            and self.progress.best_score >= 1000
+            and (
+                self.curriculum_stage in {"B", "C"}
+                or self.progress.best_score >= self.config.training.curriculum_stage_a_max
+            )
             and self.metrics.total_steps % max(1, self.config.demo.hybrid_bc_every) == 0
         ):
             demo_batch = self.demo_replay.sample(
