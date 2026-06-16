@@ -20,21 +20,33 @@ class TransitionBatch:
 class ReplayBuffer:
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
-        self._items: deque[tuple[np.ndarray, int, float, np.ndarray, bool]] = deque(
-            maxlen=capacity
-        )
+        self._items: deque[tuple] = deque(maxlen=capacity)
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _copy_state(state):
+        if isinstance(state, tuple):
+            return (state[0].copy(), state[1].copy())
+        return state.copy()
 
     def add(
         self,
-        state: np.ndarray,
+        state,
         action: int,
         reward: float,
-        next_state: np.ndarray,
+        next_state,
         done: bool,
     ) -> None:
         with self._lock:
-            self._items.append((state.copy(), action, reward, next_state.copy(), done))
+            self._items.append(
+                (
+                    self._copy_state(state),
+                    action,
+                    reward,
+                    self._copy_state(next_state),
+                    done,
+                )
+            )
 
     def add_many(
         self,
@@ -48,10 +60,10 @@ class ReplayBuffer:
             for idx in range(len(actions)):
                 self._items.append(
                     (
-                        states[idx].copy(),
+                        self._copy_state(states[idx]),
                         int(actions[idx]),
                         float(rewards[idx]),
-                        next_states[idx].copy(),
+                        self._copy_state(next_states[idx]),
                         bool(dones[idx]),
                     )
                 )
@@ -60,6 +72,14 @@ class ReplayBuffer:
         with self._lock:
             batch = random.sample(self._items, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch, strict=True)
+        if batch and isinstance(states[0], tuple):
+            return TransitionBatch(
+                states=np.asarray(states, dtype=object),
+                actions=np.asarray(actions, dtype=np.int32),
+                rewards=np.asarray(rewards, dtype=np.float32),
+                next_states=np.asarray(next_states, dtype=object),
+                dones=np.asarray(dones, dtype=np.float32),
+            )
         return TransitionBatch(
             states=np.asarray(states, dtype=np.float32),
             actions=np.asarray(actions, dtype=np.int32),

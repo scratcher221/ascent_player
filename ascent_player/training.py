@@ -19,7 +19,15 @@ from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
 from ascent_player.env.target_detector import TargetDetectionTracker
 
 
+from ascent_player.training.curriculum import CurriculumMetrics, mechanics_stage_from_metrics
+
+
+_curriculum_metrics = CurriculumMetrics()
+
+
 def curriculum_stage_from_score(recent_avg: float, config: AppConfig) -> str:
+    if config.mechanics_curriculum.use_mechanics_rewards:
+        return mechanics_stage_from_metrics(_curriculum_metrics, config)
     if recent_avg >= config.training.curriculum_stage_b_max:
         return "C"
     if recent_avg >= config.training.curriculum_stage_a_max:
@@ -27,14 +35,55 @@ def curriculum_stage_from_score(recent_avg: float, config: AppConfig) -> str:
     return "A"
 
 
-def apply_curriculum(config: AppConfig, agent: DQNAgent, env) -> str:
+def apply_curriculum(config: AppConfig, agent: DQNAgent, env, *, episode_steps: int = 0, frame_state: FrameState | None = None) -> str:
+    if frame_state is not None:
+        _curriculum_metrics.record_episode(
+            steps=episode_steps,
+            bounces=frame_state.bounces,
+            height=frame_state.height,
+            combo=frame_state.combo,
+            score=float(frame_state.score or 0),
+        )
     recent = agent.progress.recent_scores[-10:]
     recent_avg = float(sum(recent) / len(recent)) if recent else 0.0
-    stage = curriculum_stage_from_score(recent_avg, config)
+    if config.mechanics_curriculum.use_mechanics_rewards:
+        stage = mechanics_stage_from_metrics(_curriculum_metrics, config)
+    else:
+        stage = curriculum_stage_from_score(recent_avg, config)
     agent.curriculum_stage = stage
     if hasattr(env, "reward_tracker"):
         env.reward_tracker.set_curriculum_stage(stage)
     return stage
+
+
+async def warmstart_from_teacher(agent: DQNAgent, config: AppConfig) -> int:
+    from ascent_player.agent.teacher import RuleTeacher
+
+    env = AscentSimEnv(config, fast_mode=True)
+    teacher = RuleTeacher()
+    added = 0
+    try:
+        for _ in range(config.mechanics_curriculum.teacher_episodes):
+            state = await env.reset()
+            for _ in range(600):
+                frame_state = env._last_frame_state
+                if frame_state is None:
+                    break
+                action = teacher.act(frame_state)
+                result = await env.step(action)
+                agent.remember(state, action, result.reward, result.state, result.done, sim=True)
+                state = result.state
+                added += 1
+                if result.done:
+                    break
+    finally:
+        await env.close()
+    if added:
+        agent.pretrain_from_replay(steps=min(config.demo.pretrain_steps, added // 4))
+        agent.epsilon = config.mechanics_curriculum.teacher_warmstart_epsilon
+        agent.metrics.epsilon = agent.epsilon
+        agent.progress.epsilon = agent.epsilon
+    return added
 
 
 def _empty_training_stats(log_path: Path, *, error: str = "") -> dict[str, float]:
@@ -110,7 +159,8 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     agent.apply_sim_pretrain_profile()
     logger = TrainingLogger(config, "sim")
 
-    states = np.stack([env.reset_sync() for env in envs])
+    states = [env.reset_sync() for env in envs]
+    hybrid_states = config.observation.include_vector_state
     episode_rewards = [0.0] * env_count
     episode_max_scores = [0.0] * env_count
     episode_step_counts = [0] * env_count
@@ -149,16 +199,19 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                 boost_levels=boost_levels,
             )
 
-            prev_states = states.copy()
+            prev_states = list(states) if hybrid_states else states.copy()
             rewards = np.zeros(env_count, dtype=np.float32)
-            next_states = np.empty_like(states)
+            next_states = [None] * env_count if hybrid_states else np.empty_like(states)
             dones = np.zeros(env_count, dtype=np.float32)
             scores: list[float | None] = []
 
             for index, env in enumerate(envs):
                 result = env.step_sync(int(actions[index]))
                 rewards[index] = result.reward
-                next_states[index] = result.state
+                if hybrid_states:
+                    next_states[index] = result.state
+                else:
+                    next_states[index] = result.state
                 dones[index] = float(result.done)
                 scores.append(
                     float(result.frame_state.score)
@@ -319,6 +372,11 @@ async def run_training_no_ui(
                 return _empty_training_stats(logger.path, error="browser_connect_failed")
         state = await env.reset()
         apply_curriculum(config, agent, env)
+        if config.mechanics_curriculum.use_mechanics_rewards and len(agent.replay) == 0:
+            teacher_added = await warmstart_from_teacher(agent, config)
+            if teacher_added:
+                print(f"Teacher warm-start added {teacher_added} sim transitions")
+                logger.log_note(f"teacher_warmstart={teacher_added}")
         episode = agent.progress.episodes_completed
         episode_reward = 0.0
         episode_max_score = 0.0
@@ -410,7 +468,13 @@ async def run_training_no_ui(
                 )
             if result.done:
                 agent.record_episode(episode_reward, episode_max_score)
-                apply_curriculum(config, agent, env)
+                apply_curriculum(
+                    config,
+                    agent,
+                    env,
+                    episode_steps=episode_steps,
+                    frame_state=result.frame_state,
+                )
                 logger.log_episode_end(
                     agent,
                     episode,
@@ -471,7 +535,9 @@ async def run_training_no_ui(
         "epsilon": agent.epsilon,
         "demo_replay_size": float(len(agent.demo_replay)),
         "curriculum_stage": float(
-            {"A": 0.0, "B": 1.0, "C": 2.0}.get(agent.curriculum_stage, 0.0)
+            int(agent.curriculum_stage[1:])
+            if str(agent.curriculum_stage).startswith("M")
+            else {"A": 0.0, "B": 1.0, "C": 2.0}.get(agent.curriculum_stage, 0.0)
         ),
     }
 
@@ -490,7 +556,8 @@ async def run_random_smoke(config: AppConfig, steps: int = 100) -> None:
                 print(status.message)
                 return
         state = await env.reset()
-        print(f"initial_state_shape={state.shape}")
+        shape = state[0].shape if isinstance(state, tuple) else state.shape
+        print(f"initial_state_shape={shape}")
         for idx in range(steps):
             action = random.randrange(config.action_count)
             result = await env.step(action)

@@ -1,9 +1,12 @@
 window.CHART_TRIAL_CONFIG = {
   offlineMode: true,
+  agentMode: true,
   // Same-origin routes are served by offline-fetch.js from bundled snapshots.
   calendarApiBaseUrl: window.location.origin,
   // Unlock every tier locally so training agents can reach all content.
   devUnlockTiers: true,
+  // Training runs on tier 0 (GENESIS) until the agent curriculum unlocks higher tiers.
+  trainingTierIndex: 0,
 };
 
 /* ── Radix / ASCENT constants (kept for shop UI labels; wallet is stubbed offline) ── */

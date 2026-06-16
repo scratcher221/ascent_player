@@ -62,11 +62,16 @@ class DQNAgent:
         self._last_autosave_steps = 0
         self._episodes_since_best = 0
         self._sim_pretrain_mode = False
-        self.curriculum_stage = "A"
+        self.curriculum_stage = "M0"
         input_shape = (
             config.observation.height,
             config.observation.width,
             config.observation.channel_count,
+        )
+        self._vector_dim = (
+            config.observation.vector_dim
+            if config.observation.include_vector_state
+            else 0
         )
 
         with self.tf.device(self.device_info.training_device):
@@ -74,21 +79,58 @@ class DQNAgent:
                 input_shape,
                 config.action_count,
                 config.training.learning_rate,
+                vector_dim=self._vector_dim,
             )
             self.target = build_q_network(
                 input_shape,
                 config.action_count,
                 config.training.learning_rate,
+                vector_dim=self._vector_dim,
             )
             self.target.set_weights(self.online.get_weights())
 
-        sample = np.zeros(input_shape, dtype=np.float32)
+        sample = self._sample_model_input(np.zeros(input_shape, dtype=np.float32))
         self.device_info.inference_device = benchmark_inference_device(
             self.online,
             sample,
             self.device_info,
         )
         self._batch_predict = self._build_batch_predict()
+
+    def _sample_model_input(self, visual: np.ndarray) -> np.ndarray | list[np.ndarray]:
+        if self._vector_dim > 0:
+            return [
+                visual,
+                np.zeros(self._vector_dim, dtype=np.float32),
+            ]
+        return visual
+
+    def _to_model_batch(self, states) -> np.ndarray | list[np.ndarray]:
+        if self._vector_dim <= 0:
+            return np.asarray(states, dtype=np.float32)
+        if isinstance(states, np.ndarray) and states.dtype != object:
+            return np.asarray(states, dtype=np.float32)
+        visuals = np.stack([item[0] for item in states], axis=0)
+        vectors = np.stack([item[1] for item in states], axis=0)
+        return [visuals, vectors]
+
+    def _predict_q_values(self, state) -> np.ndarray:
+        with self.tf.device(self.device_info.inference_device):
+            if self._vector_dim > 0:
+                visual, vector = state
+                q_values = self.online(
+                    [
+                        self.tf.convert_to_tensor(visual[None, ...], dtype=self.tf.float32),
+                        self.tf.convert_to_tensor(vector[None, ...], dtype=self.tf.float32),
+                    ],
+                    training=False,
+                )[0].numpy()
+            else:
+                q_values = self.online(
+                    self.tf.convert_to_tensor(state[None, ...], dtype=self.tf.float32),
+                    training=False,
+                )[0].numpy()
+        return q_values
 
     def apply_sim_pretrain_profile(self) -> None:
         training = self.config.training
@@ -122,11 +164,7 @@ class DQNAgent:
         valid = self._valid_actions(can_boost, boost_level)
         if training and random.random() < self.epsilon:
             return random.choice(valid)
-        with self.tf.device(self.device_info.inference_device):
-            q_values = self.online(
-                self.tf.convert_to_tensor(state[None, ...], dtype=self.tf.float32),
-                training=False,
-            )[0].numpy()
+        q_values = self._predict_q_values(state)
         masked = np.full(self.config.action_count, -np.inf, dtype=np.float32)
         for action in valid:
             masked[action] = q_values[action]
@@ -134,13 +172,16 @@ class DQNAgent:
 
     def act_batch(
         self,
-        states: np.ndarray,
+        states,
         *,
         training: bool = True,
         can_boost: np.ndarray | list[bool] | None = None,
         boost_levels: np.ndarray | list[float] | None = None,
     ) -> np.ndarray:
-        batch_size = len(states)
+        if isinstance(states, list):
+            batch_size = len(states)
+        else:
+            batch_size = len(states)
         if can_boost is None:
             can_boost = np.ones(batch_size, dtype=bool)
         if boost_levels is None:
@@ -153,10 +194,24 @@ class DQNAgent:
 
         greedy_indices = np.flatnonzero(~explore_mask)
         if len(greedy_indices) > 0:
+            if isinstance(states, list):
+                batch_states = [states[int(i)] for i in greedy_indices]
+            else:
+                batch_states = states[greedy_indices]
+            batch_input = self._to_model_batch(batch_states)
             with self.tf.device(self.device_info.inference_device):
-                q_values = self._batch_predict(
-                    self.tf.convert_to_tensor(states[greedy_indices], dtype=self.tf.float32)
-                ).numpy()
+                if self._vector_dim > 0:
+                    q_values = self.online(
+                        [
+                            self.tf.convert_to_tensor(batch_input[0], dtype=self.tf.float32),
+                            self.tf.convert_to_tensor(batch_input[1], dtype=self.tf.float32),
+                        ],
+                        training=False,
+                    ).numpy()
+                else:
+                    q_values = self._batch_predict(
+                        self.tf.convert_to_tensor(batch_input, dtype=self.tf.float32)
+                    ).numpy()
             for offset, index in enumerate(greedy_indices):
                 valid = self._valid_actions(bool(can_boost[index]), float(boost_levels[index]))
                 masked = np.full(self.config.action_count, -np.inf, dtype=np.float32)
@@ -270,10 +325,10 @@ class DQNAgent:
 
     def remember(
         self,
-        state: np.ndarray,
+        state,
         action: int,
         reward: float,
-        next_state: np.ndarray,
+        next_state,
         done: bool,
         *,
         sim: bool = False,
@@ -284,16 +339,26 @@ class DQNAgent:
 
     def remember_batch(
         self,
-        states: np.ndarray,
+        states,
         actions: np.ndarray,
         rewards: np.ndarray,
-        next_states: np.ndarray,
+        next_states,
         dones: np.ndarray,
         *,
         sim: bool = False,
     ) -> None:
         buffer = self.sim_replay if sim else self.replay
-        buffer.add_many(states, actions, rewards, next_states, dones)
+        if isinstance(states, list):
+            for index in range(len(actions)):
+                buffer.add(
+                    states[index],
+                    int(actions[index]),
+                    float(rewards[index]),
+                    next_states[index],
+                    bool(dones[index]),
+                )
+        else:
+            buffer.add_many(states, actions, rewards, next_states, dones)
         self.metrics.replay_size = len(self.replay)
 
     def advance_steps(self, count: int = 1) -> AgentMetrics:
@@ -559,16 +624,36 @@ class DQNAgent:
         return True
 
     def _train_batch(self, batch: TransitionBatch):
-        states = self.tf.convert_to_tensor(batch.states, dtype=self.tf.float32)
-        next_states = self.tf.convert_to_tensor(batch.next_states, dtype=self.tf.float32)
+        states = self._to_model_batch(batch.states)
+        next_states = self._to_model_batch(batch.next_states)
         actions = self.tf.convert_to_tensor(batch.actions, dtype=self.tf.int32)
         rewards = self.tf.convert_to_tensor(batch.rewards, dtype=self.tf.float32)
         dones = self.tf.convert_to_tensor(batch.dones, dtype=self.tf.float32)
-        loss = self._train_step(states, actions, rewards, next_states, dones)
+        if self._vector_dim > 0:
+            loss = self._train_step(
+                self.tf.convert_to_tensor(states[0], dtype=self.tf.float32),
+                self.tf.convert_to_tensor(states[1], dtype=self.tf.float32),
+                actions,
+                rewards,
+                self.tf.convert_to_tensor(next_states[0], dtype=self.tf.float32),
+                self.tf.convert_to_tensor(next_states[1], dtype=self.tf.float32),
+                dones,
+            )
+        else:
+            dummy = self.tf.zeros((len(batch.actions), 1), dtype=self.tf.float32)
+            loss = self._train_step(
+                self.tf.convert_to_tensor(states, dtype=self.tf.float32),
+                dummy,
+                actions,
+                rewards,
+                self.tf.convert_to_tensor(next_states, dtype=self.tf.float32),
+                dummy,
+                dones,
+            )
         if (
             len(self.demo_replay) > 0
             and (
-                self.curriculum_stage in {"B", "C"}
+                self.curriculum_stage not in {"M0", "M1", "M2"}
                 or self.progress.best_score >= self.config.training.curriculum_stage_a_max
             )
             and self.metrics.total_steps % max(1, self.config.demo.hybrid_bc_every) == 0
@@ -576,8 +661,9 @@ class DQNAgent:
             demo_batch = self.demo_replay.sample(
                 min(self.batch_size, len(self.demo_replay))
             )
+            demo_states = self._to_model_batch(demo_batch.states)
             bc_loss = self._bc_train_step(
-                self.tf.convert_to_tensor(demo_batch.states, dtype=self.tf.float32),
+                demo_states,
                 self.tf.convert_to_tensor(demo_batch.actions, dtype=self.tf.int32),
             )
             loss = loss + self.config.demo.bc_loss_weight * bc_loss
@@ -621,8 +707,15 @@ class DQNAgent:
             neg_inf = tf.constant(-1e9, dtype=tf.float32)
 
             @self.tf.function
-            def train_step(states, actions, rewards, next_states, dones):
-                boost_levels = tf.reduce_mean(next_states[..., -2], axis=[1, 2])
+            def train_step(state_visual, state_vector, actions, rewards, next_visual, next_vector, dones):
+                if agent._vector_dim > 0:
+                    next_states_tensor = [next_visual, next_vector]
+                    states_tensor = [state_visual, state_vector]
+                    boost_levels = tf.reduce_mean(next_visual[..., -2], axis=[1, 2])
+                else:
+                    next_states_tensor = next_visual
+                    states_tensor = state_visual
+                    boost_levels = tf.reduce_mean(next_states_tensor[..., -2], axis=[1, 2])
                 can_boost = boost_levels * 100.0 >= agent.config.reward.boost_min_energy
                 action_idx = tf.range(action_count, dtype=tf.int32)
                 jump_actions = action_idx >= 3
@@ -632,8 +725,8 @@ class DQNAgent:
                 )
                 mask = tf.cast(allowed, tf.float32)
 
-                online_next_q = agent.online(next_states, training=False)
-                target_next_q = agent.target(next_states, training=False)
+                online_next_q = agent.online(next_states_tensor, training=False)
+                target_next_q = agent.target(next_states_tensor, training=False)
                 masked_online = tf.where(mask > 0.0, online_next_q, neg_inf)
                 masked_target = tf.where(mask > 0.0, target_next_q, neg_inf)
 
@@ -649,7 +742,7 @@ class DQNAgent:
                 targets = rewards + (1.0 - dones) * agent.config.training.gamma * next_values
 
                 with tf.GradientTape() as tape:
-                    q_values = agent.online(states, training=True)
+                    q_values = agent.online(states_tensor, training=True)
                     action_masks = tf.one_hot(actions, action_count)
                     selected_q = tf.reduce_sum(q_values * action_masks, axis=1)
                     loss = tf.keras.losses.Huber()(targets, selected_q)
@@ -682,8 +775,16 @@ class DQNAgent:
 
             @self.tf.function
             def bc_train_step(states, actions):
+                if agent._vector_dim > 0:
+                    visual, vector = states
+                    model_in = [
+                        tf.convert_to_tensor(visual, dtype=tf.float32),
+                        tf.convert_to_tensor(vector, dtype=tf.float32),
+                    ]
+                else:
+                    model_in = tf.convert_to_tensor(states, dtype=tf.float32)
                 with tf.GradientTape() as tape:
-                    q_values = agent.online(states, training=True)
+                    q_values = agent.online(model_in, training=True)
                     loss = tf.keras.losses.SparseCategoricalCrossentropy(
                         from_logits=True
                     )(actions, q_values)

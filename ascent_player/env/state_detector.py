@@ -22,18 +22,35 @@ from ascent_player.env.target_detector import (
 class FrameState:
     orb_x: float | None = None
     orb_y: float | None = None
+    orb_vx: float | None = None
+    orb_vy: float | None = None
     score: int | None = None
     boost_level: float = 1.0
     can_boost: bool = True
     nearest_platform_dx: float | None = None
     nearest_platform_dy: float | None = None
+    nearest_platform_width: float = 0.0
+    platform_wear: float = 0.0
     platform_mask: np.ndarray | None = None
     target_dx: float | None = None
     target_dy: float | None = None
     target_kind: str | None = None
+    booster_dx: float | None = None
+    booster_dy: float | None = None
+    booster_type: str | None = None
     combo: int = 0
     streak: int = 0
     score_multiplier: float = 1.0
+    bonus: float = 0.0
+    bank_style: float = 0.0
+    height: float = 0.0
+    bounces: int = 0
+    storm_level: float = 0.0
+    tier_index: int = 0
+    canvas_w: float = 640.0
+    canvas_h: float = 360.0
+    agent_hook_ok: bool = False
+    game_phase: str = ""
     platform_landed: bool = False
     game_over: bool = False
     in_menu: bool = False
@@ -278,4 +295,67 @@ def merge_dom_state(frame_state: FrameState, body_text: str) -> FrameState:
     multiplier = parse_multiplier_from_text(body_text)
     if multiplier is not None:
         frame_state.score_multiplier = multiplier
+    return frame_state
+
+
+def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameState:
+    if not isinstance(payload, dict):
+        return frame_state
+    frame_state.agent_hook_ok = True
+    frame_state.game_phase = str(payload.get("state") or "")
+    if frame_state.game_phase == "crashed":
+        frame_state.game_over = True
+    if frame_state.game_phase in {"ready", "paused"}:
+        frame_state.in_menu = True
+
+    canvas_w = float(payload.get("canvasW") or frame_state.canvas_w or 640.0)
+    canvas_h = float(payload.get("canvasH") or frame_state.canvas_h or 360.0)
+    frame_state.canvas_w = canvas_w
+    frame_state.canvas_h = canvas_h
+    camera_y = float(payload.get("cameraY") or 0.0)
+
+    orb = payload.get("orb") or {}
+    if orb:
+        frame_state.orb_x = float(orb.get("x", 0.0))
+        frame_state.orb_vx = float(orb.get("vx", 0.0))
+        frame_state.orb_vy = float(orb.get("vy", 0.0))
+        world_y = float(orb.get("worldY", 0.0))
+        frame_state.orb_y = (world_y - camera_y) / max(canvas_h, 1.0)
+        energy = float(orb.get("energy", 0.0))
+        reserve = float(orb.get("reserve", 0.0))
+        frame_state.boost_level = min(1.0, (energy + reserve) / 100.0)
+        frame_state.can_boost = bool(payload.get("canBoost", energy + reserve >= 14))
+        frame_state.combo = int(orb.get("combo", frame_state.combo))
+        frame_state.bonus = float(orb.get("bonus", 0.0))
+        frame_state.bank_style = float(orb.get("bankStyle", 0.0))
+        frame_state.height = float(orb.get("height", 0.0))
+        frame_state.bounces = int(orb.get("bounces", 0))
+
+    if payload.get("score") is not None:
+        frame_state.score = int(payload["score"])
+    frame_state.tier_index = int(payload.get("tierIndex", frame_state.tier_index))
+    frame_state.storm_level = float(payload.get("stormLevel", 0.0))
+
+    nearest = payload.get("nearestPlatformBelow")
+    if isinstance(nearest, dict):
+        frame_state.nearest_platform_dx = float(nearest.get("dx", 0.0))
+        frame_state.nearest_platform_dy = float(nearest.get("dy", 0.0))
+        frame_state.nearest_platform_width = float(nearest.get("width", 0.0))
+        frame_state.platform_wear = float(nearest.get("wear", 0.0))
+        frame_state.target_dx = frame_state.nearest_platform_dx
+        frame_state.target_dy = frame_state.nearest_platform_dy
+        frame_state.target_kind = "platform"
+
+    booster = payload.get("nearestBooster")
+    if isinstance(booster, dict):
+        frame_state.booster_dx = float(booster.get("dx", 0.0))
+        frame_state.booster_dy = float(booster.get("dy", 0.0))
+        frame_state.booster_type = str(booster.get("type") or "")
+        if frame_state.target_kind != "platform" or abs(frame_state.booster_dy or 1) < abs(
+            frame_state.nearest_platform_dy or 1
+        ):
+            frame_state.target_dx = frame_state.booster_dx
+            frame_state.target_dy = frame_state.booster_dy
+            frame_state.target_kind = f"booster_{frame_state.booster_type}"
+
     return frame_state

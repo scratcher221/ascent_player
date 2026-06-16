@@ -6,7 +6,11 @@ from pathlib import Path
 
 
 ASCENT_URL = "https://ascent.xrd.workers.dev/"
+LOCAL_ASCENT_URL = (
+    "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
+)
 ASCENT_HOST = "ascent.xrd.workers.dev"
+LOCAL_ASCENT_HOST = "127.0.0.1"
 
 
 class DeviceMode(str, Enum):
@@ -23,8 +27,9 @@ class RunMode(str, Enum):
 
 @dataclass(slots=True)
 class BrowserConfig:
-    ascent_url: str = ASCENT_URL
-    host_match: str = ASCENT_HOST
+    ascent_url: str = LOCAL_ASCENT_URL
+    host_match: str = LOCAL_ASCENT_HOST
+    agent_mode: bool = True
     cdp_ports: tuple[int, ...] = tuple(range(9222, 9230))
     cdp_timeout_seconds: float = 0.25
     manual_cdp_url: str | None = None
@@ -52,6 +57,8 @@ class ObservationConfig:
     frame_stack: int = 4
     include_boost_channel: bool = True
     include_platform_channel: bool = True
+    include_vector_state: bool = True
+    vector_dim: int = 24
 
     @property
     def channel_count(self) -> int:
@@ -100,6 +107,47 @@ class RewardConfig:
     milestone_scores: tuple[int, ...] = (500, 1000, 1500, 2000, 2500, 3000)
     milestone_bonus: float = 0.2
     reward_clip: float = 2.0
+
+
+@dataclass(slots=True)
+class MechanicsRewardConfig:
+    survival: float = 0.004
+    height_gain: float = 0.012
+    platform_land: float = 0.35
+    falling_penalty: float = -0.04
+    steer_gain: float = 0.38
+    wrong_way_penalty: float = -0.18
+    aligned_bonus: float = 0.08
+    boost_spent: float = -0.025
+    wasted_boost_penalty: float = -0.10
+    empty_boost_penalty: float = -0.22
+    timed_boost_bonus: float = 0.12
+    combo_gain: float = 0.06
+    combo_break_penalty: float = -0.40
+    booster_collect: float = 0.18
+    drag_penalty: float = -0.35
+    score_gain: float = 0.008
+    death: float = -1.0
+    early_death_penalty: float = -0.5
+    early_death_steps: int = 80
+    milestone_scores: tuple[int, ...] = (500, 1000, 1500, 2000, 2500, 3000)
+    milestone_bonus: float = 0.2
+    reward_clip: float = 2.0
+    boost_min_energy: float = 14.0
+
+
+@dataclass(slots=True)
+class MechanicsCurriculumConfig:
+    stage_m1_min_survival_steps: float = 480.0
+    stage_m2_min_landing_rate: float = 0.60
+    stage_m3_min_height: float = 400.0
+    stage_m4_min_combo: float = 5.0
+    stage_m5_min_score: float = 800.0
+    stage_m6_min_score: float = 1500.0
+    training_tier_index: int = 0
+    teacher_episodes: int = 80
+    teacher_warmstart_epsilon: float = 0.15
+    use_mechanics_rewards: bool = True
 
 
 @dataclass(slots=True)
@@ -154,7 +202,7 @@ class TrainingConfig:
     transfer_epsilon_restart: float = 0.45
     transfer_demo_delay_episodes: int = 12
     transfer_plateau_episodes: int = 12
-    transfer_frame_skip: int = 4
+    transfer_frame_skip: int = 2
     browser_epsilon_cap: float = 0.35
     browser_epsilon_floor: float = 0.05
     browser_plateau_epsilon_decay: float = 0.97
@@ -169,7 +217,7 @@ class TrainingConfig:
     target_detection_min_samples: int = 80
     target_special_min_rate: float = 0.02
     finetune_max_seconds: int = 600
-    mixed_sim_replay_ratio: float = 0.0
+    mixed_sim_replay_ratio: float = 0.3
     sim_epsilon_end: float = 0.12
     sim_epsilon_decay: float = 0.995
     sim_min_best_score: int = 1000
@@ -195,6 +243,10 @@ class AppConfig:
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    mechanics_reward: MechanicsRewardConfig = field(default_factory=MechanicsRewardConfig)
+    mechanics_curriculum: MechanicsCurriculumConfig = field(
+        default_factory=MechanicsCurriculumConfig
+    )
     training: TrainingConfig = field(default_factory=TrainingConfig)
     demo: DemoConfig = field(default_factory=DemoConfig)
 

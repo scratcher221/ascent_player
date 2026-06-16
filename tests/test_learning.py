@@ -14,6 +14,7 @@ class LearningSanityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = AppConfig()
+        cls.config.observation.include_vector_state = False
         cls.config.training.device_mode = DeviceMode.CPU
         cls.config.training.min_replay_size = 32
         cls.config.training.batch_size_cpu = 16
@@ -24,18 +25,35 @@ class LearningSanityTests(unittest.TestCase):
         agent = DQNAgent(self.config)
         before = agent.weight_norm()
         channels = self.config.observation.channel_count
-        states = np.random.rand(32, 84, 84, channels).astype(np.float32)
+        visual = np.random.rand(32, 84, 84, channels).astype(np.float32)
+        if self.config.observation.include_vector_state:
+            states = [
+                (visual[i], np.zeros(self.config.observation.vector_dim, dtype=np.float32))
+                for i in range(32)
+            ]
+        else:
+            states = visual
         actions = np.random.randint(0, 6, size=32, dtype=np.int32)
         rewards = np.zeros(32, dtype=np.float32)
         dones = np.zeros(32, dtype=np.float32)
-        agent.absorb_demonstration_arrays(
-            states,
-            actions,
-            rewards,
-            states,
-            dones,
-            multiplier=1,
-        )
+        if isinstance(states, list):
+            for i in range(32):
+                agent.demo_replay.add(
+                    states[i],
+                    int(actions[i]),
+                    float(rewards[i]),
+                    states[i],
+                    bool(dones[i]),
+                )
+        else:
+            agent.absorb_demonstration_arrays(
+                states,
+                actions,
+                rewards,
+                states,
+                dones,
+                multiplier=1,
+            )
         loss = agent.pretrain_from_replay(steps=30)
         after = agent.weight_norm()
         self.assertIsNotNone(loss)
@@ -83,15 +101,25 @@ class LearningSanityTests(unittest.TestCase):
             env = AscentSimEnv(self.config)
             try:
                 state = await env.reset()
-                self.assertEqual(
-                    state.shape,
-                    (84, 84, self.config.observation.channel_count),
-                )
+                if isinstance(state, tuple):
+                    visual, vector = state
+                    self.assertEqual(
+                        visual.shape,
+                        (84, 84, self.config.observation.channel_count),
+                    )
+                    self.assertEqual(vector.shape[0], self.config.observation.vector_dim)
+                else:
+                    self.assertEqual(
+                        state.shape,
+                        (84, 84, self.config.observation.channel_count),
+                    )
                 result = await env.step(0)
-                self.assertEqual(
-                    result.state.shape,
-                    (84, 84, self.config.observation.channel_count),
-                )
+                if isinstance(result.state, tuple):
+                    visual, vector = result.state
+                    self.assertEqual(visual.ndim, 3)
+                    self.assertEqual(vector.shape[0], self.config.observation.vector_dim)
+                else:
+                    self.assertEqual(result.state.ndim, 3)
             finally:
                 await env.close()
 

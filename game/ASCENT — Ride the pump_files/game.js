@@ -68,6 +68,7 @@ const PREVIEW_TOKEN = new URLSearchParams(location.search).get("previewToken") |
 const DEV_UNLOCK_TIERS = window.CHART_TRIAL_CONFIG?.devUnlockTiers
   || (/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
   && new URLSearchParams(location.search).has("devUnlockTiers"));
+const AGENT_MODE = Boolean(window.CHART_TRIAL_CONFIG?.agentMode);
 const LB_MAX         = 10;
 const LB_ARCHIVE_MAX = 1000; // mirrors worker LEADERBOARD_ARCHIVE_MAX; ranks beyond it are unknown
 const PLAYER_NAME_KEY = "ascent-player-name";
@@ -2905,6 +2906,85 @@ function updateBeaconAttraction(dt, ultiMods) {
   }
 }
 
+function exportAgentState() {
+  if (!AGENT_MODE || !orb?.worldY) return;
+  const viewTop = cameraY - 50;
+  const viewBot = cameraY + H + 50;
+  const visiblePlatforms = platforms
+    .filter(p => p.worldY >= viewTop && p.worldY <= viewBot)
+    .slice(0, 24)
+    .map(p => ({
+      x: p.x + p.width / 2,
+      worldY: p.worldY,
+      width: p.width,
+      type: p.type || "neutral",
+      receptions: p.receptions ?? 0,
+      bounceLimit: p.bounceLimit ?? 3,
+    }));
+  const visibleBoosters = boosters
+    .filter(b => !b.used && b.worldY >= viewTop && b.worldY <= viewBot)
+    .slice(0, 12)
+    .map(b => ({ type: b.type, x: b.x, worldY: b.worldY, w: b.w }));
+  let nearest = null;
+  for (const plat of platforms) {
+    if (plat.worldY > orb.worldY - 8) continue;
+    if (!nearest || plat.worldY > nearest.worldY) nearest = plat;
+  }
+  let nearestPlatformBelow = null;
+  if (nearest) {
+    nearestPlatformBelow = {
+      dx: ((nearest.x + nearest.width / 2) - orb.x) / Math.max(W, 1),
+      dy: (orb.worldY - nearest.worldY) / Math.max(H, 1),
+      width: nearest.width / Math.max(W, 1),
+      wear: (nearest.receptions ?? 0) / Math.max(nearest.bounceLimit ?? 3, 1),
+    };
+  }
+  let nearestBooster = null;
+  let bestDist = Infinity;
+  for (const b of visibleBoosters) {
+    const dx = b.x - orb.x;
+    const dy = b.worldY - orb.worldY;
+    const dist = dx * dx + dy * dy;
+    if (dist < bestDist) {
+      bestDist = dist;
+      nearestBooster = {
+        type: b.type,
+        dx: dx / Math.max(W, 1),
+        dy: dy / Math.max(H, 1),
+      };
+    }
+  }
+  window.__ASCENT_AGENT__ = {
+    state,
+    orb: {
+      x: orb.x,
+      worldY: orb.worldY,
+      vx: orb.vx ?? 0,
+      vy: orb.vy ?? 0,
+      energy: orb.energy ?? 0,
+      reserve: orb.reserve ?? 0,
+      combo: orb.combo ?? 0,
+      bonus: orb.bonus ?? 0,
+      bankStyle: orb.bankStyle ?? 0,
+      height: orb.height ?? 0,
+      bounces: orb.bounces ?? 0,
+    },
+    cameraY,
+    canvasW: W,
+    canvasH: H,
+    platforms: visiblePlatforms,
+    boosters: visibleBoosters,
+    activeAnomaly: activeAnomaly ? { type: activeAnomaly.type, remaining: activeAnomaly.remaining ?? 0 } : null,
+    ultiCharges: [...(ultiCharges || [])],
+    tierIndex: activeTier,
+    score: currentScore(),
+    canBoost: (orb.energy ?? 0) + (orb.reserve ?? 0) >= 14,
+    nearestPlatformBelow,
+    nearestBooster,
+    stormLevel: stormLevel(),
+  };
+}
+
 function update(dt) {
   updateGamepadInput();
   if (state === "paused") return;
@@ -2929,6 +3009,7 @@ function update(dt) {
   updateScoreAndCamera(simDt);
   anomalyMinDelay = Math.max(0, anomalyMinDelay - dt); // real dt: CHRONO must not stretch the floor
   maybeTriggerAutoAnomaly();
+  if (AGENT_MODE) exportAgentState();
 }
 
 // Tier is a prestige weight applied ONCE, uniformly, at display time — never baked into the bank.

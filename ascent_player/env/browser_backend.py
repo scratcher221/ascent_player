@@ -121,6 +121,18 @@ _READ_SCORE_JS = """
 }
 """
 
+_READ_AGENT_STATE_JS = """
+() => window.__ASCENT_AGENT__ || null
+"""
+
+_ENSURE_AGENT_MODE_JS = """
+() => {
+    window.CHART_TRIAL_CONFIG = window.CHART_TRIAL_CONFIG || {};
+    window.CHART_TRIAL_CONFIG.agentMode = true;
+    return true;
+}
+"""
+
 
 @dataclass(slots=True)
 class HudSnapshot:
@@ -259,6 +271,40 @@ class BrowserBackend:
         except Exception:
             # Some game boot states delay canvas attachment. The env will retry.
             pass
+        if self.config.agent_mode:
+            await self.ensure_agent_mode()
+
+    async def ensure_agent_mode(self) -> None:
+        self._require_page()
+        try:
+            await self.page.evaluate(_ENSURE_AGENT_MODE_JS)
+        except Exception:
+            pass
+
+    async def read_agent_state(self) -> dict | None:
+        self._require_page()
+        try:
+            payload = await self.page.evaluate(_READ_AGENT_STATE_JS)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    async def select_training_tier(self, tier_index: int) -> None:
+        self._require_page()
+        try:
+            await self.page.evaluate(
+                """(tier) => {
+                    if (typeof activeTier !== 'number') return false;
+                    activeTier = tier;
+                    document.querySelectorAll('.tier-btn').forEach((b, i) => {
+                        b.classList.toggle('active', i === tier);
+                    });
+                    return true;
+                }""",
+                tier_index,
+            )
+        except Exception:
+            pass
 
     async def canvas_screenshot(self) -> np.ndarray:
         frame, _ = await self.capture_turn(include_hud=False)
@@ -370,6 +416,14 @@ class BrowserBackend:
         self._require_page()
         try:
             await self.page.get_by_text(text, exact=False).click(timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    async def click_selector(self, selector: str, timeout: int = 1_000) -> bool:
+        self._require_page()
+        try:
+            await self.page.locator(selector).first.click(timeout=timeout)
             return True
         except Exception:
             return False
