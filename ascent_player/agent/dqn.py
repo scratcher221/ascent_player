@@ -107,11 +107,46 @@ class DQNAgent:
 
     def _to_model_batch(self, states) -> np.ndarray | list[np.ndarray]:
         if self._vector_dim <= 0:
-            return np.asarray(states, dtype=np.float32)
-        if isinstance(states, np.ndarray) and states.dtype != object:
-            return np.asarray(states, dtype=np.float32)
-        visuals = np.stack([item[0] for item in states], axis=0)
-        vectors = np.stack([item[1] for item in states], axis=0)
+            arr = np.asarray(states, dtype=np.float32)
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            return arr
+
+        def zero_vectors(batch_size: int) -> np.ndarray:
+            return np.zeros((batch_size, self._vector_dim), dtype=np.float32)
+
+        if isinstance(states, np.ndarray):
+            if states.dtype == object:
+                items = list(states)
+            elif states.ndim == 4:
+                visuals = np.asarray(states, dtype=np.float32)
+                return [visuals, zero_vectors(visuals.shape[0])]
+            elif states.ndim == 3:
+                visuals = np.asarray(states, dtype=np.float32)[None, ...]
+                return [visuals, zero_vectors(1)]
+            else:
+                items = list(states)
+        elif (
+            isinstance(states, (tuple, list))
+            and len(states) == 2
+            and isinstance(states[0], np.ndarray)
+            and states[0].ndim == 3
+            and isinstance(states[1], np.ndarray)
+            and states[1].ndim == 1
+        ):
+            return [
+                np.asarray(states[0], dtype=np.float32)[None, ...],
+                np.asarray(states[1], dtype=np.float32)[None, ...],
+            ]
+        else:
+            items = list(states)
+
+        if isinstance(items[0], (tuple, list)):
+            visuals = np.stack([item[0] for item in items], axis=0).astype(np.float32)
+            vectors = np.stack([item[1] for item in items], axis=0).astype(np.float32)
+        else:
+            visuals = np.stack(items, axis=0).astype(np.float32)
+            vectors = zero_vectors(visuals.shape[0])
         return [visuals, vectors]
 
     def _predict_q_values(self, state) -> np.ndarray:
@@ -291,7 +326,7 @@ class DQNAgent:
             for _ in range(total_steps):
                 batch = self.demo_replay.sample(batch_size)
                 last_loss = float(
-                    self._bc_train_step(
+                    self._invoke_bc_train_step(
                         batch.states,
                         batch.actions,
                     ).numpy()
@@ -307,19 +342,13 @@ class DQNAgent:
         with self.tf.device(self.device_info.training_device):
             for _ in range(total_steps):
                 indices = np.random.randint(0, len(transitions), batch_size)
-                batch_states = np.asarray(
-                    [transitions[i].state for i in indices],
-                    dtype=np.float32,
-                )
+                batch_states = [transitions[i].state for i in indices]
                 batch_actions = np.asarray(
                     [transitions[i].action for i in indices],
                     dtype=np.int32,
                 )
                 last_loss = float(
-                    self._bc_train_step(
-                        batch_states,
-                        batch_actions,
-                    ).numpy()
+                    self._invoke_bc_train_step(batch_states, batch_actions).numpy()
                 )
         return last_loss
 
@@ -661,10 +690,9 @@ class DQNAgent:
             demo_batch = self.demo_replay.sample(
                 min(self.batch_size, len(self.demo_replay))
             )
-            demo_states = self._to_model_batch(demo_batch.states)
-            bc_loss = self._bc_train_step(
-                demo_states,
-                self.tf.convert_to_tensor(demo_batch.actions, dtype=self.tf.int32),
+            bc_loss = self._invoke_bc_train_step(
+                demo_batch.states,
+                demo_batch.actions,
             )
             loss = loss + self.config.demo.bc_loss_weight * bc_loss
         return loss
@@ -767,6 +795,23 @@ class DQNAgent:
             self._compiled_train_step = train_step
         return self._compiled_train_step
 
+    def _invoke_bc_train_step(self, states, actions):
+        actions_t = self.tf.convert_to_tensor(actions, dtype=self.tf.int32)
+        model_batch = self._to_model_batch(states)
+        dummy = self.tf.zeros((self.tf.shape(actions_t)[0], 1), dtype=self.tf.float32)
+        if self._vector_dim > 0:
+            visual, vector = model_batch
+            return self._bc_train_step(
+                self.tf.convert_to_tensor(visual, dtype=self.tf.float32),
+                self.tf.convert_to_tensor(vector, dtype=self.tf.float32),
+                actions_t,
+            )
+        return self._bc_train_step(
+            self.tf.convert_to_tensor(model_batch, dtype=self.tf.float32),
+            dummy,
+            actions_t,
+        )
+
     @property
     def _bc_train_step(self):
         if not hasattr(self, "_compiled_bc_train_step"):
@@ -774,15 +819,11 @@ class DQNAgent:
             tf = agent.tf
 
             @self.tf.function
-            def bc_train_step(states, actions):
+            def bc_train_step(state_visual, state_vector, actions):
                 if agent._vector_dim > 0:
-                    visual, vector = states
-                    model_in = [
-                        tf.convert_to_tensor(visual, dtype=tf.float32),
-                        tf.convert_to_tensor(vector, dtype=tf.float32),
-                    ]
+                    model_in = [state_visual, state_vector]
                 else:
-                    model_in = tf.convert_to_tensor(states, dtype=tf.float32)
+                    model_in = state_visual
                 with tf.GradientTape() as tape:
                     q_values = agent.online(model_in, training=True)
                     loss = tf.keras.losses.SparseCategoricalCrossentropy(

@@ -66,7 +66,7 @@ class VectorObsTests(unittest.TestCase):
 
 class CurriculumTests(unittest.TestCase):
     def test_stage_progression(self) -> None:
-        from ascent_player.training.curriculum import CurriculumMetrics, mechanics_stage_from_metrics
+        from ascent_player.mechanics_curriculum import CurriculumMetrics, mechanics_stage_from_metrics
 
         config = AppConfig()
         metrics = CurriculumMetrics()

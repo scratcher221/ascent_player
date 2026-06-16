@@ -19,7 +19,7 @@ from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
 from ascent_player.env.target_detector import TargetDetectionTracker
 
 
-from ascent_player.training.curriculum import CurriculumMetrics, mechanics_stage_from_metrics
+from ascent_player.mechanics_curriculum import CurriculumMetrics, mechanics_stage_from_metrics
 
 
 _curriculum_metrics = CurriculumMetrics()
