@@ -709,6 +709,7 @@ body.quality-low .crt-overlay { opacity: .12; }
 .lb-tab--active { border-color: var(--t-primary); color: var(--t-primary); }
 .lb-wallet { display: block; font-size: 9px; color: var(--muted); letter-spacing: .04em; margin-top: 1px; }
 .lb-contest-banner { margin-bottom: 14px; text-align: center; }
+.lb-contest-tier { font: 14px/1 "VT323", monospace; color: var(--t-primary); margin: 0 0 8px; letter-spacing: .08em; text-transform: uppercase; }
 .lb-contest-podium { display: flex; justify-content: center; align-items: flex-end; gap: 6px; margin-bottom: 10px; }
 .lb-contest-prize { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 6px 10px; border: 1px solid; border-radius: var(--r-2); font: 13px/1 "VT323", monospace; letter-spacing: .06em; }
 .lb-contest-prize span { font-size: 10px; letter-spacing: .04em; }

@@ -65,8 +65,9 @@ async function apiFetch(url, { timeoutMs = 5000, errorLabel = "request failed", 
 const PREVIEW_TOKEN = new URLSearchParams(location.search).get("previewToken") || "";
 // Dev-only: unlock every tier on localhost via ?devUnlockTiers (for visual QA).
 // Host-gated so it can never take effect in production.
-const DEV_UNLOCK_TIERS = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
-  && new URLSearchParams(location.search).has("devUnlockTiers");
+const DEV_UNLOCK_TIERS = window.CHART_TRIAL_CONFIG?.devUnlockTiers
+  || (/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
+  && new URLSearchParams(location.search).has("devUnlockTiers"));
 const LB_MAX         = 10;
 const LB_ARCHIVE_MAX = 1000; // mirrors worker LEADERBOARD_ARCHIVE_MAX; ranks beyond it are unknown
 const PLAYER_NAME_KEY = "ascent-player-name";
@@ -852,7 +853,12 @@ const leaderboardRevision = new Map();
 const leaderboardSubmissions = new Map();
 let lbMode = "temporary";
 let currentSeason = "S01";
-let contestConfig = { endDate: "", podiumRewards: { "1": 0, "2": 0, "3": 0 }, contestLocked: false };
+let contestConfig = { endDate: "", podiumRewards: { "1": 0, "2": 0, "3": 0 }, contestTier: 0, contestLocked: false };
+// Optimistic finish-screen leaderboard entries for the just-finished run, merged into the
+// rendered top-10 until the authoritative server data lands. Kept per board (all-time vs
+// contest) because each reconciles from a different source at a different time.
+let pendingAllTimeEntry = null; // { tier, name, score } | null
+let pendingContestEntry = null; // { tier, name, score, identityAddress, accountAddress } | null
 function fmtAscent(n) {
   if (n >= 1_000_000) return (n / 1_000_000).toLocaleString("en-US", { maximumFractionDigits: 1 }) + "M";
   if (n >= 1_000) return (n / 1_000).toLocaleString("en-US", { maximumFractionDigits: 1 }) + "K";
@@ -911,9 +917,11 @@ async function loadTemporaryLeaderboards(marketId=currentMarket) {
     if (payload.market!==marketId || !Array.isArray(payload.tiers) || payload.tiers.length!==TIERS.length) throw new Error("invalid leaderboard");
     if (temporaryLeaderboardRevision.get(marketId)!==revision) return;
     if (payload.endDate !== undefined) {
-      contestConfig = { endDate: payload.endDate || "", podiumRewards: payload.podiumRewards || { "1": 0, "2": 0, "3": 0 }, contestLocked: !!payload.contestLocked };
+      contestConfig = { endDate: payload.endDate || "", podiumRewards: payload.podiumRewards || { "1": 0, "2": 0, "3": 0 }, contestTier: Number(payload.contestTier) || 0, contestLocked: !!payload.contestLocked };
     }
     temporaryLeaderboardState.set(marketId,{ status:"ready", tiers:payload.tiers.map(normalizeLeaderboardEntriesTemporary) });
+    // Authoritative contest list loaded; drop the optimistic copy.
+    pendingContestEntry = null;
   } catch {
     if (temporaryLeaderboardRevision.get(marketId)!==revision) return;
     temporaryLeaderboardState.set(marketId,{ status:"unavailable", tiers:emptyLeaderboards() });
@@ -933,7 +941,7 @@ async function loadLeaderboards(marketId=currentMarket) {
     if (payload.currentSeason && payload.currentSeason!==currentSeason) {
       currentSeason = payload.currentSeason;
       const btn = document.getElementById("lbTabTemporary");
-      if (btn) btn.textContent = `SEASON ${currentSeason}`;
+      if (btn) btn.textContent = `CONTEST ${currentSeason}`;
       temporaryLeaderboardState.clear();
       temporaryLeaderboardRevision.clear();
     }
@@ -972,6 +980,8 @@ async function lbSave(score) {
     const state = marketLeaderboards(marketId);
     state.status = "ready";
     state.tiers[tierIndex] = normalizeLeaderboardEntries(payload.entries);
+    // The run is now in the authoritative all-time list; drop the optimistic copy.
+    if (pendingAllTimeEntry?.tier === tierIndex) pendingAllTimeEntry = null;
   } catch {
     // save failure: keep existing leaderboard state intact rather than wiping it
   } finally {
@@ -1078,21 +1088,32 @@ function setLbMode(mode) {
   ["lbTabTemporary","finishLbTabTemporary"].forEach(id => document.getElementById(id)?.classList.toggle("lb-tab--active", isContest));
   ["lbTabAllTime","finishLbTabAllTime"].forEach(id => document.getElementById(id)?.classList.toggle("lb-tab--active", !isContest));
 }
+function mergePendingEntry(entries, tier, pending, { dedupeByIdentity }) {
+  if (!pending || pending.tier !== tier) return entries;
+  let base = entries;
+  if (dedupeByIdentity && pending.identityAddress) {
+    // The contest keeps at most one entry per identityAddress (worker/index.js:2628-2633):
+    // drop the player's existing row before adding, otherwise they'd appear twice.
+    base = entries.filter(e => e.identityAddress !== pending.identityAddress);
+  }
+  return [...base, pending].sort((a, b) => b.score - a.score).slice(0, LB_MAX);
+}
 function lbRender() {
   const container = document.getElementById("leaderboard");
   if (!container) return;
   container.replaceChildren();
   if (lbMode === "temporary") {
     const state = marketTemporaryLeaderboards();
-    container.append(lbTitle("CONTEST · TIER 1"));
+    const contestTier = contestConfig.contestTier || 0;
+    container.append(lbTitle(`CONTEST · TIER ${contestTier + 1}`));
     if (state.status==="unavailable") { container.append(lbStatus("LEADERBOARD UNAVAILABLE", true)); return; }
     if (state.status==="loading") { container.append(lbStatus("LOADING…")); return; }
-    const entries = state.tiers[0] || [];
+    const entries = mergePendingEntry(state.tiers[contestTier] || [], contestTier, pendingContestEntry, { dedupeByIdentity:true });
     container.append(entries.length ? lbRows(entries) : lbGhostRows());
     return;
   }
   const state = marketLeaderboards();
-  const entries = lbLoad();
+  const entries = mergePendingEntry(lbLoad(), activeTier, pendingAllTimeEntry, { dedupeByIdentity:false });
   container.append(lbTitle(`BEST ASCENTS · TIER ${activeTier+1}`));
   if (state.status==="unavailable") { container.append(lbStatus("LEADERBOARD UNAVAILABLE", true)); return; }
   if (state.status==="loading") { container.append(lbStatus("LOADING LEADERBOARD")); return; }
@@ -1110,7 +1131,10 @@ function renderAllLeaderboards() {
     const p2 = fmtAscent(contestConfig.podiumRewards["2"] || 0);
     const p3 = fmtAscent(contestConfig.podiumRewards["3"] || 0);
     const endLabel = contestConfig.endDate ? `Contest ends on: <strong>${contestConfig.endDate} · 12:00 UTC</strong>` : "";
+    const cTier = contestConfig.contestTier || 0;
+    const cTierName = TIERS[cTier]?.name || "";
     banner.innerHTML =
+      `<p class="lb-contest-tier">TIER ${cTier + 1}${cTierName ? ` · ${cTierName}` : ""}</p>` +
       '<div class="lb-contest-podium">' +
         `<div class="lb-contest-prize lb-contest-prize--2">🥈 2<span>${p2} ASCENT</span></div>` +
         `<div class="lb-contest-prize lb-contest-prize--1">🥇 1<span>${p1} ASCENT</span></div>` +
@@ -1123,7 +1147,7 @@ function renderAllLeaderboards() {
     const state = marketTemporaryLeaderboards();
     if (state.status==="unavailable") { container.append(lbStatus("LEADERBOARD UNAVAILABLE", true)); return; }
     if (state.status==="loading") { container.append(lbStatus("LOADING LEADERBOARD")); return; }
-    const entries = state.tiers[0] || [];
+    const entries = state.tiers[contestConfig.contestTier || 0] || [];
     const filled = entries.length >= 10 ? entries : [...entries, ...Array(10 - entries.length).fill(null)];
     const fragment = document.createDocumentFragment();
     filled.forEach((entry, i) => {
@@ -1205,15 +1229,28 @@ function updateLeaderboardButton() {
 }
 let best = 0;
 let playerBestScore = null;
+let playerBestScoreLoaded = false;
 let playerBestScoreMarket = null;
 let playerBestScoreTier = null;
 let bestRank = null; // { market, tier, rank, total } — all-time rank of the connected player's best score
+function updateBestScoreHud() {
+  const scoreEl = document.getElementById("bestScore");
+  const labelEl = document.getElementById("bestScoreLabel");
+  const walletConnected = storedWalletState().status === "connected";
+  const personalBestReady = walletConnected && playerBestScoreLoaded;
+  if (labelEl) labelEl.textContent = personalBestReady ? "MY BEST" : "BEST";
+  if (!scoreEl) return;
+  if (personalBestReady) {
+    scoreEl.textContent = String(playerBestScore ?? 0).padStart(6,"0");
+    return;
+  }
+  scoreEl.textContent = marketLeaderboards().status==="ready" ? String(best).padStart(6,"0") : "------";
+}
 function loadBest() {
   const state = marketLeaderboards();
   const entries = lbLoad();
   best = entries[0]?.score || 0;
-  const el = document.getElementById("bestScore");
-  if (el) el.textContent = state.status==="ready" ? String(best).padStart(6,"0") : "------";
+  updateBestScoreHud();
 }
 
 // ── TIER NORMALIZATION ───────────────────────────────────────────────────────
@@ -1750,6 +1787,7 @@ let buyChartGlowPower = 0;
 let sellChartFlash = 0;
 let rocketPhase = 'off';
 let rocketPhaseTimer = 0;
+let rocketFlameCyan = false; // true for the VOID portal launch, false for buy rockets
 const ROCKET_ATTACK_DUR = 0.15;
 let rocketSustainDuration = 0;
 let rocketDecayDuration = 0;
@@ -1822,7 +1860,8 @@ function makeShortSqueezeHazards(count) {
 function makeLiquidityVoidHazards(count, portal) {
   return Array.from({ length: count }, (_, index) => {
     const lane = (index + 1) / (count + 1);
-    const worldY = orb.worldY + H * (0.08 + lane * 0.88) + (Math.random() - 0.5) * H * 0.18;
+    // Spread across the frozen chamber band (camera-relative), not above the orb.
+    const worldY = cameraY + H * (0.12 + lane * 0.74) + (Math.random() - 0.5) * H * 0.12;
     return {
       kind: "voidShard",
       x: Math.max(gs * 34, Math.min(W - gs * 34, portal.x + (Math.random() - 0.5) * W * 0.86)),
@@ -1838,9 +1877,12 @@ function makeLiquidityVoidHazards(count, portal) {
 
 function makeLiquidityVoidPortal() {
   const radius = gs * (isMobile ? 34 : 42);
+  // Placed inside the frozen chamber (camera is locked at void entry) so it's always
+  // on-screen, in the upper band and horizontally offset to force the player to
+  // navigate toward it rather than just flying up.
   return {
     x: Math.max(radius + gs * 24, Math.min(W - radius - gs * 24, orb.x + (Math.random() - 0.5) * W * 0.46)),
-    worldY: orb.worldY + H * 0.95,
+    worldY: cameraY + H * (0.62 + Math.random() * 0.26),
     r: radius,
     phase: Math.random() * 7
   };
@@ -1935,25 +1977,51 @@ function releaseDeferredAnomalyBuys() {
   deferredAnomalyBuyCount = 0;
 }
 
-function finishAnomaly() {
+function finishAnomaly(reachedPortal = false) {
   if (!activeAnomaly || activeAnomaly.exitApplied) return;
   const { def, type, auto } = activeAnomaly;
   activeAnomaly.exitApplied = true;
+  // VOID is the only anomaly you can fail: timing out without reaching the portal grants
+  // nothing (no height, no bonus points, energy left untouched). Every other anomaly —
+  // and the void when the portal is reached — rewards on exit as before.
+  const voidFailed = type === "liquidityVoid" && !reachedPortal;
   // A x2 buff ending isn't the player's fault: bank only the portion the multiplier adds so the
   // displayed number stays continuous when it drops to x1, WITHOUT wiping the reservoir/combo — the
   // momentum survives (unlike a red hit). activeAnomaly is still set here, so styleLive reads x2.
+  // Runs even on a void fail: this is display continuity, not a reward (no-op for the void
+  // since scoreMult is 1, but stays correct if that ever changes).
   const aMult = anomalyScoreMultiplier(type);
   if (aMult > 1) orb.bankStyle += STYLE_WEIGHT * orb.bonus * comboMult() * (aMult - 1);
-  if (Number.isFinite(def.exitBonus)) orb.bonus = Math.min(MAX_ORB_BONUS, orb.bonus + def.exitBonus);
-  if (Number.isFinite(def.exitEnergy)) {
-    orb.energy = Math.max(orb.energy, def.exitEnergy);
-    updateEnergyBar();
-  }
   releaseDeferredAnomalyBuys();
   const sy = w2s(orb.worldY);
-  burst(orb.x, sy, def.color, isMobile ? 16 : 28, { spread: 110, up: 130, size: 3.5 });
-  shockwaves.push({ x: orb.x, y: sy, r: 0, life: 0.75 });
-  if (type === "shortSqueeze") orb.vy = Math.max(orb.vy, 220);
+  if (voidFailed) {
+    burst(orb.x, sy, "#6b7a8a", isMobile ? 6 : 12, { spread: 80, up: 30, size: 2.5 });
+  } else {
+    if (Number.isFinite(def.exitBonus)) orb.bonus = Math.min(MAX_ORB_BONUS, orb.bonus + def.exitBonus);
+    if (Number.isFinite(def.exitEnergy)) {
+      orb.energy = Math.max(orb.energy, def.exitEnergy);
+      updateEnergyBar();
+    }
+    burst(orb.x, sy, def.color, isMobile ? 16 : 28, { spread: 110, up: 130, size: 3.5 });
+    shockwaves.push({ x: orb.x, y: sy, r: 0, life: 0.75 });
+    if (type === "shortSqueeze") orb.vy = Math.max(orb.vy, 220);
+    // VOID success: the portal is the elevator. Instead of teleporting (which snaps the
+    // world), arm a rocket-thrust envelope (attack→sustain→decay): the orb visibly ignites
+    // and accelerates upward while the camera — unfrozen on clearAnomaly — follows, so the
+    // bonus height is felt and read as a launch, not snapped in.
+    if (type === "liquidityVoid") {
+      orb.vy = Math.max(orb.vy, 450);
+      rocketModePeak          = 1.0;
+      rocketSustainDuration   = 0.65;
+      rocketDecayDuration     = 1.15;
+      rocketModeTotalDuration = ROCKET_ATTACK_DUR + rocketSustainDuration + rocketDecayDuration;
+      rocketModeDuration      = rocketModeTotalDuration;
+      rocketFlameCyan         = true;
+      rocketPhase             = 'attack';
+      rocketPhaseTimer        = 0;
+      rocketMode              = 0;
+    }
+  }
   clearAnomaly();
   anomalyMinDelay = 20;
   if (auto) scheduleNextAutoAnomaly();
@@ -2006,10 +2074,9 @@ function applyShortSqueezeHit(hazard) {
 }
 
 function resetVoidShard(hazard) {
-  const portal = activeAnomaly?.portal;
-  const anchorY = portal?.worldY || orb.worldY + H * 0.85;
   hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + Math.random() * (W - hazard.r * 2)));
-  hazard.worldY = anchorY - H * (0.1 + Math.random() * 0.85);
+  // Respawn inside the frozen chamber band so no shard reappears off-screen.
+  hazard.worldY = cameraY + H * (0.08 + Math.random() * 0.87);
   hazard.vx = gs * ((Math.random() - 0.5) * 52);
   hazard.vy = gs * ((Math.random() - 0.5) * 36);
   hazard.spin = (Math.random() - 0.5) * 2.4;
@@ -2041,7 +2108,7 @@ function updateAnomaly(dt) {
       const dx = orb.x - portal.x;
       const dy = orb.worldY - portal.worldY;
       if (Math.hypot(dx, dy) < orb.radius + portal.r * 0.72) {
-        finishAnomaly();
+        finishAnomaly(true);
         return;
       }
     }
@@ -2607,6 +2674,27 @@ function updateOrbPhysics(dt, t, ultiMods) {
   orb.prevWorldY = orb.worldY;
   orb.worldY += orb.vy * dt;
 
+  // VOID ceiling: a soft cushion, not a wall. Camera is locked during the void (see
+  // updateScoreAndCamera), so the chamber is closed. In the top band the upward velocity
+  // is eased toward an envelope that reaches 0 exactly at the ceiling, so the orb glides
+  // to a stop instead of slamming/bouncing. Gated on the void ONLY — without this gate it
+  // would brake the orb during normal climbing.
+  if (activeAnomaly?.type === "liquidityVoid") {
+    const ceil = cameraY + H - orb.radius * 2.4;
+    const cushion = H * 0.10;
+    // Thin top cushion: lightly bleed upward speed so the impact lands soft, not a slam.
+    if (orb.vy > 0 && orb.worldY > ceil - cushion) {
+      const k = (orb.worldY - (ceil - cushion)) / cushion; // 0..1, deeper = stronger brake
+      orb.vy *= Math.pow(0.55, dt * 10 * k);
+    }
+    // Damped bounce at the ceiling (a little rebound, not a dead stop at the top).
+    if (orb.worldY > ceil) {
+      orb.worldY = ceil;
+      if (orb.vy > 0) orb.vy *= -0.5;
+      orb.vx *= 0.9;
+    }
+  }
+
   if (w2s(orb.worldY) > H) {
     if (activeAnomaly?.type === "liquidityVoid") {
       orb.worldY = cameraY + orb.radius * 2.4;
@@ -2773,7 +2861,11 @@ function updatePlatformCollisions(dt, t, ultiMods) {
 
 let _hudScoreLast = -1;
 function updateScoreAndCamera(dt) {
-  if (orb.worldY > orb.height) {
+  // During LIQUIDITY VOID the screen is frozen into a closed chamber: neither the
+  // height score nor the camera rises, so flying upward farms nothing — the only
+  // way out (and up) is reaching the portal, which launches the orb on exit.
+  const inVoid = activeAnomaly?.type === "liquidityVoid";
+  if (!inVoid && orb.worldY > orb.height) {
     orb.height = orb.worldY;
   }
   const s = currentScore();
@@ -2785,9 +2877,15 @@ function updateScoreAndCamera(dt) {
   }
   updateComboGlow();
 
+  // Camera follows the climb — but during the VOID it settles into a frozen chamber.
+  // Don't cut the scroll dead (that reads as "snapped off"): over the first ~0.5s let the
+  // upward follow fade to zero so the world decelerates smoothly, then the chamber locks.
+  let follow = 1;
+  if (inVoid) follow = Math.max(0, 1 - activeAnomaly.elapsed / 0.5);
+  if (follow <= 0) return;
   const targetCamY = orb.worldY - H * 0.42;
   if (targetCamY > cameraY) {
-    cameraY += (targetCamY - cameraY) * (1 - Math.exp(-dt * 6));
+    cameraY += (targetCamY - cameraY) * (1 - Math.exp(-dt * 6)) * follow;
   }
 }
 
@@ -4559,13 +4657,15 @@ function drawRocketFlame() {
   const flicker2 = 0.88 + 0.12 * Math.sin(now * 17.1 + 1.4);
   const flameLen = (240 + rocketMode * 680) * flicker;
   const flameW   = R * 2.2 * flicker2;
+  // VOID portal launch uses a cyan flame (its own identity); buy rockets stay green.
+  const cyan = rocketFlameCyan;
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
   const g1 = ctx.createLinearGradient(sx, sy + R * 0.8, sx, sy + R * 0.8 + flameLen);
-  g1.addColorStop(0,   `rgba(120,255,140,${rocketMode * 0.85})`);
-  g1.addColorStop(0.2, `rgba(0,255,90,${rocketMode * 0.7})`);
-  g1.addColorStop(0.6, `rgba(0,200,50,${rocketMode * 0.35})`);
-  g1.addColorStop(1,   'rgba(0,80,20,0)');
+  g1.addColorStop(0,   cyan ? `rgba(150,240,255,${rocketMode * 0.85})` : `rgba(120,255,140,${rocketMode * 0.85})`);
+  g1.addColorStop(0.2, cyan ? `rgba(60,200,255,${rocketMode * 0.7})`  : `rgba(0,255,90,${rocketMode * 0.7})`);
+  g1.addColorStop(0.6, cyan ? `rgba(0,150,230,${rocketMode * 0.35})`  : `rgba(0,200,50,${rocketMode * 0.35})`);
+  g1.addColorStop(1,   cyan ? 'rgba(0,40,90,0)' : 'rgba(0,80,20,0)');
   ctx.fillStyle = g1;
   ctx.beginPath();
   ctx.moveTo(sx - flameW / 2, sy + R * 0.8);
@@ -4576,9 +4676,9 @@ function drawRocketFlame() {
   const coreW = flameW * 0.38;
   const coreLen = flameLen * 0.6;
   const g2 = ctx.createLinearGradient(sx, sy + R, sx, sy + R + coreLen);
-  g2.addColorStop(0,   `rgba(220,255,220,${rocketMode * 0.9})`);
-  g2.addColorStop(0.5, `rgba(80,255,120,${rocketMode * 0.5})`);
-  g2.addColorStop(1,   'rgba(0,200,60,0)');
+  g2.addColorStop(0,   cyan ? `rgba(225,250,255,${rocketMode * 0.9})` : `rgba(220,255,220,${rocketMode * 0.9})`);
+  g2.addColorStop(0.5, cyan ? `rgba(120,225,255,${rocketMode * 0.5})` : `rgba(80,255,120,${rocketMode * 0.5})`);
+  g2.addColorStop(1,   cyan ? 'rgba(0,160,230,0)' : 'rgba(0,200,60,0)');
   ctx.fillStyle = g2;
   ctx.beginPath();
   ctx.moveTo(sx - coreW / 2, sy + R);
@@ -5380,6 +5480,7 @@ function processImpactQueue() {
       rocketModeTotalDuration = ROCKET_ATTACK_DUR + rocketSustainDuration + rocketDecayDuration;
       rocketModeDuration    = rocketModeTotalDuration;
       armBuyChartGlow(rocketModeTotalDuration, buyChartFlash);
+      rocketFlameCyan       = false;
       rocketPhase           = 'attack';
       rocketPhaseTimer      = 0;
       rocketMode            = 0;
@@ -5797,6 +5898,8 @@ function startGame() {
   resize(); // always re-measure canvas before seeding world positions
   _sceneQ = _qLevel; // freeze the painted-scene quality for this run
   runTier = activeTier;
+  pendingAllTimeEntry = null; // clear any leftover optimistic finish-screen entries
+  pendingContestEntry = null;
   gameStartTime = performance.now();
   cameraY = 0;
   _streamPrevCamY = 0; // avoid a one-frame stream-flow spike from the camera reset
@@ -5856,14 +5959,35 @@ function gameOver() {
   const wasBest = marketLeaderboards().status==="ready" && scoreVal > best;
   lbSave(scoreVal);
 
+  // Show the just-finished run in the finish-screen leaderboard immediately, before the
+  // async server data arrives. Reconciled in lbSave/loadTemporaryLeaderboards.
+  const lbState = storedWalletState();
+  const runName = currentPlayerName();
+  pendingAllTimeEntry = { tier: runTier, name: runName, score: scoreVal };
+  // Contest mirrors the server's write conditions (worker/index.js:1742,1747,1749):
+  // connected wallet + contest unlocked + run on the contest tier.
+  const contestEligible =
+    lbState.status === "connected" &&
+    !contestConfig.contestLocked &&
+    runTier === (contestConfig.contestTier || 0);
+  pendingContestEntry = contestEligible
+    ? { tier: runTier, name: runName, score: scoreVal,
+        identityAddress: lbState.identityAddress || "",
+        accountAddress: lbState.accountAddress || "" }
+    : null;
+
   document.getElementById("finishRankStat")?.classList.add("hidden");
   document.getElementById("finalHeight").textContent = String(scoreVal).padStart(6,"0");
   document.getElementById("finalCombo").textContent  = `x${orb.maxCombo}`;
   document.getElementById("finishTitle").textContent  = wasBest ? "NEW PEAK!" : "BACK TO EARTH.";
   document.getElementById("finishKicker").textContent = wasBest ? "RECORD" : "FELL";
-  if (playerBestScore != null && scoreVal > playerBestScore) playerBestScore = scoreVal;
+  if (storedWalletState().status === "connected" && (playerBestScore == null || scoreVal > playerBestScore)) {
+    playerBestScore = scoreVal;
+    playerBestScoreLoaded = true;
+  }
+  updateBestScoreHud();
   lbRender();
-  if (!temporaryLeaderboardState.has(currentMarket)) loadTemporaryLeaderboards();
+  if (!temporaryLeaderboardState.has(currentMarket) || contestEligible) loadTemporaryLeaderboards();
   document.getElementById("finishOverlay")?.classList.remove("hidden");
   if (pendingTierRelockIndex !== null) {
     setTimeout(() => {
@@ -6508,10 +6632,12 @@ async function fetchProfile() {
     if (!res.ok) return;
     const { profile } = await res.json();
     playerBestScore = profile?.bestScore ?? null;
+    playerBestScoreLoaded = true;
     // Legacy profiles predate best-score market/tier tracking; every pre-feature score
     // was recorded on the ascent market, tier 0 (the only tier that ever had entries).
     playerBestScoreMarket = profile?.bestScoreMarket ?? (playerBestScore != null ? "ascent" : null);
     playerBestScoreTier = Number.isInteger(profile?.bestScoreTier) ? profile.bestScoreTier : (playerBestScore != null ? 0 : null);
+    updateBestScoreHud();
     loadBestRank();
     const skinCountEl = document.getElementById("profileSkinCount");
     if (skinCountEl) skinCountEl.textContent = profile?.skinCount ?? "0";
@@ -6827,9 +6953,11 @@ function walletDisconnect() {
   _saveWalletLocal({ status: "disconnected" });
   localStorage.removeItem(WALLET_CONNECT_LOCAL_KEY);
   playerBestScore = null;
+  playerBestScoreLoaded = false;
   playerBestScoreMarket = null;
   playerBestScoreTier = null;
   bestRank = null;
+  updateBestScoreHud();
   updateBestRankUi();
   setWalletButtonState("idle");
   document.getElementById("shopBtn")?.removeAttribute("disabled");
