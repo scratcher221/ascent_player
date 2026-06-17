@@ -17,6 +17,19 @@ class TransitionBatch:
     dones: np.ndarray
 
 
+def _is_hybrid_state(state) -> bool:
+    if not isinstance(state, (tuple, list)) or len(state) != 2:
+        return False
+    visual, vector = state
+    return isinstance(visual, np.ndarray) and isinstance(vector, np.ndarray)
+
+
+def _pack_hybrid_states(states) -> np.ndarray:
+    packed = np.empty(len(states), dtype=object)
+    packed[:] = list(states)
+    return packed
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
@@ -72,12 +85,12 @@ class ReplayBuffer:
         with self._lock:
             batch = random.sample(self._items, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch, strict=True)
-        if batch and isinstance(states[0], tuple):
+        if batch and _is_hybrid_state(states[0]):
             return TransitionBatch(
-                states=np.asarray(states, dtype=object),
+                states=_pack_hybrid_states(states),
                 actions=np.asarray(actions, dtype=np.int32),
                 rewards=np.asarray(rewards, dtype=np.float32),
-                next_states=np.asarray(next_states, dtype=object),
+                next_states=_pack_hybrid_states(next_states),
                 dones=np.asarray(dones, dtype=np.float32),
             )
         return TransitionBatch(

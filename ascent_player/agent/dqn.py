@@ -115,7 +115,18 @@ class DQNAgent:
         def zero_vectors(batch_size: int) -> np.ndarray:
             return np.zeros((batch_size, self._vector_dim), dtype=np.float32)
 
+        def split_hybrid_item(item):
+            if isinstance(item, (tuple, list)) and len(item) == 2:
+                return item[0], item[1]
+            if isinstance(item, np.ndarray) and item.shape == (2,):
+                return item[0], item[1]
+            return item, None
+
         if isinstance(states, np.ndarray):
+            if states.dtype == object and states.ndim == 2 and states.shape[1] == 2:
+                visuals = np.stack(states[:, 0], axis=0).astype(np.float32)
+                vectors = np.stack(states[:, 1], axis=0).astype(np.float32)
+                return [visuals, vectors]
             if states.dtype == object:
                 items = list(states)
             elif states.ndim == 4:
@@ -145,8 +156,13 @@ class DQNAgent:
             visuals = np.stack([item[0] for item in items], axis=0).astype(np.float32)
             vectors = np.stack([item[1] for item in items], axis=0).astype(np.float32)
         else:
-            visuals = np.stack(items, axis=0).astype(np.float32)
-            vectors = zero_vectors(visuals.shape[0])
+            split = [split_hybrid_item(item) for item in items]
+            if split[0][1] is not None:
+                visuals = np.stack([item[0] for item in split], axis=0).astype(np.float32)
+                vectors = np.stack([item[1] for item in split], axis=0).astype(np.float32)
+            else:
+                visuals = np.stack(items, axis=0).astype(np.float32)
+                vectors = zero_vectors(visuals.shape[0])
         return [visuals, vectors]
 
     def _predict_q_values(self, state) -> np.ndarray:
