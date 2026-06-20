@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import random
 import time
 
 import numpy as np
@@ -25,16 +24,6 @@ from ascent_player.mechanics_curriculum import CurriculumMetrics, mechanics_stag
 _curriculum_metrics = CurriculumMetrics()
 
 
-def curriculum_stage_from_score(recent_avg: float, config: AppConfig) -> str:
-    if config.mechanics_curriculum.use_mechanics_rewards:
-        return mechanics_stage_from_metrics(_curriculum_metrics, config)
-    if recent_avg >= config.training.curriculum_stage_b_max:
-        return "C"
-    if recent_avg >= config.training.curriculum_stage_a_max:
-        return "B"
-    return "A"
-
-
 def apply_curriculum(config: AppConfig, agent: DQNAgent, env, *, episode_steps: int = 0, frame_state: FrameState | None = None) -> str:
     if frame_state is not None:
         _curriculum_metrics.record_episode(
@@ -44,12 +33,7 @@ def apply_curriculum(config: AppConfig, agent: DQNAgent, env, *, episode_steps: 
             combo=frame_state.combo,
             score=float(frame_state.score or 0),
         )
-    recent = agent.progress.recent_scores[-10:]
-    recent_avg = float(sum(recent) / len(recent)) if recent else 0.0
-    if config.mechanics_curriculum.use_mechanics_rewards:
-        stage = mechanics_stage_from_metrics(_curriculum_metrics, config)
-    else:
-        stage = curriculum_stage_from_score(recent_avg, config)
+    stage = mechanics_stage_from_metrics(_curriculum_metrics, config)
     agent.curriculum_stage = stage
     if hasattr(env, "reward_tracker"):
         env.reward_tracker.set_curriculum_stage(stage)
@@ -372,7 +356,7 @@ async def run_training_no_ui(
                 return _empty_training_stats(logger.path, error="browser_connect_failed")
         state = await env.reset()
         apply_curriculum(config, agent, env)
-        if config.mechanics_curriculum.use_mechanics_rewards and len(agent.replay) == 0:
+        if len(agent.replay) == 0:
             teacher_added = await warmstart_from_teacher(agent, config)
             if teacher_added:
                 print(f"Teacher warm-start added {teacher_added} sim transitions")
@@ -537,38 +521,9 @@ async def run_training_no_ui(
         "curriculum_stage": float(
             int(agent.curriculum_stage[1:])
             if str(agent.curriculum_stage).startswith("M")
-            else {"A": 0.0, "B": 1.0, "C": 2.0}.get(agent.curriculum_stage, 0.0)
+            else 0.0
         ),
     }
-
-
-async def run_random_smoke(config: AppConfig, steps: int = 100) -> None:
-    if config.training.sim_mode:
-        env = AscentSimEnv(config)
-        backend = None
-    else:
-        backend = BrowserBackend(config.browser)
-        env = AscentGameEnv(config, backend)
-    try:
-        if backend is not None:
-            status = await backend.connect_auto()
-            if not status.connected:
-                print(status.message)
-                return
-        state = await env.reset()
-        shape = state[0].shape if isinstance(state, tuple) else state.shape
-        print(f"initial_state_shape={shape}")
-        for idx in range(steps):
-            action = random.randrange(config.action_count)
-            result = await env.step(action)
-            print(
-                f"step={idx} action={ACTION_LABELS[action]} "
-                f"reward={result.reward:.3f} done={result.done}"
-            )
-            if result.done:
-                await env.reset()
-    finally:
-        await env.close()
 
 
 async def run_sim_calibration(config: AppConfig, episodes: int = 10) -> None:

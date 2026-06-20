@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from ascent_player.config import AppConfig, RewardConfig
+from ascent_player.config import AppConfig
 from ascent_player.env.game_env import ACTION_LABELS, StepResult
 from ascent_player.env.platform_detector import Platform, nearest_safe_platform
 from ascent_player.env.fast_sim_obs import fast_build_observation

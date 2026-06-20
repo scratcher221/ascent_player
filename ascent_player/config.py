@@ -17,12 +17,6 @@ class DeviceMode(str, Enum):
     CPU = "cpu"
 
 
-class RunMode(str, Enum):
-    TRAIN = "train"
-    WATCH = "watch"
-    PAUSED = "paused"
-
-
 @dataclass(slots=True)
 class BrowserConfig:
     ascent_url: str = ASCENT_URL
@@ -145,7 +139,6 @@ class MechanicsCurriculumConfig:
     training_tier_index: int = 0
     teacher_episodes: int = 80
     teacher_warmstart_epsilon: float = 0.15
-    use_mechanics_rewards: bool = True
 
 
 @dataclass(slots=True)

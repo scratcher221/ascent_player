@@ -10,7 +10,8 @@ from ascent_player.demo.keyboard_probe import install_keyboard_probe, keys_to_ac
 from ascent_player.demo.storage import DemoTransition, new_demo_path, save_demo
 from ascent_player.env.browser_backend import BrowserBackend
 from ascent_player.env.game_env import AscentGameEnv
-from ascent_player.env.rewards import RewardTracker
+from ascent_player.env.reward_factory import create_reward_tracker
+from ascent_player.env.mechanics_rewards import MechanicsRewardTracker
 from ascent_player.env.state_detector import (
     apply_hud_boost,
     detect_from_frame,
@@ -25,7 +26,7 @@ class DemoRecorder:
     config: AppConfig
     backend: BrowserBackend
     env: AscentGameEnv
-    reward_tracker: RewardTracker = field(init=False)
+    reward_tracker: MechanicsRewardTracker = field(init=False)
     transitions: list[DemoTransition] = field(default_factory=list)
     recording: bool = False
     episode_id: int = 0
@@ -34,7 +35,7 @@ class DemoRecorder:
     _last_score: float = 0.0
 
     def __post_init__(self) -> None:
-        self.reward_tracker = RewardTracker(self.config.reward)
+        self.reward_tracker = create_reward_tracker(self.config)
 
     async def prepare(self) -> None:
         status = await self.backend.connect_auto()
@@ -60,7 +61,7 @@ class DemoRecorder:
             hud.energy,
             hud.reserve,
             hud.can_boost,
-            min_energy=self.config.reward.boost_min_energy,
+            min_energy=self.config.mechanics_reward.boost_min_energy,
         )
         if hud.score is not None:
             frame_state.score = hud.score
