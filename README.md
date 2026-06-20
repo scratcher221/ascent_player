@@ -31,8 +31,10 @@ playwright install chromium
 ### Local game server
 
 Browser training needs the offline Ascent build served over HTTP (ES modules do
-not work from `file://`). In a **separate terminal**, start the server and leave
-it running:
+not work from `file://`). The app **starts the local server automatically** when
+you launch or attach a browser.
+
+To run it yourself (optional):
 
 ```bash
 ./game/serve.sh
@@ -151,7 +153,7 @@ uses a lower learning rate and restarts exploration (ε ≈ 0.3 → 0.05).
 
 #### Option A — PyQt UI (recommended)
 
-1. Start the local game server (if not already running):
+1. (Optional) Start the local game server manually if you prefer:
 
    ```bash
    ./game/serve.sh
@@ -186,14 +188,12 @@ uses a lower learning rate and restarts exploration (ε ≈ 0.3 → 0.05).
 
 #### Option B — Headless browser fine-tune
 
-Start `./game/serve.sh` first, then:
-
 ```bash
 python main.py --transfer-from-sim --no-ui
 ```
 
-Requires the local game server plus a reachable Ascent tab or auto-launch
-Chromium.
+Requires a reachable Ascent tab or auto-launch Chromium (the app starts the
+local game server if needed).
 
 ### Step 5 — (Optional) Add human demonstrations
 
@@ -285,8 +285,6 @@ tail -f logs/training_*_browser.log
 
 ## Run (browser / UI)
 
-Start the local game server in another terminal (`./game/serve.sh`), then:
-
 ```bash
 python main.py
 python main.py --no-auto-launch
@@ -302,8 +300,8 @@ python main.py --transfer-from-sim          # fine-tune after sim pretrain
 
 The app first scans local Chrome DevTools Protocol ports (`9222`-`9229`) for an
 existing Chromium tab at `http://127.0.0.1:8765/`. To make your normal Chromium
-window detectable, start the game server (`./game/serve.sh`) and open Ascent
-with remote debugging enabled:
+window detectable, open Ascent with remote debugging enabled (the app starts the
+local server automatically if needed):
 
 ```bash
 chromium --remote-debugging-port=9222 \
@@ -317,7 +315,7 @@ On Arch Linux, you can also add this line to Chromium flags:
 ```
 
 If no existing Ascent tab is found, the app launches a visible Chromium window
-to the local URL by default (the game server must still be running).
+to the local URL by default.
 
 ## UI
 

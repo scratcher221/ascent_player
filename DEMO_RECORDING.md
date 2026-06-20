@@ -29,19 +29,14 @@ Files are named like `demonstrations/demo_20260614_153045.npz`.
 
 1. Complete the normal setup in [README.md](README.md) (Python 3.11 venv, deps,
    Playwright Chromium).
-2. Start the local game server in a separate terminal and leave it running:
-   ```bash
-   ./game/serve.sh
-   ```
-3. Launch the app:
+2. Launch the app (the local game server starts automatically when needed):
    ```bash
    source .venv/bin/activate
    python main.py
    ```
-4. Have Ascent reachable in Chromium — either:
+3. Have Ascent reachable in Chromium — either:
    - Already open at `http://127.0.0.1:8765/` with CDP enabled, or
-   - Let the app auto-launch / attach a browser for you (the game server must
-     still be running).
+   - Let the app auto-launch / attach a browser for you.
 
 ## Step-by-step recording
 
@@ -138,11 +133,11 @@ Your held keys each frame are converted to one of six actions:
 
 ### Game won't load or canvas not detected
 
-- Start the local game server before launching the app:
+- Confirm the browser tab is at `http://127.0.0.1:8765/`.
+- If auto-start fails, run the server manually:
   ```bash
   ./game/serve.sh
   ```
-- Confirm the browser tab is at `http://127.0.0.1:8765/`.
 
 ### Keys are not detected
 

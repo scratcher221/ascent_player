@@ -11,6 +11,7 @@ from PIL import Image
 
 from ascent_player.config import BrowserConfig
 from ascent_player.env.browser_discovery import CdpTab, discover_ascent_tab
+from ascent_player.utils.game_server import ensure_game_server, stop_game_server_if_started
 
 _CAPTURE_TURN_JS = """
 (args) => {
@@ -232,14 +233,14 @@ class BrowserBackend:
             }
         )
         self.page = await self.context.new_page()
-        await self.page.goto(self.config.ascent_url, wait_until="domcontentloaded")
+        await self._goto_ascent()
         await self._ensure_page_ready(navigate_if_needed=True)
         self.status = await self._make_status(True, "launched", None)
         return self.status
 
     async def force_open_game(self) -> BrowserStatus:
         self._require_page()
-        await self.page.goto(self.config.ascent_url, wait_until="domcontentloaded")
+        await self._goto_ascent()
         await self._ensure_page_ready(navigate_if_needed=False)
         self.status = await self._make_status(True, self.status.mode, self.status.cdp_url)
         return self.status
@@ -256,7 +257,7 @@ class BrowserBackend:
     async def _ensure_page_ready(self, navigate_if_needed: bool) -> None:
         self._require_page()
         if navigate_if_needed and self.config.host_match not in self.page.url:
-            await self.page.goto(self.config.ascent_url, wait_until="domcontentloaded")
+            await self._goto_ascent()
         # Only raise the tab once at connect/reset — repeated bring_to_front()
         # during play steals focus and can make the window appear to flicker.
         if not getattr(self, "_focused_once", False):
@@ -463,6 +464,12 @@ class BrowserBackend:
         if self.playwright is not None:
             await self.playwright.stop()
             self.playwright = None
+        stop_game_server_if_started()
+
+    async def _goto_ascent(self) -> None:
+        await asyncio.to_thread(ensure_game_server, self.config.ascent_url)
+        self._require_page()
+        await self.page.goto(self.config.ascent_url, wait_until="domcontentloaded")
 
     async def _make_status(
         self,
