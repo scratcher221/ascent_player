@@ -16,7 +16,9 @@ from ascent_player.agent.checkpoint import (
 from ascent_player.agent.progress_sanitize import sanitize_browser_progress
 from ascent_player.agent.model import build_q_network
 from ascent_player.agent.replay_buffer import ReplayBuffer, TransitionBatch
+from ascent_player.agent.teacher import RulePolicy
 from ascent_player.config import AppConfig
+from ascent_player.env.state_detector import FrameState
 from ascent_player.utils.device import (
     DeviceInfo,
     benchmark_inference_device,
@@ -51,9 +53,17 @@ class DQNAgent:
         )
         self.epsilon = config.training.epsilon_start
         self.metrics = AgentMetrics(epsilon=self.epsilon)
-        self.replay = ReplayBuffer(config.training.replay_buffer_size)
+        self.replay = ReplayBuffer(
+            config.training.replay_buffer_size,
+            prioritized=config.training.use_prioritized_replay,
+        )
         self.demo_replay = ReplayBuffer(config.training.replay_buffer_size)
-        self.sim_replay = ReplayBuffer(config.training.replay_buffer_size)
+        self.sim_replay = ReplayBuffer(
+            config.training.replay_buffer_size,
+            prioritized=config.training.use_prioritized_replay,
+        )
+        self.rule_policy = RulePolicy()
+        self._n_step_queue: list[tuple] = []
         self.progress = TrainingProgress(
             baseline_episodes=config.training.baseline_episodes,
             epsilon=config.training.epsilon_start,
@@ -80,12 +90,14 @@ class DQNAgent:
                 config.action_count,
                 config.training.learning_rate,
                 vector_dim=self._vector_dim,
+                dueling=config.training.dueling_dqn,
             )
             self.target = build_q_network(
                 input_shape,
                 config.action_count,
                 config.training.learning_rate,
                 vector_dim=self._vector_dim,
+                dueling=config.training.dueling_dqn,
             )
             self.target.set_weights(self.online.get_weights())
 
@@ -205,14 +217,30 @@ class DQNAgent:
 
         return batch_predict
 
+    def rule_prior_probability(self) -> float:
+        training = self.config.training
+        if training.rule_prior_steps <= 0:
+            return 0.0
+        progress = min(1.0, self.metrics.total_steps / training.rule_prior_steps)
+        return max(
+            training.rule_prior_end,
+            training.rule_prior_start
+            - (training.rule_prior_start - training.rule_prior_end) * progress,
+        )
+
     def act(
         self,
         state: np.ndarray,
         training: bool = True,
         can_boost: bool = True,
         boost_level: float = 1.0,
+        frame_state: FrameState | None = None,
     ) -> int:
         valid = self._valid_actions(can_boost, boost_level)
+        if training and frame_state is not None:
+            prior = self.rule_prior_probability()
+            if prior > 0.0 and random.random() < prior:
+                return self.rule_policy.act(frame_state)
         if training and random.random() < self.epsilon:
             return random.choice(valid)
         q_values = self._predict_q_values(state)
@@ -379,8 +407,32 @@ class DQNAgent:
         sim: bool = False,
     ) -> None:
         buffer = self.sim_replay if sim else self.replay
-        buffer.add(state, action, reward, next_state, done)
+        n_step = max(1, self.config.training.n_step)
+        self._n_step_queue.append((state, action, reward, next_state, done))
+        while len(self._n_step_queue) >= n_step:
+            self._flush_one_n_step(buffer)
+        if done:
+            while self._n_step_queue:
+                self._flush_one_n_step(buffer)
+            self._n_step_queue.clear()
         self.metrics.replay_size = len(self.replay)
+
+    def _flush_one_n_step(self, buffer: ReplayBuffer) -> None:
+        if not self._n_step_queue:
+            return
+        gamma = self.config.training.gamma
+        accumulated = 0.0
+        final_next = self._n_step_queue[-1][3]
+        final_done = False
+        for index, (_, _, step_reward, step_next, step_done) in enumerate(self._n_step_queue):
+            accumulated += (gamma ** index) * step_reward
+            final_next = step_next
+            final_done = step_done
+            if step_done:
+                break
+        first_state, first_action, _, _, _ = self._n_step_queue[0]
+        buffer.add(first_state, first_action, accumulated, final_next, final_done)
+        self._n_step_queue.pop(0)
 
     def remember_batch(
         self,
@@ -566,9 +618,13 @@ class DQNAgent:
         return True
 
     def prepare_transfer_from_sim(self) -> None:
+        preserved = ReplayBuffer(self.config.training.replay_buffer_size)
+        preserved.extend_from(self.sim_replay)
         self.replay.clear()
-        self.sim_replay.clear()
         self.demo_replay.clear()
+        self.sim_replay.clear()
+        self.sim_replay.extend_from(preserved, max_items=5000)
+        self._n_step_queue.clear()
         self._sim_pretrain_mode = False
         self.set_learning_rate(self.config.training.transfer_learning_rate)
         self.epsilon = self.config.training.transfer_epsilon_start
@@ -637,7 +693,16 @@ class DQNAgent:
         try:
             with self.tf.device(self.device_info.training_device):
                 loaded = self.tf.keras.models.load_model(target)
-                if tuple(loaded.input_shape[1:]) != tuple(self.online.input_shape[1:]):
+                if self._vector_dim > 0:
+                    if len(loaded.inputs) != 2:
+                        return False
+                    visual_shape = tuple(loaded.inputs[0].shape[1:])
+                    vector_shape = tuple(loaded.inputs[1].shape[1:])
+                    if visual_shape != tuple(self.online.inputs[0].shape[1:]):
+                        return False
+                    if vector_shape != (self._vector_dim,):
+                        return False
+                elif tuple(loaded.input_shape[1:]) != tuple(self.online.input_shape[1:]):
                     return False
                 self.online.set_weights(loaded.get_weights())
                 self.target.set_weights(loaded.get_weights())
@@ -675,7 +740,7 @@ class DQNAgent:
         rewards = self.tf.convert_to_tensor(batch.rewards, dtype=self.tf.float32)
         dones = self.tf.convert_to_tensor(batch.dones, dtype=self.tf.float32)
         if self._vector_dim > 0:
-            loss = self._train_step(
+            loss, td_errors = self._train_step(
                 self.tf.convert_to_tensor(states[0], dtype=self.tf.float32),
                 self.tf.convert_to_tensor(states[1], dtype=self.tf.float32),
                 actions,
@@ -683,10 +748,13 @@ class DQNAgent:
                 self.tf.convert_to_tensor(next_states[0], dtype=self.tf.float32),
                 self.tf.convert_to_tensor(next_states[1], dtype=self.tf.float32),
                 dones,
+                self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
+                if batch.weights is not None
+                else None,
             )
         else:
             dummy = self.tf.zeros((len(batch.actions), 1), dtype=self.tf.float32)
-            loss = self._train_step(
+            loss, td_errors = self._train_step(
                 self.tf.convert_to_tensor(states, dtype=self.tf.float32),
                 dummy,
                 actions,
@@ -694,7 +762,13 @@ class DQNAgent:
                 self.tf.convert_to_tensor(next_states, dtype=self.tf.float32),
                 dummy,
                 dones,
+                self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
+                if batch.weights is not None
+                else None,
             )
+        self._last_td_errors = td_errors
+        if batch.indices is not None:
+            self.replay.update_priorities(batch.indices, np.abs(td_errors.numpy()))
         if (
             len(self.demo_replay) > 0
             and (
@@ -751,7 +825,7 @@ class DQNAgent:
             neg_inf = tf.constant(-1e9, dtype=tf.float32)
 
             @self.tf.function
-            def train_step(state_visual, state_vector, actions, rewards, next_visual, next_vector, dones):
+            def train_step(state_visual, state_vector, actions, rewards, next_visual, next_vector, dones, weights):
                 if agent._vector_dim > 0:
                     next_states_tensor = [next_visual, next_vector]
                     states_tensor = [state_visual, state_vector]
@@ -789,7 +863,13 @@ class DQNAgent:
                     q_values = agent.online(states_tensor, training=True)
                     action_masks = tf.one_hot(actions, action_count)
                     selected_q = tf.reduce_sum(q_values * action_masks, axis=1)
-                    loss = tf.keras.losses.Huber()(targets, selected_q)
+                    td_errors = targets - selected_q
+                    per_sample = tf.keras.losses.Huber(reduction="none")(targets, selected_q)
+                    if weights is not None:
+                        per_sample = per_sample * weights
+                    loss = tf.reduce_mean(per_sample)
+
+                agent._last_td_errors = td_errors
 
                 gradients = tape.gradient(loss, agent.online.trainable_variables)
                 clipped, _ = tf.clip_by_global_norm(
@@ -806,7 +886,7 @@ class DQNAgent:
                     if gradient is not None
                 ]
                 agent.online.optimizer.apply_gradients(gradient_pairs)
-                return loss
+                return loss, tf.abs(td_errors)
 
             self._compiled_train_step = train_step
         return self._compiled_train_step

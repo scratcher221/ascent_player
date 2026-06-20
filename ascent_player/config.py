@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import os
 from pathlib import Path
 
 
@@ -9,6 +10,18 @@ ASCENT_URL = (
     "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
 )
 ASCENT_HOST = "127.0.0.1"
+
+# On KDE Wayland + NVIDIA, Chromium on native Wayland can crash kwin_wayland.
+_DEFAULT_WAYLAND_CHROMIUM_ARGS = (
+    "--ozone-platform=x11",
+    "--disable-features=Vulkan",
+)
+
+
+def default_chromium_args() -> tuple[str, ...]:
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return _DEFAULT_WAYLAND_CHROMIUM_ARGS
+    return ()
 
 
 class DeviceMode(str, Enum):
@@ -40,6 +53,7 @@ class BrowserConfig:
     capture_max_width: int = 640
     capture_max_height: int = 360
     capture_jpeg_quality: float = 0.82
+    chromium_args: tuple[str, ...] = field(default_factory=default_chromium_args)
 
 
 @dataclass(slots=True)
@@ -50,7 +64,7 @@ class ObservationConfig:
     include_boost_channel: bool = True
     include_platform_channel: bool = True
     include_vector_state: bool = True
-    vector_dim: int = 24
+    vector_dim: int = 43
 
     @property
     def channel_count(self) -> int:
@@ -227,6 +241,12 @@ class TrainingConfig:
     log_interval_steps_sim: int = 2500
     log_browser_detail_steps: int = 100
     log_weight_norm_every: int = 5000
+    use_prioritized_replay: bool = True
+    n_step: int = 3
+    rule_prior_start: float = 0.35
+    rule_prior_end: float = 0.05
+    rule_prior_steps: int = 100_000
+    dueling_dqn: bool = True
 
 
 @dataclass(slots=True)

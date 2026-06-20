@@ -2937,8 +2937,60 @@ function exportAgentState() {
       dy: (orb.worldY - nearest.worldY) / Math.max(H, 1),
       width: nearest.width / Math.max(W, 1),
       wear: (nearest.receptions ?? 0) / Math.max(nearest.bounceLimit ?? 3, 1),
+      type: nearest.type || "neutral",
     };
   }
+  let nearestAbove = null;
+  for (const plat of platforms) {
+    if (plat.worldY <= orb.worldY + 8) continue;
+    if (!nearestAbove || plat.worldY < nearestAbove.worldY) nearestAbove = plat;
+  }
+  let nearestPlatformAbove = null;
+  if (nearestAbove) {
+    nearestPlatformAbove = {
+      dx: ((nearestAbove.x + nearestAbove.width / 2) - orb.x) / Math.max(W, 1),
+      dy: (nearestAbove.worldY - orb.worldY) / Math.max(H, 1),
+      width: nearestAbove.width / Math.max(W, 1),
+      wear: (nearestAbove.receptions ?? 0) / Math.max(nearestAbove.bounceLimit ?? 3, 1),
+      type: nearestAbove.type || "neutral",
+    };
+  }
+  const pickTarget = (candidates) => {
+    let best = null;
+    let bestScore = Infinity;
+    for (const item of candidates) {
+      if (!item) continue;
+      const typePenalty = item.type === "sell" ? 0.35 : 0;
+      const wearPenalty = Math.max(0, (item.wear ?? 0) - 0.7) * 0.5;
+      const score = Math.abs(item.dx) * 2 + Math.abs(item.dy) + typePenalty + wearPenalty;
+      if (score < bestScore) {
+        bestScore = score;
+        best = item;
+      }
+    }
+    return best;
+  };
+  const bestLandingPlatform = pickTarget([nearestPlatformAbove, nearestPlatformBelow]);
+  const vy = orb.vy ?? 0;
+  const rising = vy > 20;
+  const falling = vy < -20;
+  const landingWindow = falling && nearestPlatformBelow
+    && nearestPlatformBelow.dy > 0.05 && nearestPlatformBelow.dy < 0.35;
+  let timeToPlatform = 0;
+  if (falling && nearestPlatformBelow && vy < -1) {
+    const dyPx = (orb.worldY - (nearest?.worldY ?? orb.worldY));
+    timeToPlatform = Math.min(1, Math.max(0, dyPx / Math.max(Math.abs(vy), 1) / H));
+  }
+  const canBoostNow = (orb.energy ?? 0) + (orb.reserve ?? 0) >= 14;
+  const gapBelow = nearestPlatformBelow?.dy ?? 0;
+  const boostUseful = canBoostNow && (
+    vy < -120 || gapBelow > 0.18 || (falling && Math.abs(nearestPlatformBelow?.dx ?? 0) > 0.18)
+  );
+  const danger = {
+    worn: (nearestPlatformBelow?.wear ?? 0) >= 0.85 || (nearestPlatformAbove?.wear ?? 0) >= 0.85,
+    sell: nearestPlatformBelow?.type === "sell" || nearestPlatformAbove?.type === "sell",
+    missRisk: falling && Math.abs(nearestPlatformBelow?.dx ?? 0) > 0.18 && gapBelow < 0.4,
+  };
   let nearestBooster = null;
   let bestDist = Infinity;
   for (const b of visibleBoosters) {
@@ -2980,6 +3032,12 @@ function exportAgentState() {
     score: currentScore(),
     canBoost: (orb.energy ?? 0) + (orb.reserve ?? 0) >= 14,
     nearestPlatformBelow,
+    nearestPlatformAbove,
+    bestLandingPlatform,
+    orbPhase: { rising, falling, landingWindow, airborne: Math.abs(vy) > 20 },
+    timeToPlatform,
+    boostUseful,
+    danger,
     nearestBooster,
     stormLevel: stormLevel(),
   };

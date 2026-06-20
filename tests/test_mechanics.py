@@ -47,6 +47,47 @@ class MechanicsRewardTests(unittest.TestCase):
         reward = tracker.compute(FrameState(height=10, game_over=True, agent_hook_ok=True), 0)
         self.assertLess(reward, 0.0)
 
+    def test_m0_wasted_boost_penalty(self) -> None:
+        tracker = MechanicsRewardTracker(MechanicsRewardConfig())
+        tracker.set_curriculum_stage("M0")
+        prev = FrameState(
+            can_boost=True,
+            boost_level=0.8,
+            orb_vy=200.0,
+            agent_hook_ok=True,
+        )
+        curr = FrameState(
+            can_boost=False,
+            boost_level=0.0,
+            orb_vy=250.0,
+            agent_hook_ok=True,
+        )
+        tracker.last_state = prev
+        reward = tracker.compute(curr, action=3)
+        self.assertLess(reward, tracker.config.survival)
+
+    def test_m0_meaningful_boost_bonus(self) -> None:
+        tracker = MechanicsRewardTracker(MechanicsRewardConfig())
+        tracker.set_curriculum_stage("M0")
+        prev = FrameState(
+            can_boost=True,
+            boost_level=0.8,
+            nearest_platform_dy=0.25,
+            orb_vy=-0.3,
+            agent_hook_ok=True,
+        )
+        curr = FrameState(
+            can_boost=False,
+            boost_level=0.2,
+            nearest_platform_dy=0.25,
+            orb_vy=-0.5,
+            boost_useful=True,
+            agent_hook_ok=True,
+        )
+        tracker.last_state = prev
+        reward = tracker.compute(curr, action=3)
+        self.assertGreater(reward, tracker.config.survival)
+
 
 class VectorObsTests(unittest.TestCase):
     def test_vector_shape(self) -> None:
@@ -62,6 +103,23 @@ class VectorObsTests(unittest.TestCase):
             )
         )
         self.assertEqual(vec.shape[0], VECTOR_DIM)
+
+
+class PlatformMaskTests(unittest.TestCase):
+    def test_agent_payload_mask_draws_platforms(self) -> None:
+        from ascent_player.env.state_detector import platform_mask_from_agent_payload
+
+        payload = {
+            "cameraY": 100.0,
+            "canvasW": 640,
+            "canvasH": 360,
+            "platforms": [
+                {"x": 320, "worldY": 200.0, "width": 80, "type": "neutral"},
+            ],
+        }
+        mask = platform_mask_from_agent_payload(payload, width=640, height=360)
+        self.assertEqual(mask.shape, (360, 640))
+        self.assertGreater(mask.sum(), 0)
 
 
 class CurriculumTests(unittest.TestCase):

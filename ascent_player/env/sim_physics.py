@@ -351,3 +351,19 @@ class SimWorld:
         wear = nearest.receptions / max(nearest.bounce_limit, 1)
         width = nearest.width / max(self.config.width, 1.0)
         return dx, dy, wear, width
+
+    def nearest_platform_above(self) -> tuple[float, float, float, float, str]:
+        ball = self.ball
+        nearest: SimPlatform | None = None
+        for platform in self.platforms:
+            if platform.cy <= ball.y + 8:
+                continue
+            if nearest is None or platform.cy < nearest.cy:
+                nearest = platform
+        if nearest is None:
+            return 0.0, 0.0, 0.0, 0.0, "neutral"
+        dx = (nearest.cx - ball.x) / max(self.config.width, 1.0)
+        dy = (nearest.cy - ball.y) / max(self.config.height, 1.0)
+        wear = nearest.receptions / max(nearest.bounce_limit, 1)
+        width = nearest.width / max(self.config.width, 1.0)
+        return dx, dy, wear, width, "neutral"

@@ -9,6 +9,7 @@ from ascent_player.config import AppConfig
 from ascent_player.env.game_env import ACTION_LABELS, StepResult
 from ascent_player.env.platform_detector import Platform, nearest_safe_platform
 from ascent_player.env.fast_sim_obs import fast_build_observation
+from ascent_player.env.navigation import enrich_navigation
 from ascent_player.env.reward_factory import create_reward_tracker
 from ascent_player.env.sim_physics import SimBooster, SimPlatform, SimPhysicsConfig, SimWorld
 from ascent_player.env.state_detector import FrameState, mask_jump_action
@@ -118,6 +119,7 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
         frame_rgb.shape,
     )
     ndx, ndy, wear, pwidth = world.nearest_platform_below()
+    adx, ady, awear, awidth, atype = world.nearest_platform_above()
     booster_dx = booster_dy = None
     booster_type = None
     best_dist = float("inf")
@@ -133,11 +135,11 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
             booster_dy = dy
             booster_type = booster.type
 
-    return FrameState(
+    state = FrameState(
         orb_x=ball.x,
         orb_y=screen_y / max(world.config.height, 1.0),
-        orb_vx=ball.vx / 575.0,
-        orb_vy=ball.vy / 1500.0,
+        orb_vx=ball.vx,
+        orb_vy=ball.vy,
         score=world.score,
         boost_level=world.boost_level,
         can_boost=world.can_boost,
@@ -145,6 +147,14 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
         nearest_platform_dy=ndy,
         nearest_platform_width=pwidth,
         platform_wear=wear,
+        nearest_platform_above_dx=adx,
+        nearest_platform_above_dy=ady,
+        nearest_platform_above_width=awidth,
+        nearest_platform_above_wear=awear,
+        nearest_platform_above_type=atype,
+        target_dx=adx if ady < ndy or ndy == 0 else ndx,
+        target_dy=ady if ady < ndy or ndy == 0 else ndy,
+        target_platform_type=atype if ady < ndy or ndy == 0 else "neutral",
         booster_dx=booster_dx,
         booster_dy=booster_dy,
         booster_type=booster_type,
@@ -165,6 +175,7 @@ def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState
         ),
         game_over=False,
     )
+    return enrich_navigation(state)
 
 
 class AscentSimEnv:
@@ -238,11 +249,12 @@ class AscentSimEnv:
         ball = self.world.ball
         screen_y = ball.y - self.world.camera_y
         ndx, ndy, wear, pwidth = self.world.nearest_platform_below()
-        return FrameState(
+        adx, ady, awear, awidth, atype = self.world.nearest_platform_above()
+        state = FrameState(
             orb_x=ball.x / self.world.config.width,
             orb_y=screen_y / max(self.world.config.height, 1.0),
-            orb_vx=ball.vx / 575.0,
-            orb_vy=ball.vy / 1500.0,
+            orb_vx=ball.vx,
+            orb_vy=ball.vy,
             score=self.world.score,
             boost_level=self.world.boost_level,
             can_boost=self.world.can_boost,
@@ -250,6 +262,14 @@ class AscentSimEnv:
             nearest_platform_dy=ndy,
             nearest_platform_width=pwidth,
             platform_wear=wear,
+            nearest_platform_above_dx=adx,
+            nearest_platform_above_dy=ady,
+            nearest_platform_above_width=awidth,
+            nearest_platform_above_wear=awear,
+            nearest_platform_above_type=atype,
+            target_dx=adx if ady < ndy or ndy == 0 else ndx,
+            target_dy=ady if ady < ndy or ndy == 0 else ndy,
+            target_platform_type=atype if ady < ndy or ndy == 0 else "neutral",
             combo=self.world.combo,
             score_multiplier=self.world.score_multiplier,
             bonus=self.world.bonus,
@@ -263,6 +283,7 @@ class AscentSimEnv:
             booster_type=self.world.booster_collected,
             game_over=False,
         )
+        return enrich_navigation(state)
 
     def _build_state(self):
         if self.fast_mode:

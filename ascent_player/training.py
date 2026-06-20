@@ -378,6 +378,7 @@ async def run_training_no_ui(
                 training=not config.training.watch_mode,
                 can_boost=env.can_boost,
                 boost_level=env.boost_level,
+                frame_state=env._last_frame_state,
             )
             result = await env.step(action)
             step_ms = (time.perf_counter() - step_started) * 1000.0

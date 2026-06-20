@@ -15,6 +15,7 @@ from ascent_player.env.state_detector import (
     mask_jump_action,
     merge_agent_state,
     merge_dom_state,
+    platform_mask_from_agent_payload,
     platform_mask_from_state,
 )
 from ascent_player.env.vector_obs import attach_vector
@@ -168,7 +169,12 @@ class AscentGameEnv:
         agent_payload = await self.backend.read_agent_state()
         if agent_payload:
             state = merge_agent_state(FrameState(), agent_payload)
-            state.platform_mask = build_platform_mask_fallback(frame, state)
+            height, width = frame.shape[:2]
+            state.platform_mask = platform_mask_from_agent_payload(
+                agent_payload,
+                width,
+                height,
+            )
         else:
             state = detect_from_frame(
                 frame,

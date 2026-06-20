@@ -1,6 +1,8 @@
-"""Rule-based teacher for behavior-cloning warm-start."""
+"""Rule-based policy for warm-start, exploration prior, and baseline evaluation."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from ascent_player.env.state_detector import FrameState, mask_jump_action
 
@@ -11,40 +13,63 @@ LEFT_JUMP = 4
 RIGHT_JUMP = 5
 
 
-class RuleTeacher:
-    def __init__(
-        self,
-        *,
-        steer_threshold: float = 0.012,
-        fall_vy_threshold: float = -0.2,
-        gap_threshold: float = 0.15,
-        min_energy_to_boost: float = 0.3,
-    ) -> None:
-        self.steer_threshold = steer_threshold
-        self.fall_vy_threshold = fall_vy_threshold
-        self.gap_threshold = gap_threshold
-        self.min_energy_to_boost = min_energy_to_boost
+@dataclass(slots=True)
+class RulePolicy:
+    steer_threshold: float = 0.012
+    fall_vy_threshold: float = -0.2
+    gap_threshold: float = 0.15
+    min_energy_to_boost: float = 0.14
+    recovery_dx_threshold: float = 0.18
+
+    def target_dx(self, state: FrameState) -> float | None:
+        if state.target_dx is not None:
+            return state.target_dx
+        if state.nearest_platform_above_dx is not None and (state.rising or state.airborne):
+            return state.nearest_platform_above_dx
+        return state.nearest_platform_dx
+
+    def target_dy(self, state: FrameState) -> float | None:
+        if state.target_dy is not None:
+            return state.target_dy
+        if state.nearest_platform_above_dy is not None and (state.rising or state.airborne):
+            return state.nearest_platform_above_dy
+        return state.nearest_platform_dy
 
     def act(self, state: FrameState) -> int:
-        dx = state.nearest_platform_dx
-        dy = state.nearest_platform_dy
+        dx = self.target_dx(state)
+        dy = self.target_dy(state)
         vy = state.orb_vy or 0.0
+        if abs(vy) > 1.5:
+            vy = vy / 1500.0
         action = 0
 
-        if dx is not None:
+        if state.danger_sell and dx is not None:
             if dx < -self.steer_threshold:
                 action = LEFT
             elif dx > self.steer_threshold:
+                action = RIGHT
+        elif dx is not None:
+            threshold = self.recovery_dx_threshold if state.miss_risk else self.steer_threshold
+            if dx < -threshold:
+                action = LEFT
+            elif dx > threshold:
                 action = RIGHT
 
         should_boost = (
             state.can_boost
             and state.boost_level >= self.min_energy_to_boost
-            and vy < self.fall_vy_threshold
-            and (dy is None or dy > self.gap_threshold)
+            and (
+                state.boost_useful is True
+                or (
+                    vy < self.fall_vy_threshold
+                    and (dy is None or dy > self.gap_threshold)
+                )
+            )
         )
 
         if state.booster_type == "drag" and state.combo > 3:
+            should_boost = False
+        if state.danger_sell and not state.miss_risk:
             should_boost = False
 
         if should_boost:
@@ -58,7 +83,10 @@ class RuleTeacher:
         return mask_jump_action(action, state.can_boost)
 
 
-def generate_teacher_episode(env, teacher: RuleTeacher, max_steps: int = 600) -> list[tuple]:
+RuleTeacher = RulePolicy
+
+
+def generate_teacher_episode(env, teacher: RulePolicy, max_steps: int = 600) -> list[tuple]:
     """Sync helper for sim env — returns (state, action, reward, next_state, done) tuples."""
     import asyncio
 

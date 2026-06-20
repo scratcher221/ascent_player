@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from ascent_player.env.navigation import enrich_navigation, platform_type_onehot
 from ascent_player.env.platform_detector import (
     build_platform_mask,
     detect_platforms,
@@ -31,6 +32,22 @@ class FrameState:
     nearest_platform_dy: float | None = None
     nearest_platform_width: float = 0.0
     platform_wear: float = 0.0
+    nearest_platform_above_dx: float | None = None
+    nearest_platform_above_dy: float | None = None
+    nearest_platform_above_width: float = 0.0
+    nearest_platform_above_wear: float = 0.0
+    nearest_platform_above_type: str = "neutral"
+    target_platform_type: str = "neutral"
+    horizontal_error: float = 0.0
+    rising: bool = False
+    falling: bool = False
+    airborne: bool = False
+    landing_window: bool = False
+    boost_useful: bool | None = None
+    time_to_platform: float = 0.0
+    danger_worn: bool = False
+    danger_sell: bool = False
+    miss_risk: bool = False
     platform_mask: np.ndarray | None = None
     target_dx: float | None = None
     target_dy: float | None = None
@@ -342,9 +359,43 @@ def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameSta
         frame_state.nearest_platform_dy = float(nearest.get("dy", 0.0))
         frame_state.nearest_platform_width = float(nearest.get("width", 0.0))
         frame_state.platform_wear = float(nearest.get("wear", 0.0))
+        frame_state.target_platform_type = str(nearest.get("type") or "neutral")
         frame_state.target_dx = frame_state.nearest_platform_dx
         frame_state.target_dy = frame_state.nearest_platform_dy
         frame_state.target_kind = "platform"
+
+    above = payload.get("nearestPlatformAbove")
+    if isinstance(above, dict):
+        frame_state.nearest_platform_above_dx = float(above.get("dx", 0.0))
+        frame_state.nearest_platform_above_dy = float(above.get("dy", 0.0))
+        frame_state.nearest_platform_above_width = float(above.get("width", 0.0))
+        frame_state.nearest_platform_above_wear = float(above.get("wear", 0.0))
+        frame_state.nearest_platform_above_type = str(above.get("type") or "neutral")
+
+    landing = payload.get("bestLandingPlatform")
+    if isinstance(landing, dict):
+        frame_state.target_dx = float(landing.get("dx", 0.0))
+        frame_state.target_dy = float(landing.get("dy", 0.0))
+        frame_state.target_platform_type = str(landing.get("type") or "neutral")
+        frame_state.target_kind = "platform"
+
+    phase = payload.get("orbPhase")
+    if isinstance(phase, dict):
+        frame_state.rising = bool(phase.get("rising"))
+        frame_state.falling = bool(phase.get("falling"))
+        frame_state.landing_window = bool(phase.get("landingWindow"))
+        frame_state.airborne = bool(phase.get("airborne"))
+
+    if payload.get("timeToPlatform") is not None:
+        frame_state.time_to_platform = float(payload["timeToPlatform"])
+    if payload.get("boostUseful") is not None:
+        frame_state.boost_useful = bool(payload["boostUseful"])
+
+    danger = payload.get("danger")
+    if isinstance(danger, dict):
+        frame_state.danger_worn = bool(danger.get("worn"))
+        frame_state.danger_sell = bool(danger.get("sell"))
+        frame_state.miss_risk = bool(danger.get("missRisk"))
 
     booster = payload.get("nearestBooster")
     if isinstance(booster, dict):
@@ -358,4 +409,36 @@ def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameSta
             frame_state.target_dy = frame_state.booster_dy
             frame_state.target_kind = f"booster_{frame_state.booster_type}"
 
-    return frame_state
+    return enrich_navigation(frame_state)
+
+
+def platform_mask_from_agent_payload(
+    payload: dict,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Build a platform channel mask from exported JS platform geometry."""
+    mask = np.zeros((height, width), dtype=np.uint8)
+    platforms = payload.get("platforms") or []
+    camera_y = float(payload.get("cameraY", 0))
+    canvas_w = max(float(payload.get("canvasW") or width), 1.0)
+    canvas_h = max(float(payload.get("canvasH") or height), 1.0)
+    scale_x = width / canvas_w
+    scale_y = height / canvas_h
+    for plat in platforms:
+        if not isinstance(plat, dict):
+            continue
+        world_y = float(plat.get("worldY", 0))
+        screen_y = world_y - camera_y
+        if screen_y < -30 or screen_y > canvas_h + 30:
+            continue
+        cx = float(plat.get("x", 0)) * scale_x
+        pw = max(4.0, float(plat.get("width", 40)) * scale_x)
+        sy = screen_y * scale_y
+        x1 = max(0, int(cx - pw / 2))
+        x2 = min(width, int(cx + pw / 2))
+        y1 = max(0, int(sy - 5))
+        y2 = min(height, int(sy + 5))
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = 255
+    return mask

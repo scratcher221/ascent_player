@@ -346,6 +346,9 @@ transitions, training from replay, and saving checkpoints under `checkpoints/`.
 See **[DEMO_RECORDING.md](DEMO_RECORDING.md)** for full instructions on recording
 your own playthroughs and training the agent from them.
 
+For staged training, evaluation commands, and progress metrics, see
+**[TRAINING_GUIDE.md](TRAINING_GUIDE.md)**.
+
 Quick summary:
 
 1. Click **Record demo** → play with `A` / `D` / `Space` → **Stop recording**

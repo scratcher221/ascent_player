@@ -51,6 +51,8 @@ class _WindowStats:
     platform_dy_sum: float = 0.0
     platform_samples: int = 0
     in_menu_steps: int = 0
+    landing_count: int = 0
+    meaningful_boost_count: int = 0
 
     def clear(self) -> None:
         self.action_counts.fill(0)
@@ -76,6 +78,8 @@ class _WindowStats:
         self.platform_dy_sum = 0.0
         self.platform_samples = 0
         self.in_menu_steps = 0
+        self.landing_count = 0
+        self.meaningful_boost_count = 0
 
 
 @dataclass
@@ -87,6 +91,8 @@ class _EpisodeStats:
         default_factory=lambda: np.zeros(6, dtype=np.int64)
     )
     jump_while_depleted: int = 0
+    landing_count: int = 0
+    meaningful_boost_count: int = 0
 
     def clear(self) -> None:
         self.steps = 0
@@ -94,6 +100,8 @@ class _EpisodeStats:
         self.max_score = 0.0
         self.action_counts.fill(0)
         self.jump_while_depleted = 0
+        self.landing_count = 0
+        self.meaningful_boost_count = 0
 
 
 class TrainingLogger:
@@ -388,6 +396,8 @@ class TrainingLogger:
             f"epsilon={agent.epsilon:.4f}",
             f"  actions: {action_hist}",
             f"  jump_while_depleted={jump_depleted}",
+            f"  landing_rate={self._episode.landing_count / max(steps, 1):.3f}",
+            f"  meaningful_boost_rate={self._episode.meaningful_boost_count / max(self._episode.action_counts[3:6].sum(), 1):.3f}",
             *self._browser_episode_extras(agent, episode_max_score, episode_reward),
           ]
         )
@@ -444,6 +454,9 @@ class TrainingLogger:
       self._window.depleted_steps += 1
     if action in JUMP_ACTIONS:
       self._window.jump_count += 1
+      if frame_state.boost_useful:
+        self._window.meaningful_boost_count += 1
+        self._episode.meaningful_boost_count += 1
       if not can_boost:
         self._window.jump_while_depleted += 1
         self._episode.jump_while_depleted += 1
@@ -473,6 +486,9 @@ class TrainingLogger:
       self._window.platform_dx_sum += abs(frame_state.nearest_platform_dx)
       self._window.platform_dy_sum += frame_state.nearest_platform_dy
       self._window.platform_samples += 1
+    if frame_state.platform_landed:
+      self._window.landing_count += 1
+      self._episode.landing_count += 1
     if frame_state.in_menu:
       self._window.in_menu_steps += 1
 

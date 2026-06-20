@@ -106,6 +106,27 @@ def parse_args() -> argparse.Namespace:
         default=10_000,
         help="Overnight early-stop target score (default 10000)",
     )
+    parser.add_argument(
+        "--evaluate-policy",
+        action="store_true",
+        help="Evaluate the loaded checkpoint without exploration (no UI)",
+    )
+    parser.add_argument(
+        "--rule-baseline",
+        action="store_true",
+        help="Run the rule-based baseline policy for comparison (no UI)",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=10,
+        help="Episodes for --evaluate-policy / --rule-baseline",
+    )
+    parser.add_argument(
+        "--eval-sim",
+        action="store_true",
+        help="Evaluate in the headless simulator instead of the browser",
+    )
     return parser.parse_args()
 
 
@@ -171,6 +192,34 @@ def run_no_ui(config: AppConfig) -> int:
 def main() -> int:
     args = parse_args()
     config = build_config(args)
+    if args.rule_baseline or args.evaluate_policy:
+        import asyncio
+
+        from ascent_player.evaluation import (
+            evaluate_learned_policy,
+            evaluate_rule_baseline,
+            format_skill_metrics,
+        )
+
+        if args.rule_baseline:
+            metrics = asyncio.run(
+                evaluate_rule_baseline(
+                    config,
+                    episodes=max(1, args.eval_episodes),
+                    use_sim=args.eval_sim,
+                )
+            )
+            print(format_skill_metrics("Rule baseline", metrics))
+        else:
+            metrics = asyncio.run(
+                evaluate_learned_policy(
+                    config,
+                    episodes=max(1, args.eval_episodes),
+                    use_sim=args.eval_sim,
+                )
+            )
+            print(format_skill_metrics("Learned policy", metrics))
+        return 0
     if args.calibrate_sim:
         import asyncio
 

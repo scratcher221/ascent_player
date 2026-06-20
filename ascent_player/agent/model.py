@@ -10,6 +10,8 @@ def build_q_network(
     action_count: int,
     learning_rate: float,
     vector_dim: int = 0,
+    *,
+    dueling: bool = True,
 ):
     import tensorflow as tf
 
@@ -21,14 +23,25 @@ def build_q_network(
 
     if vector_dim > 0:
         vector_input = tf.keras.Input(shape=(vector_dim,), name="vector")
-        vector_branch = tf.keras.layers.Dense(64, activation="relu")(vector_input)
+        vector_branch = tf.keras.layers.Dense(128, activation="relu")(vector_input)
+        vector_branch = tf.keras.layers.Dense(128, activation="relu")(vector_branch)
         x = tf.keras.layers.Concatenate()([x, vector_branch])
         inputs = [visual_input, vector_input]
     else:
         inputs = visual_input
 
-    x = tf.keras.layers.Dense(512, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(action_count, name="q_values")(x)
+    features = tf.keras.layers.Dense(512, activation="relu")(x)
+    if dueling:
+        value = tf.keras.layers.Dense(1, name="state_value")(features)
+        advantage = tf.keras.layers.Dense(action_count, name="advantage")(features)
+        advantage_centered = tf.keras.layers.Lambda(
+            lambda tensor: tensor - tf.reduce_mean(tensor, axis=1, keepdims=True),
+            name="advantage_centered",
+        )(advantage)
+        outputs = tf.keras.layers.Add(name="q_values")([value, advantage_centered])
+    else:
+        outputs = tf.keras.layers.Dense(action_count, name="q_values")(features)
+
     model = tf.keras.Model(inputs=inputs, outputs=outputs, name="ascent_dqn")
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),

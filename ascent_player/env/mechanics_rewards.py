@@ -42,13 +42,12 @@ class MechanicsRewardTracker:
 
         if previous is not None:
             reward += self._height_reward(previous, state)
+            reward += self._landing_reward(previous, state)
+            reward += self._falling_penalty(previous, state)
+            reward += self._steer_reward(previous, state, action)
+            reward += self._boost_economy_reward(previous, state, action)
             if self._stage_at_least("M1"):
-                reward += self._landing_reward(previous, state)
-                reward += self._falling_penalty(previous, state)
-            if self._stage_at_least("M2"):
-                reward += self._steer_reward(previous, state, action)
-            if self._stage_at_least("M3"):
-                reward += self._boost_economy_reward(previous, state, action)
+                reward += self._approach_reward(previous, state)
             if self._stage_at_least("M4"):
                 reward += self._combo_reward(previous, state)
             if self._stage_at_least("M5"):
@@ -92,7 +91,7 @@ class MechanicsRewardTracker:
         return 0.0
 
     def _steer_reward(self, previous: FrameState, state: FrameState, action: int) -> float:
-        dx = state.nearest_platform_dx
+        dx = state.target_dx if state.target_dx is not None else state.nearest_platform_dx
         if dx is None:
             return 0.0
         reward = 0.0
@@ -109,7 +108,18 @@ class MechanicsRewardTracker:
                 reward += self.config.wrong_way_penalty
         else:
             reward += self.config.aligned_bonus
+        if state.miss_risk and action == 0:
+            reward += self.config.wrong_way_penalty * 0.5
         return reward
+
+    def _approach_reward(self, previous: FrameState, state: FrameState) -> float:
+        prev_dx = abs(previous.target_dx or previous.nearest_platform_dx or 1.0)
+        curr_dx = abs(state.target_dx or state.nearest_platform_dx or 1.0)
+        if curr_dx < prev_dx:
+            return 0.04
+        if curr_dx > prev_dx + 0.02:
+            return -0.03
+        return 0.0
 
     def _boost_economy_reward(
         self,
@@ -129,6 +139,8 @@ class MechanicsRewardTracker:
         gap = state.nearest_platform_dy or 0.0
         if jumped and vy < -0.2 and gap > 0.15:
             reward += self.config.timed_boost_bonus
+        if jumped and state.boost_useful:
+            reward += self.config.timed_boost_bonus * 0.5
         return reward
 
     def _combo_reward(self, previous: FrameState, state: FrameState) -> float:

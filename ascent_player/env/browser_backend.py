@@ -224,6 +224,8 @@ class BrowserBackend:
         kwargs: dict[str, Any] = {"headless": False}
         if self.config.chromium_path:
             kwargs["executable_path"] = self.config.chromium_path
+        if self.config.chromium_args:
+            kwargs["args"] = list(self.config.chromium_args)
         self.browser = await self.playwright.chromium.launch(**kwargs)
         self.launched_browser = True
         self.context = await self.browser.new_context(

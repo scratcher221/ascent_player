@@ -14,9 +14,11 @@ class TeacherTests(unittest.TestCase):
         state = FrameState(
             nearest_platform_dx=-0.2,
             nearest_platform_dy=0.3,
-            orb_vy=-0.4,
+            target_dx=-0.2,
+            orb_vy=-400.0,
             can_boost=True,
             boost_level=0.8,
+            boost_useful=True,
             agent_hook_ok=True,
         )
         action = teacher.act(state)
