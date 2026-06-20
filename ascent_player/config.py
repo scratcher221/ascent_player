@@ -5,12 +5,10 @@ from enum import Enum
 from pathlib import Path
 
 
-ASCENT_URL = "https://ascent.xrd.workers.dev/"
-LOCAL_ASCENT_URL = (
+ASCENT_URL = (
     "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
 )
-ASCENT_HOST = "ascent.xrd.workers.dev"
-LOCAL_ASCENT_HOST = "127.0.0.1"
+ASCENT_HOST = "127.0.0.1"
 
 
 class DeviceMode(str, Enum):
@@ -27,8 +25,8 @@ class RunMode(str, Enum):
 
 @dataclass(slots=True)
 class BrowserConfig:
-    ascent_url: str = LOCAL_ASCENT_URL
-    host_match: str = LOCAL_ASCENT_HOST
+    ascent_url: str = ASCENT_URL
+    host_match: str = ASCENT_HOST
     agent_mode: bool = True
     cdp_ports: tuple[int, ...] = tuple(range(9222, 9230))
     cdp_timeout_seconds: float = 0.25

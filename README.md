@@ -1,7 +1,8 @@
 # Ascent Neural Network Player
 
-A Python reinforcement-learning app that learns to play
-[Ascent](https://ascent.xrd.workers.dev/) from browser canvas screenshots.
+A Python reinforcement-learning app that learns to play Ascent from browser
+canvas screenshots. The game runs **locally** from the bundled `game/` folder
+(no internet required).
 
 The app uses:
 
@@ -26,6 +27,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 ```
+
+### Local game server
+
+Browser training needs the offline Ascent build served over HTTP (ES modules do
+not work from `file://`). In a **separate terminal**, start the server and leave
+it running:
+
+```bash
+./game/serve.sh
+```
+
+This serves the game at `http://127.0.0.1:8765/`. The training app connects to
+that URL by default.
 
 If you see `No matching distribution found for tensorflow`, your venv was
 probably created with a newer Python (for example 3.14). Recreate it with
@@ -137,38 +151,49 @@ uses a lower learning rate and restarts exploration (ε ≈ 0.3 → 0.05).
 
 #### Option A — PyQt UI (recommended)
 
-1. Start Chromium with remote debugging (if not auto-launching):
+1. Start the local game server (if not already running):
 
    ```bash
-   chromium --remote-debugging-port=9222 https://ascent.xrd.workers.dev/
+   ./game/serve.sh
    ```
 
-2. Launch the app with transfer enabled:
+2. (Optional) Start Chromium with remote debugging if you prefer to attach to an
+   existing window instead of letting the app launch one:
+
+   ```bash
+   chromium --remote-debugging-port=9222 \
+     "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
+   ```
+
+3. Launch the app with transfer enabled:
 
    ```bash
    python main.py --transfer-from-sim
    ```
 
-3. Click **Start** in the UI.
+4. Click **Start** in the UI.
 
-4. On startup you should see a dialog like:
+5. On startup you should see a dialog like:
 
    ```
    Loaded sim pretrain from sim_pretrained.keras — fine-tuning with ε=0.30
    ```
 
-5. Watch the progress panel — **score velocity** (Δscore/step) is a leading
+6. Watch the progress panel — **score velocity** (Δscore/step) is a leading
    indicator of improvement. Best score updates as episodes complete.
 
-6. Checkpoints auto-save to **`checkpoints/dqn_latest.keras`** during fine-tune.
+7. Checkpoints auto-save to **`checkpoints/dqn_latest.keras`** during fine-tune.
 
 #### Option B — Headless browser fine-tune
+
+Start `./game/serve.sh` first, then:
 
 ```bash
 python main.py --transfer-from-sim --no-ui
 ```
 
-Requires a reachable Ascent tab or auto-launch Chromium.
+Requires the local game server plus a reachable Ascent tab or auto-launch
+Chromium.
 
 ### Step 5 — (Optional) Add human demonstrations
 
@@ -260,6 +285,8 @@ tail -f logs/training_*_browser.log
 
 ## Run (browser / UI)
 
+Start the local game server in another terminal (`./game/serve.sh`), then:
+
 ```bash
 python main.py
 python main.py --no-auto-launch
@@ -274,11 +301,13 @@ python main.py --transfer-from-sim          # fine-tune after sim pretrain
 ## Existing Chromium Auto-Detect
 
 The app first scans local Chrome DevTools Protocol ports (`9222`-`9229`) for an
-existing Chromium tab at the Ascent URL. To make your normal Chromium window
-detectable, start it with remote debugging enabled:
+existing Chromium tab at `http://127.0.0.1:8765/`. To make your normal Chromium
+window detectable, start the game server (`./game/serve.sh`) and open Ascent
+with remote debugging enabled:
 
 ```bash
-chromium --remote-debugging-port=9222 https://ascent.xrd.workers.dev/
+chromium --remote-debugging-port=9222 \
+  "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
 ```
 
 On Arch Linux, you can also add this line to Chromium flags:
@@ -288,7 +317,7 @@ On Arch Linux, you can also add this line to Chromium flags:
 ```
 
 If no existing Ascent tab is found, the app launches a visible Chromium window
-by default.
+to the local URL by default (the game server must still be running).
 
 ## UI
 
