@@ -5,13 +5,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import time
 
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -21,15 +21,17 @@ from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.demo.recorder import DemoRecorder
 from ascent_player.demo.ingest import ingest_demonstrations
 from ascent_player.env.browser_backend import BrowserBackend, BrowserStatus
-from ascent_player.env.browser_discovery import discover_ascent_tab, list_chromium_windows
+from ascent_player.env.browser_discovery import discover_ascent_tab
 from ascent_player.env.game_env import ACTION_LABELS, AscentGameEnv
 from ascent_player.ui.widgets import (
+    APP_STYLESHEET,
     BrowserPanel,
     EpisodeChart,
     EpisodePoint,
     HyperparameterPanel,
     PreviewWidget,
     ProgressPanel,
+    SessionControls,
 )
 from ascent_player.utils.preprocessing import qimage_bytes_from_frame
 from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
@@ -89,7 +91,8 @@ class RecordingWorker(QThread):
             self.status_ready.emit("Preparing demo recording...")
             await recorder.prepare()
             self.status_ready.emit(
-                "Recording: play in the browser with A / D / Space. Click Stop when done."
+                "Recording: play in the browser with A / D / Space. "
+                "Click Stop recording when done."
             )
             while self.running:
                 frame, action, done = await recorder.capture_step()
@@ -208,20 +211,28 @@ class TrainingWorker(QThread):
             message=load_result.message,
             extra={"ui_mode": not self.config.training.watch_mode},
         )
-        load_result = type(load_result)(
+        session_label = (
+            "Resumed from checkpoint" if load_result.loaded else "Fresh training session"
+        )
+        ui_result = type(load_result)(
             load_result.loaded,
-            f"{load_result.message}\n\nTraining log:\n{logger.path}",
+            session_label,
             load_result.progress,
         )
-        self.session_ready.emit(load_result)
+        self.session_ready.emit(ui_result)
         episode = agent.progress.episodes_completed
-        autosave_message = f"Training log: {logger.path.name}"
+        autosave_message = f"Log: {logger.path.name}"
         try:
-            self.status_ready.emit(f"Connecting browser... | log: {logger.path.name}")
+            self.status_ready.emit(
+                f"Connecting browser… · {session_label} · log {logger.path.name}"
+            )
             status = await backend.connect_auto()
             self.status_ready.emit(_format_browser_status(status))
             if not status.connected:
                 logger.log_note(f"browser_connect_failed={status.message}")
+                self.error_ready.emit(
+                    f"Browser connection failed: {status.message}"
+                )
                 logger.close(agent)
                 return
 
@@ -327,7 +338,7 @@ class TrainingWorker(QThread):
                             boost_level=env.boost_level,
                             can_boost=env.can_boost,
                             loop_hz=self._loop_hz,
-                            session_message=load_result.message,
+                            session_message=session_label,
                             baseline_reward=progress.baseline_reward,
                             baseline_score=progress.baseline_score,
                             vs_baseline_pct=progress.reward_vs_baseline_pct(),
@@ -394,59 +405,75 @@ class MainWindow(QMainWindow):
         self.recording_worker: RecordingWorker | None = None
 
         self.setWindowTitle("Ascent Neural Network Player")
-        self.resize(1180, 760)
+        self.resize(1280, 820)
+        self.setStyleSheet(APP_STYLESHEET)
 
         self.browser_panel = BrowserPanel()
         self.preview = PreviewWidget()
+        self.session = SessionControls()
         self.params = HyperparameterPanel()
         self.progress_panel = ProgressPanel()
         self.chart = EpisodeChart()
-        self.status = QLabel("Ready")
+        self.status = QLabel("Ready — hover ⓘ icons for explanations")
+        self.status.setObjectName("statusBar")
+        self.status.setWordWrap(True)
 
-        self.start_button = QPushButton("Start")
-        self.pause_button = QPushButton("Pause")
-        self.save_button = QPushButton("Save checkpoint")
-        self.load_button = QPushButton("Load checkpoint")
-        self.record_button = QPushButton("Record demo")
-        self.stop_record_button = QPushButton("Stop recording")
-        self.stop_record_button.setEnabled(False)
-        self.pause_button.setEnabled(False)
-        self.save_button.setEnabled(False)
-        self.load_button.setEnabled(False)
+        # Compatibility aliases used by older call sites / mental model.
+        self.start_button = self.session.start_button
+        self.pause_button = self.session.pause_button
+        self.save_button = self.session.save_button
+        self.load_button = self.session.load_button
+        self.record_button = self.session.record_button
+        self.stop_record_button = self.session.stop_record_button
+
+        side_host = QWidget()
+        side = QVBoxLayout(side_host)
+        side.setContentsMargins(0, 0, 0, 0)
+        side.setSpacing(10)
+        side.addWidget(self.session)
+        side.addWidget(self.progress_panel)
+        side.addWidget(self.params)
+        side.addWidget(self.chart)
+        side.addStretch(1)
+
+        side_scroll = QScrollArea()
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side_scroll.setWidget(side_host)
+        side_scroll.setMinimumWidth(340)
+        side_scroll.setMaximumWidth(420)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(self.preview, stretch=3)
+        body.addWidget(side_scroll, stretch=1)
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(12, 12, 12, 0)
+        root_layout.setSpacing(10)
         root_layout.addWidget(self.browser_panel)
-
-        body = QHBoxLayout()
-        body.addWidget(self.preview, stretch=3)
-        side = QVBoxLayout()
-        side.addWidget(self.params)
-        side.addWidget(self.progress_panel)
-        side.addWidget(self.chart)
-        side.addWidget(self.start_button)
-        side.addWidget(self.pause_button)
-        side.addWidget(self.save_button)
-        side.addWidget(self.load_button)
-        side.addWidget(self.record_button)
-        side.addWidget(self.stop_record_button)
-        side.addStretch()
-        body.addLayout(side, stretch=1)
-        root_layout.addLayout(body)
+        root_layout.addLayout(body, stretch=1)
         root_layout.addWidget(self.status)
         self.setCentralWidget(root)
 
-        self.start_button.clicked.connect(self.start_training)
-        self.pause_button.clicked.connect(self.toggle_pause)
+        self.session.start_clicked.connect(self.start_training)
+        self.session.stop_clicked.connect(self.stop_training)
+        self.session.pause_clicked.connect(self.toggle_pause)
+        self.session.save_clicked.connect(self.save_checkpoint)
+        self.session.load_clicked.connect(self.load_checkpoint)
+        self.session.record_clicked.connect(self.start_recording)
+        self.session.stop_record_clicked.connect(self.stop_recording)
+        self.session.changed.connect(self.apply_config_from_ui)
         self.browser_panel.rescan_requested.connect(self.rescan)
         self.browser_panel.connect_requested.connect(self.attach_cdp)
         self.browser_panel.launch_requested.connect(self.force_launch)
-        self.browser_panel.windows_requested.connect(self.refresh_windows)
         self.params.changed.connect(self.apply_config_from_ui)
-        self.save_button.clicked.connect(self.save_checkpoint)
-        self.load_button.clicked.connect(self.load_checkpoint)
-        self.record_button.clicked.connect(self.start_recording)
-        self.stop_record_button.clicked.connect(self.stop_recording)
+
+        if config.training.watch_mode:
+            self.session.set_mode_value("watch")
+        self.params.set_watch_mode(self.session.mode_value() == "watch")
+        self.apply_config_from_ui()
 
         self.rescan_timer = QTimer(self)
         self.rescan_timer.timeout.connect(self.rescan)
@@ -465,12 +492,12 @@ class MainWindow(QMainWindow):
         self.config.training.train_every_gpu = self.params.train_every.value()
         self.config.training.device_mode = DeviceMode(self.params.device.currentText())
         self.config.browser.auto_launch_on_miss = self.browser_panel.auto_launch.isChecked()
-        self.config.demo.use_demos_on_start = self.params.use_demos.isChecked()
-        mode = self.params.mode.currentText()
+        self.config.demo.use_demos_on_start = self.session.use_demos.isChecked()
+        mode = self.session.mode_value()
         self.config.training.watch_mode = mode == "watch"
+        self.params.set_watch_mode(mode == "watch")
         if self.worker is not None:
             self.worker.set_watch_mode(mode == "watch")
-            self.worker.set_paused(mode == "paused")
 
     def start_recording(self) -> None:
         if self.worker is not None or self.recording_worker is not None:
@@ -483,9 +510,8 @@ class MainWindow(QMainWindow):
         self.recording_worker.error_ready.connect(self.show_error)
         self.recording_worker.finished.connect(self.recording_worker_finished)
         self.recording_worker.start()
-        self.record_button.setEnabled(False)
-        self.stop_record_button.setEnabled(True)
-        self.start_button.setEnabled(False)
+        self.session.set_recording()
+        self.browser_panel.set_busy(True)
 
     def stop_recording(self) -> None:
         if self.recording_worker is not None:
@@ -496,9 +522,9 @@ class MainWindow(QMainWindow):
 
     def recording_worker_finished(self) -> None:
         self.recording_worker = None
-        self.record_button.setEnabled(True)
-        self.stop_record_button.setEnabled(False)
-        self.start_button.setEnabled(True)
+        self.session.set_idle()
+        self.browser_panel.set_busy(False)
+        self.preview.show_empty_state()
 
     def start_training(self) -> None:
         if self.worker is not None or self.recording_worker is not None:
@@ -511,35 +537,43 @@ class MainWindow(QMainWindow):
         self.worker.metrics_ready.connect(self.update_metrics)
         self.worker.session_ready.connect(self.on_session_ready)
         self.worker.episode_ready.connect(self.chart.add_point)
-        self.worker.error_ready.connect(self.show_error)
+        self.worker.error_ready.connect(self.on_worker_error)
         self.worker.finished.connect(self.worker_finished)
         self.worker.start()
-        self.start_button.setEnabled(False)
-        self.pause_button.setEnabled(True)
-        self.save_button.setEnabled(True)
-        self.load_button.setEnabled(True)
+        self.session.set_training()
+        self.browser_panel.set_busy(True)
+        # Connection is settled once training starts — collapse setup to free space.
+        self.browser_panel.setChecked(False)
+
+    def stop_training(self) -> None:
+        if self.worker is None:
+            return
+        self.status.setText("Stopping session…")
+        self.worker.stop()
 
     def toggle_pause(self) -> None:
         if self.worker is None:
             return
         pause = self.pause_button.text() == "Pause"
         self.worker.set_paused(pause)
-        self.pause_button.setText("Resume" if pause else "Pause")
+        self.session.set_paused(pause)
 
     def rescan(self) -> None:
         if self.worker is not None or self.recording_worker is not None:
             return
-        self.browser_panel.set_status("Scanning for Ascent tab...")
+        self.browser_panel.set_status("Scanning for Ascent tab…")
         try:
             tab = asyncio.run(discover_ascent_tab(self.config.browser))
         except Exception as exc:
             self.browser_panel.set_status(f"Scan failed: {exc}")
             return
         if tab is None:
-            self.browser_panel.set_status("No CDP Ascent tab found")
+            self.browser_panel.set_status(
+                "No Ascent tab found — enable auto-launch, or open Advanced to force a new browser"
+            )
         else:
             self.browser_panel.set_status(
-                f"Found Ascent tab: {tab.title or tab.url} on port {tab.port}"
+                f"Ready: found “{tab.title or tab.url}” on port {tab.port}"
             )
 
     def attach_cdp(self, cdp_url: str) -> None:
@@ -549,19 +583,12 @@ class MainWindow(QMainWindow):
     def force_launch(self) -> None:
         self.config.browser.manual_cdp_url = None
         self.config.browser.auto_launch_on_miss = True
+        self.browser_panel.auto_launch.setChecked(True)
         self.start_training()
 
-    def refresh_windows(self) -> None:
-        windows = list_chromium_windows()
-        labels = [
-            f"{window.title} (pid {window.pid or '-'})"
-            for window in windows
-        ]
-        self.browser_panel.set_windows(labels)
-
     def on_session_ready(self, load_result) -> None:
-        title = "Training resumed" if load_result.loaded else "Fresh training session"
-        self.progress_panel.set_session(f"Session: {load_result.message}")
+        self.progress_panel.set_session(load_result.message)
+        self.status.setText(load_result.message)
         if load_result.progress is not None:
             progress = load_result.progress
             self.progress_panel.set_baseline(
@@ -572,7 +599,6 @@ class MainWindow(QMainWindow):
                 progress.best_score,
                 progress.best_reward if progress.best_reward != float("-inf") else 0.0,
             )
-        QMessageBox.information(self, title, load_result.message)
 
     def save_checkpoint(self) -> None:
         if self.worker is not None:
@@ -583,12 +609,18 @@ class MainWindow(QMainWindow):
             self.worker.request_load()
 
     def update_metrics(self, metrics: WorkerMetrics) -> None:
-        loss = "-" if metrics.loss is None else f"{metrics.loss:.4f}"
         train_ms = "-" if metrics.train_ms is None else f"{metrics.train_ms:.1f}ms"
         boost_label = f"boost {metrics.boost_level:.0%}"
         if not metrics.can_boost:
             boost_label += " (depleted)"
-        self.progress_panel.set_session(f"Session: {metrics.session_message}")
+        self.progress_panel.set_session(metrics.session_message)
+        self.progress_panel.set_live(
+            metrics.episode,
+            metrics.episode_reward,
+            metrics.episode_score,
+            metrics.epsilon,
+            metrics.loss,
+        )
         self.progress_panel.set_baseline(metrics.baseline_reward, metrics.baseline_score)
         self.progress_panel.set_best_ever(metrics.best_score, metrics.best_reward)
         self.progress_panel.set_comparison(
@@ -599,18 +631,14 @@ class MainWindow(QMainWindow):
         self.progress_panel.set_score_velocity(metrics.score_velocity)
         self.progress_panel.set_autosave(metrics.autosave_message)
         self.status.setText(
-            " | ".join(
+            " · ".join(
                 [
                     f"ep {metrics.episode}",
-                    f"reward {metrics.episode_reward:.1f}",
                     f"score {metrics.episode_score:.1f}",
-                    f"best {metrics.best_score:.0f}",
-                    f"eps {metrics.epsilon:.3f}",
                     f"action {metrics.action}",
                     boost_label,
                     f"replay {metrics.replay_size}",
                     f"steps {metrics.total_steps}",
-                    f"loss {loss}",
                     f"train {train_ms}",
                     f"loop {metrics.loop_hz:.1f}Hz",
                     metrics.device,
@@ -618,15 +646,22 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def on_worker_error(self, message: str) -> None:
+        self.browser_panel.setChecked(True)
+        self.browser_panel.set_status(message)
+        self.show_error(message)
+
     def show_error(self, message: str) -> None:
         QMessageBox.critical(self, "Ascent player error", message)
 
     def worker_finished(self) -> None:
         self.worker = None
-        self.start_button.setEnabled(True)
-        self.pause_button.setEnabled(False)
-        self.save_button.setEnabled(False)
-        self.load_button.setEnabled(False)
+        self.session.set_idle()
+        self.browser_panel.set_busy(False)
+        self.browser_panel.setChecked(True)
+        self.preview.show_empty_state()
+        if self.status.text().startswith("Stopping"):
+            self.status.setText("Session stopped")
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self.recording_worker is not None:
