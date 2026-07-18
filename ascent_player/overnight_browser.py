@@ -83,9 +83,9 @@ class OvernightState:
     plateau_runs: int = 0
     consecutive_improvements: int = 0
     demos_ingested: bool = False
-    frame_skip: int = 4
+    frame_skip: int = 2
     learning_rate: float = 2e-4
-    target_steer_gain: float = 0.42
+    target_steer_gain: float = 0.05
     steer_gain_stagnant_runs: int = 0
     target_met: bool = False
     eval_history: list[float] = field(default_factory=list)
@@ -155,24 +155,38 @@ def _apply_browser_profile(config: AppConfig, state: OvernightState) -> None:
     config.training.sim_mode = False
     config.training.transfer_from_sim = False
     config.training.watch_mode = False
+    skip_min = config.training.browser_frame_skip_min
+    skip_max = config.training.browser_frame_skip_max
+    state.frame_skip = max(skip_min, min(skip_max, state.frame_skip))
     config.training.frame_skip = state.frame_skip
     config.training.target_score = TARGET_SCORE
     config.training.learning_rate = state.learning_rate
+    # Active reward path is mechanics_reward (legacy RewardConfig is unused by envs).
+    config.mechanics_reward.steer_gain = state.target_steer_gain
     config.reward.target_steer_gain = state.target_steer_gain
     config.reward.target_approach_gain = state.target_steer_gain * 0.83
     config.demo.use_demos_on_start = not state.demos_ingested
     config.demo.min_episode_score = 0.0
 
     rolling = rolling_mean(state.eval_history, ROLLING_EVAL_WINDOW)
+    # Keep Phase-2 score shaping; only nudge ε with curriculum progress.
     if rolling >= config.training.curriculum_stage_b_max:
         config.training.epsilon_end = 0.04
-        config.reward.score_gain = 0.008
     elif rolling >= config.training.curriculum_stage_a_max:
         config.training.epsilon_end = 0.06
-        config.reward.score_gain = 0.006
     else:
         config.training.epsilon_end = 0.08
-        config.reward.score_gain = 0.004
+    # Never lower score_gain below the Phase-2 default.
+    config.mechanics_reward.score_gain = max(
+        config.mechanics_reward.score_gain,
+        0.012,
+    )
+
+    if rolling >= config.training.gate_a_score:
+        config.training.browser_epsilon_cap = min(
+            config.training.browser_epsilon_cap,
+            config.training.browser_epsilon_cap_after_gate_a,
+        )
 
 
 def _score_improved(
@@ -251,12 +265,18 @@ def _tune_hyperparams(
     if new_eps is not None:
         notes.append(f"ε→{new_eps:.3f} (plateau decay)")
 
-    if loop_hz > 0 and loop_hz < 11 and state.frame_skip < 6:
+    if loop_hz > 0 and loop_hz < 11 and state.frame_skip < config.training.browser_frame_skip_max:
         state.frame_skip += 1
         config.training.frame_skip = state.frame_skip
         notes.append(f"frame_skip→{state.frame_skip} (loop {loop_hz:.1f}Hz)")
-    elif state.frame_skip > 4 and loop_hz >= 13:
-        state.frame_skip = max(4, state.frame_skip - 1)
+    elif (
+        state.frame_skip > config.training.browser_frame_skip_min
+        and loop_hz >= 13
+    ):
+        state.frame_skip = max(
+            config.training.browser_frame_skip_min,
+            state.frame_skip - 1,
+        )
         config.training.frame_skip = state.frame_skip
         notes.append(f"frame_skip→{state.frame_skip} (throughput)")
 
@@ -274,17 +294,27 @@ def _tune_hyperparams(
         > state.steer_gain_history[0] + 20
     )
     if steer_improved and state.steer_gain_stagnant_runs >= 3:
-        state.target_steer_gain = min(0.65, state.target_steer_gain + 0.03)
+        # Cap adaptive steer near Phase-2 levels (do not undo rebalance).
+        state.target_steer_gain = min(0.12, state.target_steer_gain + 0.01)
+        config.mechanics_reward.steer_gain = state.target_steer_gain
         config.reward.target_steer_gain = state.target_steer_gain
         config.reward.target_approach_gain = state.target_steer_gain * 0.83
         state.steer_gain_stagnant_runs = 0
-        notes.append(f"target_steer_gain→{state.target_steer_gain:.2f} (rolling gain)")
+        notes.append(f"steer_gain→{state.target_steer_gain:.2f} (rolling gain)")
 
+    # Soften flip penalty on the legacy config for any residual readers;
+    # mechanics path uses wrong_way_penalty instead.
     config.reward.direction_flip_penalty = max(
         -0.30,
         config.reward.direction_flip_penalty - 0.005,
     )
-    notes.append(f"flip_penalty→{config.reward.direction_flip_penalty:.2f}")
+    config.mechanics_reward.wrong_way_penalty = max(
+        -0.30,
+        config.mechanics_reward.wrong_way_penalty - 0.005,
+    )
+    notes.append(
+        f"wrong_way→{config.mechanics_reward.wrong_way_penalty:.2f}"
+    )
 
     return notes
 
@@ -364,7 +394,13 @@ async def run_overnight_session(
             started_at=_utc_now(),
             session_seconds=initial_session_s,
             learning_rate=config.training.learning_rate,
-            frame_skip=config.training.transfer_frame_skip,
+            frame_skip=max(
+                config.training.browser_frame_skip_min,
+                min(
+                    config.training.browser_frame_skip_max,
+                    config.training.transfer_frame_skip,
+                ),
+            ),
         )
 
     budget_start = time.perf_counter()

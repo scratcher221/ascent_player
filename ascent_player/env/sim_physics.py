@@ -11,7 +11,7 @@ GRAVITY = 820.0
 JUMP_FORCE = 640.0
 BOOST_FORCE = 520.0
 BOOST_COST = 14.0
-ENERGY_REGEN = 5.0
+ENERGY_REGEN = 12.0
 MAX_ORB_VY = 1500.0
 ORB_SPEED = 230.0
 TIER_WEIGHT = 1.0
@@ -99,7 +99,7 @@ class SimWorld:
         self.rng = random.Random(self.config.seed)
         self.reset()
 
-    def reset(self) -> None:
+    def reset(self, start_height: float = 0.0) -> None:
         cfg = self.config
         self.ball = SimBall(x=cfg.width * 0.5, y=cfg.height * 0.72)
         self.platforms = []
@@ -128,6 +128,14 @@ class SimWorld:
             bounce_limit=99,
         )
         self.platforms.append(floor)
+        if start_height > 0:
+            self.origin_y = self.ball.y + float(start_height)
+            self.max_height = float(start_height)
+            self.camera_y = self.ball.y - cfg.height * 0.42
+            # Prefill platforms above so mid-climb starts are navigable.
+            while self.next_platform_y > self.camera_y - cfg.height * 2.0:
+                self._spawn_platform()
+            self._sync_score()
 
     @property
     def height(self) -> float:

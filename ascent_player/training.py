@@ -19,6 +19,11 @@ from ascent_player.env.target_detector import TargetDetectionTracker
 
 
 from ascent_player.mechanics_curriculum import CurriculumMetrics, mechanics_stage_from_metrics
+from ascent_player.evaluation import (
+    evaluate_sim_greedy_sync,
+    format_skill_metrics,
+    score_gates,
+)
 
 
 _curriculum_metrics = CurriculumMetrics()
@@ -63,11 +68,83 @@ async def warmstart_from_teacher(agent: DQNAgent, config: AppConfig) -> int:
     finally:
         await env.close()
     if added:
+        # Promote teacher transitions into the main replay used by sim pretrain.
+        agent.replay.extend_from(agent.sim_replay)
         agent.pretrain_from_replay(steps=min(config.demo.pretrain_steps, added // 4))
         agent.epsilon = config.mechanics_curriculum.teacher_warmstart_epsilon
         agent.metrics.epsilon = agent.epsilon
         agent.progress.epsilon = agent.epsilon
     return added
+
+
+def warmstart_from_teacher_sync(agent: DQNAgent, config: AppConfig) -> int:
+    from ascent_player.agent.teacher import RuleTeacher
+
+    env = AscentSimEnv(config, fast_mode=True)
+    teacher = RuleTeacher()
+    added = 0
+    try:
+        for _ in range(config.mechanics_curriculum.teacher_episodes):
+            state = env.reset_sync()
+            for _ in range(800):
+                frame_state = env._last_frame_state
+                if frame_state is None:
+                    break
+                action = teacher.act(frame_state)
+                result = env.step_sync(action)
+                agent.remember(
+                    state,
+                    action,
+                    result.reward,
+                    result.state,
+                    result.done,
+                )
+                state = result.state
+                added += 1
+                if result.done:
+                    break
+    finally:
+        pass
+    # Teacher transitions are hybrid-compatible; keep them in the main replay.
+    if added:
+        agent.pretrain_from_replay(steps=min(config.demo.pretrain_steps, max(50, added // 4)))
+        # Note: teacher used remember() into self.replay already.
+        agent.epsilon = config.mechanics_curriculum.teacher_warmstart_epsilon
+        agent._epsilon_anneal_start = agent.epsilon
+        agent.metrics.epsilon = agent.epsilon
+        agent.progress.epsilon = agent.epsilon
+    return added
+
+
+def curriculum_start_height(agent: DQNAgent, config: AppConfig) -> float:
+    """Phase 4: sometimes start mid-climb once the agent can survive there."""
+    import random
+
+    mc = config.mechanics_curriculum
+    best = float(agent.progress.best_score)
+    # Prefer bottom-starts until eval-quality scores are real (not start-height inflated).
+    if best < mc.start_height_gate_b:
+        return 0.0
+    if random.random() > mc.start_height_prob:
+        return 0.0
+    if best >= mc.start_height_gate_c:
+        return float(random.uniform(0.0, mc.start_height_max_c))
+    return float(random.uniform(0.0, mc.start_height_max_b))
+
+
+def episode_score_for_progress(ep_score: float, start_height: float, config: AppConfig) -> float:
+    """Optionally strip free score from mid-climb starts so curriculum stays honest."""
+    if config.mechanics_curriculum.start_height_score_credit or start_height <= 0:
+        return float(ep_score)
+    free = float(start_height) / 5.0
+    return float(max(0.0, ep_score - free))
+
+
+def meets_consistency_target(mean_score: float, min_score: float, config: AppConfig) -> bool:
+    return (
+        mean_score >= config.training.consistency_mean_score
+        and min_score >= config.training.consistency_min_score
+    )
 
 
 def _empty_training_stats(log_path: Path, *, error: str = "") -> dict[str, float]:
@@ -143,14 +220,40 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     agent.apply_sim_pretrain_profile()
     logger = TrainingLogger(config, "sim")
 
+    if config.training.sim_warmstart_demos and config.demo.use_demos_on_start:
+        from ascent_player.demo.ingest import ingest_demonstrations
+
+        demo_result = ingest_demonstrations(agent, config, replace_buffer=False)
+        if demo_result.transitions_added:
+            print(demo_result.status_message)
+            logger.log_note(f"demo_warmstart={demo_result.status_message}")
+            # Keep demos in demo_replay for BC only — do not mix into main replay
+            # (demo tensors are often visual-only / shape-incompatible with hybrid states).
+            agent.pretrain_from_replay(
+                steps=min(
+                    config.demo.pretrain_steps,
+                    max(100, demo_result.transitions_added // 20),
+                )
+            )
+
+    if config.training.sim_warmstart_teacher:
+        teacher_added = warmstart_from_teacher_sync(agent, config)
+        if teacher_added:
+            print(f"Teacher warm-start added {teacher_added} transitions")
+            logger.log_note(f"teacher_warmstart={teacher_added}")
+
     states = [env.reset_sync() for env in envs]
     hybrid_states = config.observation.include_vector_state
     episode_rewards = [0.0] * env_count
     episode_max_scores = [0.0] * env_count
     episode_step_counts = [0] * env_count
+    episode_start_heights = [0.0] * env_count
     episode = 0
     started = time.perf_counter()
     last_report = 0
+    last_eval = 0
+    best_eval_mean = 0.0
+    consistency_met = False
 
     print(
         f"Fast sim pretrain: {env_count} envs, batch={agent.batch_size}, "
@@ -171,16 +274,20 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
             agent.progress.best_score < min_best
             and agent.metrics.total_steps < max_steps
         ):
+            if consistency_met:
+                break
             can_boost = np.asarray([env.can_boost for env in envs], dtype=bool)
             boost_levels = np.asarray(
                 [env.boost_level for env in envs],
                 dtype=np.float32,
             )
+            frame_states = [env._last_frame_state for env in envs]
             actions = agent.act_batch(
                 states,
                 training=True,
                 can_boost=can_boost,
                 boost_levels=boost_levels,
+                frame_states=frame_states,
             )
 
             prev_states = list(states) if hybrid_states else states.copy()
@@ -188,10 +295,12 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
             next_states = [None] * env_count if hybrid_states else np.empty_like(states)
             dones = np.zeros(env_count, dtype=np.float32)
             scores: list[float | None] = []
+            result_frames: list[FrameState | None] = [None] * env_count
 
             for index, env in enumerate(envs):
                 result = env.step_sync(int(actions[index]))
                 rewards[index] = result.reward
+                result_frames[index] = result.frame_state
                 if hybrid_states:
                     next_states[index] = result.state
                 else:
@@ -211,7 +320,11 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                 episode_step_counts[index] += 1
                 if result.done:
                     ep_reward = episode_rewards[index]
-                    ep_score = episode_max_scores[index]
+                    ep_score = episode_score_for_progress(
+                        episode_max_scores[index],
+                        episode_start_heights[index],
+                        config,
+                    )
                     agent.record_episode(ep_reward, ep_score, sim_pretrain=True)
                     agent.end_episode(sim_pretrain=True)
                     logger.log_episode_end(
@@ -228,7 +341,9 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                     episode_rewards[index] = 0.0
                     episode_max_scores[index] = 0.0
                     episode_step_counts[index] = 0
-                    next_states[index] = env.reset_sync()
+                    start_h = curriculum_start_height(agent, config)
+                    episode_start_heights[index] = start_h
+                    next_states[index] = env.reset_sync(start_height=start_h)
 
             agent.remember_batch(
                 prev_states,
@@ -240,10 +355,13 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
             states = next_states
             metrics = agent.advance_steps(env_count)
             for index in range(env_count):
+                frame = result_frames[index]
                 logger.record_step(
                     int(actions[index]),
                     float(rewards[index]),
-                    FrameState(
+                    frame
+                    if frame is not None
+                    else FrameState(
                         score=int(scores[index]) if scores[index] is not None else None,
                         boost_level=float(boost_levels[index]),
                         can_boost=bool(can_boost[index]),
@@ -267,6 +385,60 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                     f"eps={agent.epsilon:.3f} best={agent.progress.best_score:.0f} "
                     f"replay={metrics.replay_size}"
                 )
+
+            eval_every = max(0, config.training.sim_eval_every_steps)
+            if (
+                eval_every > 0
+                and metrics.total_steps >= eval_every
+                and metrics.total_steps // eval_every > last_eval
+            ):
+                last_eval = metrics.total_steps // eval_every
+                eval_metrics = evaluate_sim_greedy_sync(agent, config)
+                gates = score_gates(
+                    eval_metrics.mean_score,
+                    eval_metrics.min_score,
+                    config,
+                )
+                gate_label = ",".join(gates) if gates else "none"
+                if eval_metrics.mean_score >= best_eval_mean:
+                    best_eval_mean = eval_metrics.mean_score
+                    agent.save(config.training.sim_best_eval_checkpoint_path)
+                    logger.log_note(
+                        f"best_eval_ckpt mean={best_eval_mean:.0f} "
+                        f"-> {config.training.sim_best_eval_checkpoint_path}"
+                    )
+                msg = (
+                    f"GATED EVAL ε=0 @ step={metrics.total_steps}: "
+                    f"{format_skill_metrics('sim', eval_metrics)} "
+                    f"gates={gate_label} best_eval_mean={best_eval_mean:.0f}"
+                )
+                print(msg)
+                logger.log_note(msg)
+                if "A" in gates:
+                    agent.save_sim_checkpoint()
+                # Phase 5 consistency probe with more episodes near the target.
+                if eval_metrics.mean_score >= config.training.gate_c_score:
+                    consistency = evaluate_sim_greedy_sync(
+                        agent,
+                        config,
+                        episodes=config.training.consistency_eval_episodes,
+                        max_steps=config.training.sim_eval_max_steps,
+                    )
+                    cmsg = (
+                        f"CONSISTENCY ε=0: {format_skill_metrics('sim', consistency)}"
+                    )
+                    print(cmsg)
+                    logger.log_note(cmsg)
+                    if meets_consistency_target(
+                        consistency.mean_score,
+                        consistency.min_score,
+                        config,
+                    ):
+                        consistency_met = True
+                        agent.save_sim_checkpoint()
+                        agent.save(config.training.sim_best_eval_checkpoint_path)
+                        print("Consistency target met — stopping pretrain early.")
+                        logger.log_note("consistency_target_met=true")
     finally:
         if agent.progress.best_score >= min_best:
             agent.save_sim_checkpoint()
@@ -280,7 +452,8 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
         print(
             f"Saved sim checkpoint to {config.training.sim_checkpoint_path} "
             f"({agent.metrics.total_steps} steps in {elapsed:.1f}s, {sps:.0f} sps, "
-            f"best_score={agent.progress.best_score:.0f}, gate={gate_msg})"
+            f"best_score={agent.progress.best_score:.0f}, gate={gate_msg}, "
+            f"best_eval_mean={best_eval_mean:.0f}, consistency={consistency_met})"
         )
         print(f"Training log: {logger.path}")
 

@@ -5,6 +5,24 @@ from typing import Sequence
 StateInput = tuple  # (visual, vector) or visual only
 
 
+def _advantage_center_layer():
+    """Serializable mean-centering layer (avoids unsaved Lambda deserialization)."""
+    import tensorflow as tf
+
+    @tf.keras.utils.register_keras_serializable(package="ascent")
+    class AdvantageCenter(tf.keras.layers.Layer):
+        def call(self, inputs):
+            return inputs - tf.reduce_mean(inputs, axis=1, keepdims=True)
+
+        def compute_output_shape(self, input_shape):
+            return input_shape
+
+        def get_config(self):
+            return super().get_config()
+
+    return AdvantageCenter
+
+
 def build_q_network(
     input_shape: Sequence[int],
     action_count: int,
@@ -14,6 +32,8 @@ def build_q_network(
     dueling: bool = True,
 ):
     import tensorflow as tf
+
+    AdvantageCenter = _advantage_center_layer()
 
     visual_input = tf.keras.Input(shape=tuple(input_shape), name="visual")
     x = tf.keras.layers.Conv2D(32, 8, strides=4, activation="relu")(visual_input)
@@ -34,10 +54,7 @@ def build_q_network(
     if dueling:
         value = tf.keras.layers.Dense(1, name="state_value")(features)
         advantage = tf.keras.layers.Dense(action_count, name="advantage")(features)
-        advantage_centered = tf.keras.layers.Lambda(
-            lambda tensor: tensor - tf.reduce_mean(tensor, axis=1, keepdims=True),
-            name="advantage_centered",
-        )(advantage)
+        advantage_centered = AdvantageCenter(name="advantage_centered")(advantage)
         outputs = tf.keras.layers.Add(name="q_values")([value, advantage_centered])
     else:
         outputs = tf.keras.layers.Dense(action_count, name="q_values")(features)

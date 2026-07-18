@@ -15,8 +15,10 @@ class TransitionBatch:
     rewards: np.ndarray
     next_states: np.ndarray
     dones: np.ndarray
+    discounts: np.ndarray
     indices: np.ndarray | None = None
     weights: np.ndarray | None = None
+    sim_indices: np.ndarray | None = None
 
 
 def _is_hybrid_state(state) -> bool:
@@ -50,6 +52,9 @@ class ReplayBuffer:
         self._max_priority = 1.0
         self._lock = threading.Lock()
 
+    def set_beta(self, beta: float) -> None:
+        self.beta = float(np.clip(beta, 0.0, 1.0))
+
     @staticmethod
     def _copy_state(state):
         if isinstance(state, tuple):
@@ -64,6 +69,7 @@ class ReplayBuffer:
         next_state,
         done: bool,
         *,
+        discount: float = 1.0,
         priority: float | None = None,
     ) -> None:
         with self._lock:
@@ -74,6 +80,7 @@ class ReplayBuffer:
                     reward,
                     self._copy_state(next_state),
                     done,
+                    float(discount),
                 )
             )
             if self.prioritized:
@@ -86,9 +93,12 @@ class ReplayBuffer:
         rewards: np.ndarray,
         next_states: np.ndarray,
         dones: np.ndarray,
+        *,
+        discounts: np.ndarray | None = None,
     ) -> None:
         with self._lock:
             for idx in range(len(actions)):
+                discount = 1.0 if discounts is None else float(discounts[idx])
                 self._items.append(
                     (
                         self._copy_state(states[idx]),
@@ -96,6 +106,7 @@ class ReplayBuffer:
                         float(rewards[idx]),
                         self._copy_state(next_states[idx]),
                         bool(dones[idx]),
+                        discount,
                     )
                 )
                 if self.prioritized:
@@ -116,7 +127,7 @@ class ReplayBuffer:
                 weights = np.power(len(self._items) * probs[indices], -self.beta)
                 weights = weights / weights.max()
                 weights = weights.astype(np.float32)
-        states, actions, rewards, next_states, dones = zip(*batch, strict=True)
+        states, actions, rewards, next_states, dones, discounts = zip(*batch, strict=True)
         if batch and _is_hybrid_state(states[0]):
             return TransitionBatch(
                 states=_pack_hybrid_states(states),
@@ -124,6 +135,7 @@ class ReplayBuffer:
                 rewards=np.asarray(rewards, dtype=np.float32),
                 next_states=_pack_hybrid_states(next_states),
                 dones=np.asarray(dones, dtype=np.float32),
+                discounts=np.asarray(discounts, dtype=np.float32),
                 indices=indices,
                 weights=weights,
             )
@@ -133,6 +145,7 @@ class ReplayBuffer:
             rewards=np.asarray(rewards, dtype=np.float32),
             next_states=np.asarray(next_states, dtype=np.float32),
             dones=np.asarray(dones, dtype=np.float32),
+            discounts=np.asarray(discounts, dtype=np.float32),
             indices=indices,
             weights=weights,
         )
@@ -152,7 +165,12 @@ class ReplayBuffer:
             if max_items is not None:
                 items = items[-max_items:]
             for item in items:
-                self._items.append(item)
+                # Support legacy 5-tuples if any remain in-memory.
+                if len(item) == 5:
+                    state, action, reward, next_state, done = item
+                    self._items.append((state, action, reward, next_state, done, 1.0))
+                else:
+                    self._items.append(item)
                 if self.prioritized:
                     self._priorities.append(self._max_priority)
 

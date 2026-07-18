@@ -227,17 +227,17 @@ class AscentSimEnv:
     async def connect(self) -> None:
         return None
 
-    def reset_sync(self):
+    def reset_sync(self, start_height: float = 0.0):
         self.reward_tracker.reset()
         self.frame_stack.clear()
         self.held_left = False
         self.held_right = False
-        self.world.reset()
+        self.world.reset(start_height=start_height)
         self._current_state = self._build_state()
         return self._current_state
 
-    async def reset(self):
-        return self.reset_sync()
+    async def reset(self, start_height: float = 0.0):
+        return self.reset_sync(start_height=start_height)
 
     def _finalize_observation(self, visual: np.ndarray, frame_state: FrameState):
         if self.config.observation.include_vector_state:

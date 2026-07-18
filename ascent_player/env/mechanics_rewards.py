@@ -19,6 +19,7 @@ class MechanicsRewardTracker:
     last_state: FrameState | None = None
     episode_steps: int = 0
     milestones_hit: set[int] | None = None
+    height_milestones_hit: set[int] | None = None
     last_steer_dir: int = 0
     persist_steer_dir: int = 0
     persist_steer_steps: int = 0
@@ -31,6 +32,7 @@ class MechanicsRewardTracker:
         self.last_state = None
         self.episode_steps = 0
         self.milestones_hit = set()
+        self.height_milestones_hit = set()
         self.last_steer_dir = 0
         self.persist_steer_dir = 0
         self.persist_steer_steps = 0
@@ -46,20 +48,30 @@ class MechanicsRewardTracker:
             reward += self._falling_penalty(previous, state)
             reward += self._steer_reward(previous, state, action)
             reward += self._boost_economy_reward(previous, state, action)
+            # Phase 2: ungate climb/score signals early so the policy optimizes score.
+            reward += self._score_reward(previous, state) * self._early_score_scale()
+            reward += self._height_milestone_reward(state)
             if self._stage_at_least("M1"):
                 reward += self._approach_reward(previous, state)
-            if self._stage_at_least("M4"):
+            if self._stage_at_least("M2"):
                 reward += self._combo_reward(previous, state)
-            if self._stage_at_least("M5"):
+            if self._stage_at_least("M3"):
                 reward += self._booster_reward(previous, state)
-            if self._stage_at_least("M6"):
-                reward += self._score_reward(previous, state)
+            if self._stage_at_least("M4"):
                 reward += self._milestone_reward(state)
 
         if state.game_over:
             reward += self.config.death
             if self.episode_steps < self.config.early_death_steps:
                 reward += self.config.early_death_penalty
+            # Floor-hardening: punish sub-7k deaths so mins climb with peaks.
+            score = float(state.score or 0.0)
+            if score < 3000:
+                reward += -2.0
+            elif score < 7000:
+                reward += -1.0
+            elif score >= 10000:
+                reward += 0.5
 
         self.last_state = state
         return float(
@@ -71,6 +83,14 @@ class MechanicsRewardTracker:
 
     def _stage_at_least(self, stage: str) -> bool:
         return int(self.curriculum_stage[1:]) >= int(stage[1:])
+
+    def _early_score_scale(self) -> float:
+        """Full score shaping from M4; partial from M0 so climb is rewarded early."""
+        if self._stage_at_least("M4"):
+            return 1.0
+        if self._stage_at_least("M2"):
+            return 0.7
+        return 0.45
 
     def _height_reward(self, previous: FrameState, state: FrameState) -> float:
         delta = state.height - previous.height
@@ -180,4 +200,14 @@ class MechanicsRewardTracker:
             if state.score >= milestone and milestone not in self.milestones_hit:
                 self.milestones_hit.add(milestone)
                 reward += self.config.milestone_bonus
+        return reward
+
+    def _height_milestone_reward(self, state: FrameState) -> float:
+        if self.height_milestones_hit is None:
+            return 0.0
+        reward = 0.0
+        for milestone in self.config.height_milestones:
+            if state.height >= milestone and milestone not in self.height_milestones_hit:
+                self.height_milestones_hit.add(milestone)
+                reward += self.config.height_milestone_bonus
         return reward

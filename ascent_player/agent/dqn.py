@@ -64,6 +64,9 @@ class DQNAgent:
         )
         self.rule_policy = RulePolicy()
         self._n_step_queue: list[tuple] = []
+        self._n_step_queues: list[list[tuple]] = []
+        self._last_load_error: str | None = None
+        self._epsilon_anneal_start: float = config.training.epsilon_start
         self.progress = TrainingProgress(
             baseline_episodes=config.training.baseline_episodes,
             epsilon=config.training.epsilon_start,
@@ -205,6 +208,7 @@ class DQNAgent:
             training.sim_pretrain_min_replay,
         )
         self.epsilon = training.epsilon_start
+        self._epsilon_anneal_start = training.epsilon_start
         self.metrics.epsilon = self.epsilon
         self.progress.epsilon = self.epsilon
 
@@ -256,6 +260,7 @@ class DQNAgent:
         training: bool = True,
         can_boost: np.ndarray | list[bool] | None = None,
         boost_levels: np.ndarray | list[float] | None = None,
+        frame_states: list[FrameState | None] | None = None,
     ) -> np.ndarray:
         if isinstance(states, list):
             batch_size = len(states)
@@ -267,11 +272,23 @@ class DQNAgent:
             boost_levels = np.ones(batch_size, dtype=np.float32)
 
         actions = np.zeros(batch_size, dtype=np.int32)
+        decided = np.zeros(batch_size, dtype=bool)
+
+        # Phase 3: rule prior in vectorized pretrain.
+        if training and frame_states is not None:
+            prior = self.rule_prior_probability()
+            if prior > 0.0:
+                for index in range(batch_size):
+                    fs = frame_states[index]
+                    if fs is not None and random.random() < prior:
+                        actions[index] = self.rule_policy.act(fs)
+                        decided[index] = True
+
         explore_mask = np.zeros(batch_size, dtype=bool)
         if training and self.epsilon > 0.0:
-            explore_mask = np.random.random(batch_size) < self.epsilon
+            explore_mask = (~decided) & (np.random.random(batch_size) < self.epsilon)
 
-        greedy_indices = np.flatnonzero(~explore_mask)
+        greedy_indices = np.flatnonzero((~decided) & (~explore_mask))
         if len(greedy_indices) > 0:
             if isinstance(states, list):
                 batch_states = [states[int(i)] for i in greedy_indices]
@@ -298,10 +315,42 @@ class DQNAgent:
                     masked[action] = q_values[offset, action]
                 actions[index] = int(np.argmax(masked))
 
+        bias = self.config.training.smart_explore_boost_bias
         for index in np.flatnonzero(explore_mask):
+            fs = frame_states[index] if frame_states is not None else None
             valid = self._valid_actions(bool(can_boost[index]), float(boost_levels[index]))
+            if (
+                fs is not None
+                and bias > 0
+                and bool(can_boost[index])
+                and (fs.boost_useful or (fs.orb_vy is not None and fs.orb_vy < -0.2))
+                and random.random() < bias
+            ):
+                jump_valid = [a for a in valid if a >= 3]
+                if jump_valid:
+                    actions[index] = random.choice(jump_valid)
+                    continue
             actions[index] = random.choice(valid)
         return actions
+
+    def anneal_epsilon_by_steps(self) -> float:
+        """Phase 3: step-based ε schedule for sim pretrain."""
+        if self.config.training.watch_mode:
+            self.epsilon = 0.0
+            self.metrics.epsilon = 0.0
+            self.progress.epsilon = 0.0
+            return self.epsilon
+        if not self._sim_pretrain_mode:
+            return self.epsilon
+        training = self.config.training
+        anneal = max(1, training.sim_epsilon_anneal_steps)
+        progress = min(1.0, self.metrics.total_steps / anneal)
+        start = self._epsilon_anneal_start
+        end = training.sim_epsilon_end
+        self.epsilon = start - (start - end) * progress
+        self.metrics.epsilon = self.epsilon
+        self.progress.epsilon = self.epsilon
+        return self.epsilon
 
     @staticmethod
     def _valid_actions(can_boost: bool, boost_level: float = 1.0) -> list[int]:
@@ -319,6 +368,7 @@ class DQNAgent:
                     transition.reward,
                     transition.next_state,
                     transition.done,
+                    discount=self.config.training.gamma,
                 )
                 added += 1
         self.metrics.replay_size = len(self.replay)
@@ -346,15 +396,28 @@ class DQNAgent:
         buffer = target_buffer or self.demo_replay
         if indices is None:
             indices = np.arange(len(actions), dtype=np.int64)
+            action_lookup = actions
+            use_positional_actions = False
+        else:
+            indices = np.asarray(indices)
+            # ingest may pass already-subsampled masked actions aligned to indices.
+            use_positional_actions = len(actions) == len(indices)
+            action_lookup = actions
         added = 0
         for _ in range(max(1, multiplier)):
-            for idx in indices:
+            for offset, idx in enumerate(indices):
+                action = (
+                    int(action_lookup[offset])
+                    if use_positional_actions
+                    else int(action_lookup[int(idx)])
+                )
                 buffer.add(
-                    states[idx],
-                    int(actions[idx]),
-                    float(rewards[idx]),
-                    next_states[idx],
-                    bool(dones[idx]),
+                    states[int(idx)],
+                    action,
+                    float(rewards[int(idx)]),
+                    next_states[int(idx)],
+                    bool(dones[int(idx)]),
+                    discount=self.config.training.gamma,
                 )
                 added += 1
         self.metrics.replay_size = len(self.replay)
@@ -407,32 +470,65 @@ class DQNAgent:
         sim: bool = False,
     ) -> None:
         buffer = self.sim_replay if sim else self.replay
-        n_step = max(1, self.config.training.n_step)
-        self._n_step_queue.append((state, action, reward, next_state, done))
-        while len(self._n_step_queue) >= n_step:
-            self._flush_one_n_step(buffer)
-        if done:
-            while self._n_step_queue:
-                self._flush_one_n_step(buffer)
-            self._n_step_queue.clear()
+        self._push_n_step(
+            self._n_step_queue,
+            buffer,
+            state,
+            action,
+            reward,
+            next_state,
+            done,
+        )
         self.metrics.replay_size = len(self.replay)
 
-    def _flush_one_n_step(self, buffer: ReplayBuffer) -> None:
-        if not self._n_step_queue:
+    def _push_n_step(
+        self,
+        queue: list[tuple],
+        buffer: ReplayBuffer,
+        state,
+        action: int,
+        reward: float,
+        next_state,
+        done: bool,
+    ) -> None:
+        n_step = max(1, self.config.training.n_step)
+        queue.append((state, action, reward, next_state, done))
+        while len(queue) >= n_step:
+            self._flush_n_step_queue(queue, buffer)
+        if done:
+            while queue:
+                self._flush_n_step_queue(queue, buffer)
+            queue.clear()
+
+    def _flush_n_step_queue(self, queue: list[tuple], buffer: ReplayBuffer) -> None:
+        if not queue:
             return
         gamma = self.config.training.gamma
         accumulated = 0.0
-        final_next = self._n_step_queue[-1][3]
+        steps_used = 0
+        final_next = queue[-1][3]
         final_done = False
-        for index, (_, _, step_reward, step_next, step_done) in enumerate(self._n_step_queue):
+        for index, (_, _, step_reward, step_next, step_done) in enumerate(queue):
             accumulated += (gamma ** index) * step_reward
             final_next = step_next
             final_done = step_done
+            steps_used = index + 1
             if step_done:
                 break
-        first_state, first_action, _, _, _ = self._n_step_queue[0]
-        buffer.add(first_state, first_action, accumulated, final_next, final_done)
-        self._n_step_queue.pop(0)
+        first_state, first_action, _, _, _ = queue[0]
+        buffer.add(
+            first_state,
+            first_action,
+            accumulated,
+            final_next,
+            final_done,
+            discount=gamma ** steps_used,
+        )
+        queue.pop(0)
+
+    def _flush_one_n_step(self, buffer: ReplayBuffer) -> None:
+        """Backward-compatible alias for single-env n-step flush."""
+        self._flush_n_step_queue(self._n_step_queue, buffer)
 
     def remember_batch(
         self,
@@ -445,17 +541,24 @@ class DQNAgent:
         sim: bool = False,
     ) -> None:
         buffer = self.sim_replay if sim else self.replay
-        if isinstance(states, list):
-            for index in range(len(actions)):
-                buffer.add(
-                    states[index],
-                    int(actions[index]),
-                    float(rewards[index]),
-                    next_states[index],
-                    bool(dones[index]),
-                )
-        else:
-            buffer.add_many(states, actions, rewards, next_states, dones)
+        env_count = len(actions)
+        if len(self._n_step_queues) != env_count:
+            for queue in self._n_step_queues:
+                while queue:
+                    self._flush_n_step_queue(queue, buffer)
+            self._n_step_queues = [[] for _ in range(env_count)]
+        for index in range(env_count):
+            state = states[index]
+            next_state = next_states[index]
+            self._push_n_step(
+                self._n_step_queues[index],
+                buffer,
+                state,
+                int(actions[index]),
+                float(rewards[index]),
+                next_state,
+                bool(dones[index]),
+            )
         self.metrics.replay_size = len(self.replay)
 
     def advance_steps(self, count: int = 1) -> AgentMetrics:
@@ -481,33 +584,75 @@ class DQNAgent:
             self._sync_target_network(hard=True)
         else:
             self._sync_target_network(hard=False)
+        if self._sim_pretrain_mode:
+            self.anneal_epsilon_by_steps()
         return self.metrics
 
     def maybe_train(self) -> AgentMetrics:
         return self.advance_steps(1)
 
+    def _anneal_per_beta(self) -> float:
+        training = self.config.training
+        steps = max(1, training.per_beta_anneal_steps)
+        progress = min(1.0, self.metrics.total_steps / steps)
+        beta = training.per_beta_start + (
+            training.per_beta_end - training.per_beta_start
+        ) * progress
+        self.replay.set_beta(beta)
+        self.sim_replay.set_beta(beta)
+        return beta
+
     def _sample_training_batch(self) -> TransitionBatch:
+        self._anneal_per_beta()
         batch_size = self.batch_size
         sim_ratio = self.config.training.mixed_sim_replay_ratio
         sim_count = 0
         if len(self.sim_replay) > 0 and sim_ratio > 0:
             sim_count = min(int(batch_size * sim_ratio), len(self.sim_replay))
         rl_count = batch_size - sim_count
-        parts: list[TransitionBatch] = []
+        rl_batch: TransitionBatch | None = None
+        sim_batch: TransitionBatch | None = None
         if rl_count > 0 and len(self.replay) >= rl_count:
-            parts.append(self.replay.sample(rl_count))
+            rl_batch = self.replay.sample(rl_count)
         if sim_count > 0:
-            parts.append(self.sim_replay.sample(sim_count))
-        if not parts:
+            sim_batch = self.sim_replay.sample(sim_count)
+        if rl_batch is None and sim_batch is None:
             return self.replay.sample(min(batch_size, len(self.replay)))
-        if len(parts) == 1:
-            return parts[0]
+        if rl_batch is not None and sim_batch is None:
+            return rl_batch
+        if sim_batch is not None and rl_batch is None:
+            return sim_batch
+        assert rl_batch is not None and sim_batch is not None
+        weights = None
+        if rl_batch.weights is not None or sim_batch.weights is not None:
+            rl_w = (
+                rl_batch.weights
+                if rl_batch.weights is not None
+                else np.ones(len(rl_batch.actions), dtype=np.float32)
+            )
+            sim_w = (
+                sim_batch.weights
+                if sim_batch.weights is not None
+                else np.ones(len(sim_batch.actions), dtype=np.float32)
+            )
+            weights = np.concatenate([rl_w, sim_w], axis=0)
+            weights = weights / max(float(weights.max()), 1e-6)
         return TransitionBatch(
-            states=np.concatenate([part.states for part in parts], axis=0),
-            actions=np.concatenate([part.actions for part in parts], axis=0),
-            rewards=np.concatenate([part.rewards for part in parts], axis=0),
-            next_states=np.concatenate([part.next_states for part in parts], axis=0),
-            dones=np.concatenate([part.dones for part in parts], axis=0),
+            states=np.concatenate([rl_batch.states, sim_batch.states], axis=0),
+            actions=np.concatenate([rl_batch.actions, sim_batch.actions], axis=0),
+            rewards=np.concatenate([rl_batch.rewards, sim_batch.rewards], axis=0),
+            next_states=np.concatenate(
+                [rl_batch.next_states, sim_batch.next_states],
+                axis=0,
+            ),
+            dones=np.concatenate([rl_batch.dones, sim_batch.dones], axis=0),
+            discounts=np.concatenate(
+                [rl_batch.discounts, sim_batch.discounts],
+                axis=0,
+            ),
+            indices=rl_batch.indices,
+            weights=weights,
+            sim_indices=sim_batch.indices,
         )
 
     def end_episode(self, *, sim_pretrain: bool | None = None) -> None:
@@ -516,17 +661,15 @@ class DQNAgent:
         )
         if self.config.training.watch_mode:
             self.epsilon = 0.0
+        elif sim_mode:
+            # Step-based anneal is authoritative during sim pretrain.
+            self.anneal_epsilon_by_steps()
+            self.metrics.epsilon = self.epsilon
+            self.progress.epsilon = self.epsilon
+            return
         else:
-            decay = (
-                self.config.training.sim_epsilon_decay
-                if sim_mode
-                else self.config.training.epsilon_decay
-            )
-            epsilon_end = (
-                self.config.training.sim_epsilon_end
-                if sim_mode
-                else self.config.training.epsilon_end
-            )
+            decay = self.config.training.epsilon_decay
+            epsilon_end = self.config.training.epsilon_end
             self.epsilon = max(epsilon_end, self.epsilon * decay)
         if not sim_mode and not self.config.training.watch_mode:
             self._cap_browser_epsilon()
@@ -625,6 +768,7 @@ class DQNAgent:
         self.sim_replay.clear()
         self.sim_replay.extend_from(preserved, max_items=5000)
         self._n_step_queue.clear()
+        self._n_step_queues = []
         self._sim_pretrain_mode = False
         self.set_learning_rate(self.config.training.transfer_learning_rate)
         self.epsilon = self.config.training.transfer_epsilon_start
@@ -655,12 +799,13 @@ class DQNAgent:
                 return LoadResult(True, message, self.progress)
         if not self.config.training.auto_load_checkpoint:
             return LoadResult(False, "Auto-load disabled — starting from scratch.")
-        if not target.exists():
+        if not target.exists() and not self.weights_sidecar_path(target).exists():
             return LoadResult(False, "No checkpoint found — starting from scratch.")
         if not self.load():
+            detail = self._last_load_error or "incompatible"
             return LoadResult(
                 False,
-                "Checkpoint missing or incompatible — starting from scratch.",
+                f"Checkpoint load failed ({detail}) — starting from scratch.",
             )
         message = (
             f"Resumed training — {self.progress.episodes_completed} episodes, "
@@ -674,64 +819,116 @@ class DQNAgent:
         message += f" | best score {self.progress.best_score:.0f}"
         return LoadResult(True, message, self.progress)
 
+    @staticmethod
+    def weights_sidecar_path(keras_path: Path) -> Path:
+        return keras_path.with_name(f"{keras_path.stem}.weights.h5")
+
     def save(self, path: Path | None = None) -> Path:
         target = path or self.config.training.checkpoint_path
         target.parent.mkdir(parents=True, exist_ok=True)
         self.progress.total_steps = self.metrics.total_steps
         self.progress.epsilon = self.epsilon
-        self.online.save(target)
+        weights_path = self.weights_sidecar_path(target)
+        with self.tf.device(self.device_info.training_device):
+            self.online.save_weights(weights_path)
+            try:
+                self.online.save(target)
+            except Exception as exc:
+                print(f"Full-model save skipped ({exc}); weights saved to {weights_path.name}")
+        # Meta always keyed off the .keras path so resume finds it next to weights.
         save_progress(target, self.progress)
         return target
 
     def save_sim_checkpoint(self) -> Path:
         return self.save(self.config.training.sim_checkpoint_path)
 
+    def _apply_loaded_progress(self, target: Path) -> None:
+        progress = load_progress(target)
+        if progress is None:
+            weights_meta = self.weights_sidecar_path(target)
+            progress = load_progress(weights_meta)
+        if progress is None:
+            return
+        if progress.best_score <= 0 and progress.recent_scores:
+            progress.best_score = max(progress.recent_scores)
+        if not self.config.training.sim_mode:
+            progress, sanitize_notes = sanitize_browser_progress(
+                progress,
+                score_cap=self.config.training.score_sanity_cap,
+                epsilon_cap=self.config.training.browser_epsilon_cap,
+            )
+            for note in sanitize_notes:
+                print(f"Progress sanitize: {note}")
+        elif progress.baseline_score is not None:
+            progress.best_score = max(progress.best_score, progress.baseline_score)
+        self.progress = progress
+        self.epsilon = progress.epsilon
+        if not self.config.training.sim_mode:
+            self._cap_browser_epsilon()
+        self.progress.epsilon = self.epsilon
+        self.metrics.epsilon = self.epsilon
+        self.metrics.total_steps = progress.total_steps
+        self._last_autosave_steps = progress.total_steps
+        self._baseline_samples = []
+
     def load(self, path: Path | None = None) -> bool:
         target = path or self.config.training.checkpoint_path
-        if not target.exists():
-            return False
-        try:
-            with self.tf.device(self.device_info.training_device):
-                loaded = self.tf.keras.models.load_model(target)
-                if self._vector_dim > 0:
-                    if len(loaded.inputs) != 2:
-                        return False
-                    visual_shape = tuple(loaded.inputs[0].shape[1:])
-                    vector_shape = tuple(loaded.inputs[1].shape[1:])
-                    if visual_shape != tuple(self.online.inputs[0].shape[1:]):
-                        return False
-                    if vector_shape != (self._vector_dim,):
-                        return False
-                elif tuple(loaded.input_shape[1:]) != tuple(self.online.input_shape[1:]):
-                    return False
-                self.online.set_weights(loaded.get_weights())
-                self.target.set_weights(loaded.get_weights())
-        except Exception:
-            return False
+        weights_path = self.weights_sidecar_path(target)
+        errors: list[str] = []
 
-        progress = load_progress(target)
-        if progress is not None:
-            if progress.best_score <= 0 and progress.recent_scores:
-                progress.best_score = max(progress.recent_scores)
-            if not self.config.training.sim_mode:
-                progress, sanitize_notes = sanitize_browser_progress(
-                    progress,
-                    score_cap=self.config.training.score_sanity_cap,
-                    epsilon_cap=self.config.training.browser_epsilon_cap,
-                )
-                for note in sanitize_notes:
-                    print(f"Progress sanitize: {note}")
-            elif progress.baseline_score is not None:
-                progress.best_score = max(progress.best_score, progress.baseline_score)
-            self.progress = progress
-            self.epsilon = progress.epsilon
-            self._cap_browser_epsilon()
-            self.progress.epsilon = self.epsilon
-            self.metrics.epsilon = self.epsilon
-            self.metrics.total_steps = progress.total_steps
-            self._last_autosave_steps = progress.total_steps
-            self._baseline_samples = []
-        return True
+        with self.tf.device(self.device_info.training_device):
+            if weights_path.exists():
+                try:
+                    self.online.load_weights(weights_path)
+                    self.target.set_weights(self.online.get_weights())
+                    self._apply_loaded_progress(target)
+                    self._last_load_error = None
+                    return True
+                except Exception as exc:
+                    errors.append(f"weights load: {exc}")
+
+            if target.exists():
+                try:
+                    from ascent_player.agent.model import _advantage_center_layer
+
+                    AdvantageCenter = _advantage_center_layer()
+                    loaded = self.tf.keras.models.load_model(
+                        target,
+                        custom_objects={"AdvantageCenter": AdvantageCenter},
+                        safe_mode=False,
+                    )
+                    if self._vector_dim > 0:
+                        if len(loaded.inputs) != 2:
+                            raise ValueError("expected hybrid visual+vector inputs")
+                        visual_shape = tuple(loaded.inputs[0].shape[1:])
+                        vector_shape = tuple(loaded.inputs[1].shape[1:])
+                        if visual_shape != tuple(self.online.inputs[0].shape[1:]):
+                            raise ValueError(
+                                f"visual shape {visual_shape} != "
+                                f"{tuple(self.online.inputs[0].shape[1:])}"
+                            )
+                        if vector_shape != (self._vector_dim,):
+                            raise ValueError(
+                                f"vector shape {vector_shape} != ({self._vector_dim},)"
+                            )
+                    elif tuple(loaded.input_shape[1:]) != tuple(self.online.input_shape[1:]):
+                        raise ValueError("visual-only input shape mismatch")
+                    self.online.set_weights(loaded.get_weights())
+                    self.target.set_weights(loaded.get_weights())
+                    # Migrate legacy checkpoints to weights sidecar for future loads.
+                    try:
+                        self.online.save_weights(weights_path)
+                    except Exception:
+                        pass
+                    self._apply_loaded_progress(target)
+                    self._last_load_error = None
+                    return True
+                except Exception as exc:
+                    errors.append(f"model load: {exc}")
+
+        self._last_load_error = "; ".join(errors) if errors else "checkpoint missing"
+        print(f"Checkpoint load failed: {self._last_load_error}")
+        return False
 
     def _train_batch(self, batch: TransitionBatch):
         states = self._to_model_batch(batch.states)
@@ -739,6 +936,12 @@ class DQNAgent:
         actions = self.tf.convert_to_tensor(batch.actions, dtype=self.tf.int32)
         rewards = self.tf.convert_to_tensor(batch.rewards, dtype=self.tf.float32)
         dones = self.tf.convert_to_tensor(batch.dones, dtype=self.tf.float32)
+        discounts = self.tf.convert_to_tensor(batch.discounts, dtype=self.tf.float32)
+        weights_t = (
+            self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
+            if batch.weights is not None
+            else None
+        )
         if self._vector_dim > 0:
             loss, td_errors = self._train_step(
                 self.tf.convert_to_tensor(states[0], dtype=self.tf.float32),
@@ -748,9 +951,8 @@ class DQNAgent:
                 self.tf.convert_to_tensor(next_states[0], dtype=self.tf.float32),
                 self.tf.convert_to_tensor(next_states[1], dtype=self.tf.float32),
                 dones,
-                self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
-                if batch.weights is not None
-                else None,
+                discounts,
+                weights_t,
             )
         else:
             dummy = self.tf.zeros((len(batch.actions), 1), dtype=self.tf.float32)
@@ -762,13 +964,18 @@ class DQNAgent:
                 self.tf.convert_to_tensor(next_states, dtype=self.tf.float32),
                 dummy,
                 dones,
-                self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
-                if batch.weights is not None
-                else None,
+                discounts,
+                weights_t,
             )
         self._last_td_errors = td_errors
+        td_abs = np.abs(td_errors.numpy())
         if batch.indices is not None:
-            self.replay.update_priorities(batch.indices, np.abs(td_errors.numpy()))
+            rl_n = len(batch.indices)
+            self.replay.update_priorities(batch.indices, td_abs[:rl_n])
+            if batch.sim_indices is not None:
+                self.sim_replay.update_priorities(batch.sim_indices, td_abs[rl_n:])
+        elif batch.sim_indices is not None:
+            self.sim_replay.update_priorities(batch.sim_indices, td_abs)
         if (
             len(self.demo_replay) > 0
             and (
@@ -825,7 +1032,17 @@ class DQNAgent:
             neg_inf = tf.constant(-1e9, dtype=tf.float32)
 
             @self.tf.function
-            def train_step(state_visual, state_vector, actions, rewards, next_visual, next_vector, dones, weights):
+            def train_step(
+                state_visual,
+                state_vector,
+                actions,
+                rewards,
+                next_visual,
+                next_vector,
+                dones,
+                discounts,
+                weights,
+            ):
                 if agent._vector_dim > 0:
                     next_states_tensor = [next_visual, next_vector]
                     states_tensor = [state_visual, state_vector]
@@ -834,7 +1051,8 @@ class DQNAgent:
                     next_states_tensor = next_visual
                     states_tensor = state_visual
                     boost_levels = tf.reduce_mean(next_states_tensor[..., -2], axis=[1, 2])
-                can_boost = boost_levels * 100.0 >= agent.config.reward.boost_min_energy
+                min_energy = agent.config.mechanics_reward.boost_min_energy
+                can_boost = boost_levels * 100.0 >= min_energy
                 action_idx = tf.range(action_count, dtype=tf.int32)
                 jump_actions = action_idx >= 3
                 allowed = tf.logical_or(
@@ -857,7 +1075,7 @@ class DQNAgent:
                 else:
                     next_values = tf.reduce_max(masked_target, axis=1)
 
-                targets = rewards + (1.0 - dones) * agent.config.training.gamma * next_values
+                targets = rewards + (1.0 - dones) * discounts * next_values
 
                 with tf.GradientTape() as tape:
                     q_values = agent.online(states_tensor, training=True)

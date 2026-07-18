@@ -118,41 +118,68 @@ class RewardConfig:
 @dataclass(slots=True)
 class MechanicsRewardConfig:
     survival: float = 0.004
-    height_gain: float = 0.012
-    platform_land: float = 0.35
-    falling_penalty: float = -0.04
-    steer_gain: float = 0.38
-    wrong_way_penalty: float = -0.18
-    aligned_bonus: float = 0.08
-    boost_spent: float = -0.025
-    wasted_boost_penalty: float = -0.10
-    empty_boost_penalty: float = -0.22
-    timed_boost_bonus: float = 0.12
-    combo_gain: float = 0.06
-    combo_break_penalty: float = -0.40
-    booster_collect: float = 0.18
-    drag_penalty: float = -0.35
-    score_gain: float = 0.008
-    death: float = -1.0
-    early_death_penalty: float = -0.5
-    early_death_steps: int = 80
-    milestone_scores: tuple[int, ...] = (500, 1000, 1500, 2000, 2500, 3000)
-    milestone_bonus: float = 0.2
-    reward_clip: float = 2.0
+    height_gain: float = 0.07
+    platform_land: float = 0.70
+    falling_penalty: float = -0.08
+    steer_gain: float = 0.05
+    wrong_way_penalty: float = -0.10
+    aligned_bonus: float = 0.015
+    boost_spent: float = -0.015
+    wasted_boost_penalty: float = -0.15
+    empty_boost_penalty: float = -0.25
+    timed_boost_bonus: float = 0.45
+    combo_gain: float = 0.10
+    combo_break_penalty: float = -0.30
+    booster_collect: float = 0.25
+    drag_penalty: float = -0.30
+    score_gain: float = 0.018
+    death: float = -1.5
+    early_death_penalty: float = -1.0
+    early_death_steps: int = 500
+    milestone_scores: tuple[int, ...] = (
+        500,
+        1000,
+        1500,
+        2000,
+        3000,
+        5000,
+        7500,
+        10000,
+    )
+    milestone_bonus: float = 0.35
+    height_milestones: tuple[int, ...] = (
+        500,
+        1000,
+        2500,
+        5000,
+        10000,
+        25000,
+        50000,
+    )
+    height_milestone_bonus: float = 0.30
+    reward_clip: float = 3.5
     boost_min_energy: float = 14.0
 
 
 @dataclass(slots=True)
 class MechanicsCurriculumConfig:
-    stage_m1_min_survival_steps: float = 480.0
-    stage_m2_min_landing_rate: float = 0.60
-    stage_m3_min_height: float = 400.0
-    stage_m4_min_combo: float = 5.0
+    stage_m1_min_survival_steps: float = 400.0
+    stage_m2_min_landing_rate: float = 0.40
+    stage_m3_min_height: float = 350.0
+    stage_m4_min_combo: float = 4.0
     stage_m5_min_score: float = 800.0
     stage_m6_min_score: float = 1500.0
     training_tier_index: int = 0
-    teacher_episodes: int = 80
-    teacher_warmstart_epsilon: float = 0.15
+    teacher_episodes: int = 120
+    teacher_warmstart_epsilon: float = 0.20
+    # Phase 4: curriculum start-height when best score clears thresholds.
+    start_height_gate_b: float = 3000.0
+    start_height_gate_c: float = 6000.0
+    start_height_max_b: float = 4_000.0
+    start_height_max_c: float = 12_000.0
+    start_height_prob: float = 0.25
+    # Only count score above the start-height baseline for curriculum stats.
+    start_height_score_credit: bool = False
 
 
 @dataclass(slots=True)
@@ -211,7 +238,7 @@ class TrainingConfig:
     browser_epsilon_cap: float = 0.35
     browser_epsilon_floor: float = 0.05
     browser_plateau_epsilon_decay: float = 0.97
-    score_sanity_cap: float = 5000.0
+    score_sanity_cap: float = 20_000.0
     replay_trim_size: int = 35_000
     gpu_restart_every_runs: int = 25
     curriculum_stage_a_max: float = 800.0
@@ -223,11 +250,12 @@ class TrainingConfig:
     target_special_min_rate: float = 0.02
     finetune_max_seconds: int = 600
     mixed_sim_replay_ratio: float = 0.3
-    sim_epsilon_end: float = 0.12
-    sim_epsilon_decay: float = 0.995
+    sim_epsilon_end: float = 0.03
+    sim_epsilon_decay: float = 0.990
+    sim_epsilon_anneal_steps: int = 100_000
     sim_min_best_score: int = 1000
     sim_max_steps_multiplier: float = 2.0
-    target_score: int = 3000
+    target_score: int = 10000
     device_mode: DeviceMode = DeviceMode.GPU
     watch_mode: bool = False
     # Fast headless pretrain: parallel envs, batched inference, lightweight obs.
@@ -236,6 +264,12 @@ class TrainingConfig:
     sim_pretrain_batch_size: int = 128
     sim_pretrain_min_replay: int = 256
     sim_fast_observations: bool = True
+    sim_warmstart_teacher: bool = True
+    sim_warmstart_demos: bool = True
+    sim_best_eval_checkpoint_path: Path = Path("checkpoints/sim_best_eval.keras")
+    consistency_eval_episodes: int = 20
+    consistency_mean_score: float = 10000.0
+    consistency_min_score: float = 7000.0
     log_dir: Path = Path("logs")
     log_interval_steps: int = 500
     log_interval_steps_sim: int = 2500
@@ -243,10 +277,27 @@ class TrainingConfig:
     log_weight_norm_every: int = 5000
     use_prioritized_replay: bool = True
     n_step: int = 3
-    rule_prior_start: float = 0.35
-    rule_prior_end: float = 0.05
-    rule_prior_steps: int = 100_000
+    per_beta_start: float = 0.4
+    per_beta_end: float = 1.0
+    per_beta_anneal_steps: int = 100_000
+    rule_prior_start: float = 0.45
+    rule_prior_end: float = 0.08
+    rule_prior_steps: int = 150_000
+    smart_explore_boost_bias: float = 0.55
     dueling_dqn: bool = True
+    # Gated ε=0 eval during sim pretrain / overnight.
+    sim_eval_every_steps: int = 20_000
+    sim_eval_episodes: int = 8
+    sim_eval_max_steps: int = 12_000
+    gate_a_score: float = 900.0
+    gate_b_score: float = 2000.0
+    gate_c_score: float = 5000.0
+    gate_d_score: float = 10000.0
+    gate_d_min_score: float = 7000.0
+    # Browser overnight: keep frame skip low enough for boost timing.
+    browser_frame_skip_min: int = 2
+    browser_frame_skip_max: int = 3
+    browser_epsilon_cap_after_gate_a: float = 0.15
 
 
 @dataclass(slots=True)
