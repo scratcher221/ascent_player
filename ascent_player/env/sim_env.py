@@ -39,25 +39,54 @@ def _to_detector_platform(platform: SimPlatform, camera_y: float) -> Platform:
 
 
 def render_sim_frame(world: SimWorld) -> np.ndarray:
+    """RGB frame tuned so grayscale preprocess ≈ browser Genesis canvas.
+
+    Tier-1 colours from tiers.js / game.js:
+      bg #000000–#070707, neutral platforms #999999, sell #ff4d6d,
+      orb mid #f2f2f2 with soft white bloom (halo).
+    """
     cfg = world.config
-    frame = np.zeros((cfg.height, cfg.width, 3), dtype=np.uint8)
-    frame[:] = (5, 9, 9)
+    h, w = cfg.height, cfg.width
+    # Vertical void gradient (tiers.js GENESIS bg / bg1)
+    frame = np.zeros((h, w, 3), dtype=np.uint8)
+    yy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
+    tone = (7.0 + 5.0 * yy).astype(np.uint8)
+    frame[:, :, 0] = tone
+    frame[:, :, 1] = tone
+    frame[:, :, 2] = tone
 
     camera_y = world.camera_y
     for platform in world.platforms:
-        color = (180, 70, 70) if platform.is_hazard else (120, 120, 120)
+        # wear fades like platformOpacity() in platform-rules.js
+        wear = platform.receptions / max(platform.bounce_limit, 1)
+        alpha = max(0.2, 1.0 - wear * 0.8)
+        if platform.is_hazard:
+            base = np.array([255, 77, 109], dtype=np.float32)  # #ff4d6d sell
+        else:
+            base = np.array([153, 153, 153], dtype=np.float32)  # #999999 platN
+        color = tuple(int(c * alpha) for c in base)
         x1 = int(platform.cx - platform.width / 2)
         x2 = int(platform.cx + platform.width / 2)
         y1 = int(platform.cy - camera_y - platform.height / 2)
         y2 = int(platform.cy - camera_y + platform.height / 2)
-        if y2 < 0 or y1 > cfg.height:
+        if y2 < 0 or y1 > h:
             continue
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness=-1)
+        # Top highlight strip (game drawPlatforms tier≥2; helps edge contrast in gray)
+        if not platform.is_hazard and y1 >= 0:
+            hi = tuple(min(255, int(c + 40 * alpha)) for c in color)
+            cv2.rectangle(frame, (x1, y1), (x2, min(y1 + 2, y2)), hi, thickness=-1)
 
     for booster in world.boosters:
         if booster.used:
             continue
-        color = (80, 220, 120) if booster.type == "surge" else (120, 220, 80) if booster.type == "stream" else (80, 80, 220)
+        # surge #ffdd88, stream green-cyan, drag red wall
+        if booster.type == "surge":
+            color = (255, 221, 136)
+        elif booster.type == "stream":
+            color = (80, 200, 160)
+        else:
+            color = (255, 77, 109)
         x1 = int(booster.cx - booster.width / 2)
         x2 = int(booster.cx + booster.width / 2)
         y1 = int(booster.cy - camera_y - booster.height / 2)
@@ -66,22 +95,33 @@ def render_sim_frame(world: SimWorld) -> np.ndarray:
 
     orb_x = int(world.ball.x)
     orb_y = int(world.ball.y - camera_y)
-    radius = int(cfg.orb_radius)
-    cv2.circle(frame, (orb_x, orb_y), radius + 4, (0, 220, 220), thickness=-1)
-    cv2.circle(frame, (orb_x, orb_y), radius, (0, 255, 255), thickness=-1)
+    radius = max(2, int(cfg.orb_radius))
+    # Soft bloom then bright body (Genesis orb mid/bloom → high gray after preprocess)
+    cv2.circle(frame, (orb_x, orb_y), radius + 6, (48, 48, 48), thickness=-1)
+    cv2.circle(frame, (orb_x, orb_y), radius + 3, (180, 180, 180), thickness=-1)
+    cv2.circle(frame, (orb_x, orb_y), radius, (242, 242, 242), thickness=-1)
+    # Specular hot-spot
+    cv2.circle(
+        frame,
+        (orb_x - radius // 3, orb_y - radius // 3),
+        max(1, radius // 4),
+        (255, 255, 255),
+        thickness=-1,
+    )
 
-    bar_x = int(cfg.width * 0.02)
-    bar_bottom = int(cfg.height * 0.88)
-    bar_top = int(cfg.height * 0.58)
+    # Compact energy tick (browser HUD is separate; keep a thin cue for boost channel)
+    bar_x = int(w * 0.02)
+    bar_bottom = int(h * 0.90)
+    bar_top = int(h * 0.62)
     bar_h = bar_bottom - bar_top
-    cv2.rectangle(frame, (bar_x, bar_top), (bar_x + 8, bar_bottom), (40, 40, 40), -1)
+    cv2.rectangle(frame, (bar_x, bar_top), (bar_x + 6, bar_bottom), (28, 28, 28), -1)
     fill_h = int(bar_h * world.boost_level)
     if fill_h > 0:
-        color = (80, 220, 120) if world.boost_level > 0.3 else (80, 80, 220)
+        color = (90, 200, 140) if world.boost_level > 0.3 else (90, 90, 200)
         cv2.rectangle(
             frame,
             (bar_x + 1, bar_bottom - fill_h),
-            (bar_x + 7, bar_bottom - 1),
+            (bar_x + 5, bar_bottom - 1),
             color,
             -1,
         )

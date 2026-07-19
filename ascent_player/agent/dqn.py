@@ -8,6 +8,8 @@ import time
 import numpy as np
 
 from ascent_player.agent.checkpoint import (
+    checkpoint_exists,
+    prefer_checkpoint,
     LoadResult,
     TrainingProgress,
     load_progress,
@@ -426,6 +428,14 @@ class DQNAgent:
     def pretrain_from_replay(self, steps: int | None = None) -> float | None:
         if len(self.demo_replay) == 0:
             return None
+        # Hybrid policies need real vector features. Demo buffers are visual-only;
+        # BC with zeroed vectors collapses Q-values (often to 100% noop) and must
+        # not run — especially before Watch mode.
+        if self._vector_dim > 0:
+            print(
+                "Skipping demo BC pretrain: hybrid model cannot use visual-only demos"
+            )
+            return None
         total_steps = steps or self.config.demo.pretrain_steps
         batch_size = min(self.batch_size, len(self.demo_replay))
         last_loss = None
@@ -772,8 +782,13 @@ class DQNAgent:
         self._sim_pretrain_mode = False
         self.set_learning_rate(self.config.training.transfer_learning_rate)
         self.epsilon = self.config.training.transfer_epsilon_start
+        self._cap_browser_epsilon()
         self.metrics.epsilon = self.epsilon
         self.progress.epsilon = self.epsilon
+        # Keep sim score as baseline reference; reset browser progress counters.
+        sim_best = float(self.progress.best_score)
+        if sim_best > 0:
+            self.progress.baseline_score = sim_best
         self.progress.best_score = 0.0
         self.progress.best_reward = float("-inf")
         self.progress.recent_scores = []
@@ -782,33 +797,140 @@ class DQNAgent:
         self.metrics.total_steps = 0
         self._episodes_since_best = 0
         self._last_autosave_steps = 0
+        self._epsilon_anneal_start = self.epsilon
+
+    def seed_sim_replay_from_rendered(
+        self,
+        *,
+        transitions: int | None = None,
+        env_index: int = 42,
+    ) -> int:
+        """Fill sim_replay with rendered-sim (non-fast) rollouts for mixed transfer."""
+        from ascent_player.env.sim_env import AscentSimEnv
+
+        target = transitions or self.config.training.transfer_seed_sim_replay
+        if target <= 0:
+            return 0
+        saved_eps = self.epsilon
+        self.epsilon = 0.05
+        env = AscentSimEnv(self.config, fast_mode=False, env_index=env_index)
+        added = 0
+        try:
+            state = env.reset_sync()
+            while added < target:
+                frame_state = env._last_frame_state
+                action = self.act(
+                    state,
+                    training=True,
+                    can_boost=env.can_boost,
+                    boost_level=env.boost_level,
+                    frame_state=frame_state,
+                )
+                result = env.step_sync(int(action))
+                self.remember(
+                    state,
+                    int(action),
+                    float(result.reward),
+                    result.state,
+                    bool(result.done),
+                    sim=True,
+                )
+                state = result.state
+                added += 1
+                if result.done:
+                    state = env.reset_sync()
+        finally:
+            self.epsilon = saved_eps
+            self.metrics.epsilon = saved_eps
+            self.progress.epsilon = saved_eps
+        return added
 
     def _promote_replay_for_mixed_transfer(self) -> None:
-        return
+        if len(self.sim_replay) > 0:
+            return
+        added = self.seed_sim_replay_from_rendered()
+        if added:
+            print(f"Seeded sim_replay with {added} rendered-sim transitions")
+
+    def resolve_best_checkpoint(self) -> Path | None:
+        training = self.config.training
+        # Browser-adapted weights beat sim-only playable for Watch / UI.
+        if not training.sim_mode and checkpoint_exists(
+            training.browser_best_checkpoint_path
+        ):
+            return training.browser_best_checkpoint_path
+        for path in (
+            training.playable_checkpoint_path,
+            training.sim_best_eval_checkpoint_path,
+        ):
+            if checkpoint_exists(path):
+                return path
+        return prefer_checkpoint(
+            training.sim_checkpoint_path,
+            training.checkpoint_path,
+        )
+
+    def promote_browser_best(self) -> Path:
+        """Persist current weights as the browser Watch baseline."""
+        path = self.save(self.config.training.browser_best_checkpoint_path)
+        self.save(self.config.training.playable_checkpoint_path)
+        self.save(self.config.training.checkpoint_path)
+        return path
+
+    def promote_playable_checkpoint(self, source: Path | None = None) -> Path | None:
+        """Copy the strongest (or given) weights into playable + UI checkpoint slots."""
+        training = self.config.training
+        source = source or self.resolve_best_checkpoint()
+        if source is None or not self.load(source):
+            return None
+        playable = self.save(training.playable_checkpoint_path)
+        self.save(training.checkpoint_path)
+        return playable
 
     def try_autoload(self) -> LoadResult:
         target = self.config.training.checkpoint_path
         if self.config.training.transfer_from_sim:
-            sim_path = self.config.training.sim_checkpoint_path
-            if sim_path.exists() and self.load(sim_path):
+            sim_path = prefer_checkpoint(
+                self.config.training.sim_best_eval_checkpoint_path,
+                self.config.training.sim_checkpoint_path,
+                self.config.training.playable_checkpoint_path,
+            ) or self.config.training.sim_checkpoint_path
+            if checkpoint_exists(sim_path) and self.load(sim_path):
                 self.prepare_transfer_from_sim()
+                self._promote_replay_for_mixed_transfer()
                 message = (
                     f"Loaded sim pretrain from {sim_path.name} — "
-                    f"fine-tuning with ε={self.epsilon:.2f}"
+                    f"fine-tuning with ε={self.epsilon:.2f}, "
+                    f"sim_replay={len(self.sim_replay)}"
                 )
                 return LoadResult(True, message, self.progress)
         if not self.config.training.auto_load_checkpoint:
             return LoadResult(False, "Auto-load disabled — starting from scratch.")
-        if not target.exists() and not self.weights_sidecar_path(target).exists():
+
+        preferred = target
+        if self.config.training.prefer_best_checkpoint:
+            best = self.resolve_best_checkpoint()
+            if best is not None:
+                preferred = best
+
+        if not checkpoint_exists(preferred):
             return LoadResult(False, "No checkpoint found — starting from scratch.")
-        if not self.load():
+        if not self.load(preferred):
             detail = self._last_load_error or "incompatible"
             return LoadResult(
                 False,
                 f"Checkpoint load failed ({detail}) — starting from scratch.",
             )
+        # Keep UI default path aligned with the strongest weights we just loaded.
+        if preferred != target:
+            try:
+                self.save(target)
+                self.save(self.config.training.playable_checkpoint_path)
+            except Exception as exc:
+                print(f"Could not promote preferred checkpoint: {exc}")
         message = (
-            f"Resumed training — {self.progress.episodes_completed} episodes, "
+            f"Resumed from {preferred.name} — "
+            f"{self.progress.episodes_completed} episodes, "
             f"{self.progress.total_steps:,} steps, ε={self.progress.epsilon:.3f}"
         )
         if self.progress.has_baseline:
@@ -865,6 +987,19 @@ class DQNAgent:
         self.epsilon = progress.epsilon
         if not self.config.training.sim_mode:
             self._cap_browser_epsilon()
+            # Strong sim checkpoints should not re-open heavy exploration in the browser.
+            if progress.best_score >= self.config.training.gate_b_score:
+                play_eps = min(
+                    self.epsilon,
+                    self.config.training.browser_epsilon_cap_after_gate_a,
+                    0.06,
+                )
+                if play_eps < self.epsilon:
+                    print(
+                        f"Progress sanitize: epsilon {self.epsilon:.3f}→{play_eps:.3f} "
+                        f"(strong checkpoint)"
+                    )
+                self.epsilon = play_eps
         self.progress.epsilon = self.epsilon
         self.metrics.epsilon = self.epsilon
         self.metrics.total_steps = progress.total_steps
@@ -978,6 +1113,7 @@ class DQNAgent:
             self.sim_replay.update_priorities(batch.sim_indices, td_abs)
         if (
             len(self.demo_replay) > 0
+            and self._vector_dim <= 0
             and (
                 self.curriculum_stage not in {"M0", "M1", "M2"}
                 or self.progress.best_score >= self.config.training.curriculum_stage_a_max

@@ -65,6 +65,37 @@ def save_progress(checkpoint_path: Path, progress: TrainingProgress) -> None:
     )
 
 
+def checkpoint_exists(checkpoint_path: Path) -> bool:
+    weights = checkpoint_path.with_name(f"{checkpoint_path.stem}.weights.h5")
+    return checkpoint_path.exists() or weights.exists()
+
+
+def checkpoint_quality(checkpoint_path: Path) -> tuple[float, int]:
+    """Return (best_score, total_steps) for ranking checkpoints; missing → (-1, -1)."""
+    if not checkpoint_exists(checkpoint_path):
+        return (-1.0, -1)
+    progress = load_progress(checkpoint_path)
+    if progress is None:
+        return (0.0, 0)
+    return (float(progress.best_score), int(progress.total_steps))
+
+
+def prefer_checkpoint(*candidates: Path) -> Path | None:
+    """Pick the strongest existing checkpoint by best_score, then steps."""
+    best_path: Path | None = None
+    best_key = (-1.0, -1)
+    for path in candidates:
+        if path is None:
+            continue
+        key = checkpoint_quality(path)
+        if key[0] < 0:
+            continue
+        if key > best_key:
+            best_key = key
+            best_path = path
+    return best_path
+
+
 def load_progress(checkpoint_path: Path) -> TrainingProgress | None:
     path = meta_path(checkpoint_path)
     if not path.exists():

@@ -147,6 +147,13 @@ def meets_consistency_target(mean_score: float, min_score: float, config: AppCon
     )
 
 
+def meets_reliability_target(mean_score: float, min_score: float, config: AppConfig) -> bool:
+    return (
+        mean_score >= config.training.reliability_mean_score
+        and min_score >= config.training.reliability_min_score
+    )
+
+
 def _empty_training_stats(log_path: Path, *, error: str = "") -> dict[str, float]:
     return {
         "best_score": 0.0,
@@ -200,7 +207,10 @@ def _sim_env_count(config: AppConfig) -> int:
     if config.training.sim_pretrain_envs > 0:
         return config.training.sim_pretrain_envs
     cpus = os.cpu_count() or 8
-    return max(4, min(16, cpus - 2))
+    if config.training.sim_fast_observations:
+        return max(4, min(16, cpus - 2))
+    # Rendered frames are heavier — keep parallelism modest for transfer quality.
+    return max(2, min(6, max(2, cpus // 4)))
 
 
 def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
@@ -213,14 +223,44 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     min_best = config.training.sim_min_best_score
 
     envs = [
-        AscentSimEnv(config, fast_mode=True, env_index=index)
+        AscentSimEnv(
+            config,
+            fast_mode=None,  # honor config.training.sim_fast_observations
+            env_index=index,
+        )
         for index in range(env_count)
     ]
     agent = DQNAgent(config)
     agent.apply_sim_pretrain_profile()
     logger = TrainingLogger(config, "sim")
 
-    if config.training.sim_warmstart_demos and config.demo.use_demos_on_start:
+    resumed = False
+    if config.training.sim_resume_from_best:
+        resume_path = agent.resolve_best_checkpoint()
+        if resume_path is not None and agent.load(resume_path):
+            resumed = True
+            resume_eps = max(
+                float(config.training.sim_resume_epsilon),
+                float(config.training.sim_epsilon_end),
+            )
+            # Resume explores from a low but non-zero ε (do not restart at 1.0).
+            agent.epsilon = resume_eps
+            agent._epsilon_anneal_start = agent.epsilon
+            agent.metrics.epsilon = agent.epsilon
+            agent.progress.epsilon = agent.epsilon
+            msg = (
+                f"Resumed sim pretrain from {resume_path.name} "
+                f"(steps={agent.progress.total_steps}, "
+                f"best={agent.progress.best_score:.0f}, ε={agent.epsilon:.3f})"
+            )
+            print(msg, flush=True)
+            logger.log_note(msg)
+
+    if (
+        not resumed
+        and config.training.sim_warmstart_demos
+        and config.demo.use_demos_on_start
+    ):
         from ascent_player.demo.ingest import ingest_demonstrations
 
         demo_result = ingest_demonstrations(agent, config, replace_buffer=False)
@@ -237,6 +277,7 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
             )
 
     if config.training.sim_warmstart_teacher:
+        # Also allow on resume — aligned-physics restarts often need a fresh teacher buffer.
         teacher_added = warmstart_from_teacher_sync(agent, config)
         if teacher_added:
             print(f"Teacher warm-start added {teacher_added} transitions")
@@ -251,12 +292,22 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     episode = 0
     started = time.perf_counter()
     last_report = 0
-    last_eval = 0
+    eval_every = max(0, config.training.sim_eval_every_steps)
+    last_eval = (
+        agent.metrics.total_steps // eval_every
+        if resumed and eval_every > 0
+        else 0
+    )
     best_eval_mean = 0.0
     consistency_met = False
 
+    obs_mode = (
+        "fast_stick"
+        if config.training.sim_fast_observations
+        else "rendered_browserlike"
+    )
     print(
-        f"Fast sim pretrain: {env_count} envs, batch={agent.batch_size}, "
+        f"Sim pretrain ({obs_mode}): {env_count} envs, batch={agent.batch_size}, "
         f"train_every={agent.train_every}, device={agent.device_message}"
     )
     logger.log_session_start(
@@ -265,6 +316,7 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
             "target_steps": target_steps,
             "env_count": env_count,
             "fast_observations": config.training.sim_fast_observations,
+            "obs_mode": obs_mode,
         },
     )
     print(f"Training log: {logger.path}")
@@ -403,9 +455,12 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                 if eval_metrics.mean_score >= best_eval_mean:
                     best_eval_mean = eval_metrics.mean_score
                     agent.save(config.training.sim_best_eval_checkpoint_path)
+                    agent.save(config.training.playable_checkpoint_path)
+                    agent.save(config.training.checkpoint_path)
                     logger.log_note(
                         f"best_eval_ckpt mean={best_eval_mean:.0f} "
-                        f"-> {config.training.sim_best_eval_checkpoint_path}"
+                        f"-> {config.training.sim_best_eval_checkpoint_path} "
+                        f"(also playable + dqn_latest)"
                     )
                 msg = (
                     f"GATED EVAL ε=0 @ step={metrics.total_steps}: "
@@ -416,8 +471,15 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                 logger.log_note(msg)
                 if "A" in gates:
                     agent.save_sim_checkpoint()
-                # Phase 5 consistency probe with more episodes near the target.
-                if eval_metrics.mean_score >= config.training.gate_c_score:
+                # Probe once mean reaches Gate B (or Gate C), whichever fits the target.
+                probe_threshold = min(
+                    config.training.gate_c_score,
+                    max(
+                        config.training.gate_b_score,
+                        config.training.consistency_mean_score * 0.7,
+                    ),
+                )
+                if eval_metrics.mean_score >= probe_threshold:
                     consistency = evaluate_sim_greedy_sync(
                         agent,
                         config,
@@ -437,6 +499,8 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                         consistency_met = True
                         agent.save_sim_checkpoint()
                         agent.save(config.training.sim_best_eval_checkpoint_path)
+                        agent.save(config.training.playable_checkpoint_path)
+                        agent.save(config.training.checkpoint_path)
                         print("Consistency target met — stopping pretrain early.")
                         logger.log_note("consistency_target_met=true")
     finally:
@@ -535,12 +599,13 @@ async def run_training_no_ui(
                 print(f"Teacher warm-start added {teacher_added} sim transitions")
                 logger.log_note(f"teacher_warmstart={teacher_added}")
         episode = agent.progress.episodes_completed
+        episodes_run = 0
         episode_reward = 0.0
         episode_max_score = 0.0
         prev_step_score = 0.0
         score_velocity = 0.0
         loop_hz = 0.0
-        while max_episodes is None or episode < max_episodes:
+        while max_episodes is None or episodes_run < max_episodes:
             if deadline is not None and time.perf_counter() >= deadline:
                 print(f"Finetune time limit reached ({max_seconds}s)")
                 logger.log_note(f"finetune_timeout={max_seconds}s")
@@ -646,6 +711,7 @@ async def run_training_no_ui(
                 agent.end_episode()
                 agent.maybe_autosave(force=True)
                 episode += 1
+                episodes_run += 1
                 if config.training.transfer_from_sim:
                     transfer_episodes += 1
                 if (

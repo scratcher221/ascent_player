@@ -127,6 +127,7 @@ class TrainingWorker(QThread):
         self.watch_mode = config.training.watch_mode
         self.save_requested = False
         self.load_requested = False
+        self.load_best_requested = False
         self._preview_stride = 4
         self._metrics_stride = 2
         self._train_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dqn-train")
@@ -160,6 +161,9 @@ class TrainingWorker(QThread):
 
     def request_load(self) -> None:
         self.load_requested = True
+
+    def request_load_best(self) -> None:
+        self.load_best_requested = True
 
     def sync_agent_hyperparameters(self, agent: DQNAgent) -> None:
         agent.set_train_every(
@@ -236,11 +240,21 @@ class TrainingWorker(QThread):
                 logger.close(agent)
                 return
 
-            if self.config.demo.use_demos_on_start:
+            if (
+                self.config.demo.use_demos_on_start
+                and not self.watch_mode
+                and not self.config.training.watch_mode
+            ):
                 result = ingest_demonstrations(agent, self.config)
                 if result.transitions_added or result.transitions_skipped:
                     self.status_ready.emit(result.status_message)
                     logger.log_note(f"demo_ingest={result.status_message}")
+            elif self.watch_mode or self.config.training.watch_mode:
+                # Watch must keep loaded weights intact — demo BC would overwrite them.
+                agent.epsilon = 0.0
+                agent.metrics.epsilon = 0.0
+                agent.progress.epsilon = 0.0
+                logger.log_note("watch_mode=skip_demo_ingest")
 
             state = await env.reset()
             episode_reward = 0.0
@@ -257,6 +271,10 @@ class TrainingWorker(QThread):
                 self._collect_train_metrics(agent)
                 if self.load_requested:
                     loaded = agent.load()
+                    if loaded and self.watch_mode:
+                        agent.epsilon = 0.0
+                        agent.metrics.epsilon = 0.0
+                        agent.progress.epsilon = 0.0
                     self.status_ready.emit(
                         "Loaded checkpoint" if loaded else "No checkpoint found"
                     )
@@ -264,6 +282,25 @@ class TrainingWorker(QThread):
                         f"checkpoint_load={'ok' if loaded else 'missing'}"
                     )
                     self.load_requested = False
+                if self.load_best_requested:
+                    best = agent.resolve_best_checkpoint()
+                    loaded = bool(best and agent.load(best))
+                    if loaded and best is not None:
+                        if self.watch_mode:
+                            agent.epsilon = 0.0
+                            agent.metrics.epsilon = 0.0
+                            agent.progress.epsilon = 0.0
+                        agent.save(self.config.training.playable_checkpoint_path)
+                        agent.save(self.config.training.checkpoint_path)
+                        self.status_ready.emit(
+                            f"Loaded best model ({best.name}, "
+                            f"best score {agent.progress.best_score:.0f})"
+                        )
+                        logger.log_note(f"checkpoint_load_best=ok path={best}")
+                    else:
+                        self.status_ready.emit("No best model checkpoint found")
+                        logger.log_note("checkpoint_load_best=missing")
+                    self.load_best_requested = False
                 if self.save_requested:
                     path = agent.save()
                     autosave_message = f"Autosave: saved {path.name}"
@@ -370,7 +407,7 @@ class TrainingWorker(QThread):
                         episode_max_score,
                     )
                     agent.end_episode()
-                    if agent.maybe_autosave(force=True):
+                    if not self.watch_mode and agent.maybe_autosave(force=True):
                         autosave_message = (
                             f"Autosave: episode {agent.progress.episodes_completed} saved"
                         )
@@ -381,14 +418,16 @@ class TrainingWorker(QThread):
                     prev_step_score = 0.0
                     score_velocity = 0.0
                     state = await env.reset()
-                elif agent.maybe_autosave():
+                elif not self.watch_mode and agent.maybe_autosave():
                     autosave_message = f"Autosave: step {metrics.total_steps:,} saved"
         finally:
             self._collect_train_metrics(agent)
             try:
-                path = agent.save()
-                autosave_message = f"Autosave: final save {path.name}"
-                self.status_ready.emit(autosave_message)
+                # Never overwrite trained checkpoints from Watch (eval-only) sessions.
+                if not self.watch_mode:
+                    path = agent.save()
+                    autosave_message = f"Autosave: final save {path.name}"
+                    self.status_ready.emit(autosave_message)
             except Exception:
                 pass
             logger.close(agent)
@@ -462,6 +501,7 @@ class MainWindow(QMainWindow):
         self.session.pause_clicked.connect(self.toggle_pause)
         self.session.save_clicked.connect(self.save_checkpoint)
         self.session.load_clicked.connect(self.load_checkpoint)
+        self.session.load_best_clicked.connect(self.load_best_checkpoint)
         self.session.record_clicked.connect(self.start_recording)
         self.session.stop_record_clicked.connect(self.stop_recording)
         self.session.changed.connect(self.apply_config_from_ui)
@@ -607,6 +647,36 @@ class MainWindow(QMainWindow):
     def load_checkpoint(self) -> None:
         if self.worker is not None:
             self.worker.request_load()
+
+    def load_best_checkpoint(self) -> None:
+        if self.worker is not None:
+            self.worker.request_load_best()
+            return
+        # Idle: promote strongest weights into playable + dqn_latest for next Start.
+        agent = DQNAgent(self.config)
+        path = agent.promote_playable_checkpoint()
+        if path is None:
+            self.status.setText("No best model checkpoint found")
+            QMessageBox.warning(
+                self,
+                "Load best model",
+                "No best_playable / sim_best_eval checkpoint was found.",
+            )
+            return
+        self.status.setText(
+            f"Best model promoted to {path.name} and dqn_latest "
+            f"(best score {agent.progress.best_score:.0f}). "
+            "Start Train or Watch to use it."
+        )
+        self.progress_panel.set_session(
+            f"Best model ready ({path.name}, score {agent.progress.best_score:.0f})"
+        )
+        self.progress_panel.set_best_ever(
+            agent.progress.best_score,
+            agent.progress.best_reward
+            if agent.progress.best_reward != float("-inf")
+            else 0.0,
+        )
 
     def update_metrics(self, metrics: WorkerMetrics) -> None:
         train_ms = "-" if metrics.train_ms is None else f"{metrics.train_ms:.1f}ms"

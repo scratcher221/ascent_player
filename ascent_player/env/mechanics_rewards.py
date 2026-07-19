@@ -64,9 +64,11 @@ class MechanicsRewardTracker:
             reward += self.config.death
             if self.episode_steps < self.config.early_death_steps:
                 reward += self.config.early_death_penalty
-            # Floor-hardening: punish sub-7k deaths so mins climb with peaks.
+            # Floor-hardening: punish sub-1k / sub-7k deaths so mins climb with peaks.
             score = float(state.score or 0.0)
-            if score < 3000:
+            if score < 1000:
+                reward += -2.5
+            elif score < 3000:
                 reward += -2.0
             elif score < 7000:
                 reward += -1.0

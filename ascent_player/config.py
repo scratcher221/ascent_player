@@ -222,7 +222,15 @@ class TrainingConfig:
     train_every_gpu: int = 1
     checkpoint_path: Path = Path("checkpoints/dqn_latest.keras")
     sim_checkpoint_path: Path = Path("checkpoints/sim_pretrained.keras")
+    # Strongest known policy for Watch / resume (promoted on best gated eval).
+    playable_checkpoint_path: Path = Path("checkpoints/best_playable.keras")
+    # Browser ε=0 eval winner — preferred over sim playable for UI Watch.
+    browser_best_checkpoint_path: Path = Path("checkpoints/browser_best.keras")
     auto_load_checkpoint: bool = True
+    # Prefer best-eval / playable over a weak dqn_latest when starting UI or sim.
+    prefer_best_checkpoint: bool = True
+    sim_resume_from_best: bool = True
+    sim_resume_epsilon: float = 0.18
     autosave_every_episodes: int = 1
     autosave_every_steps: int = 250
     baseline_episodes: int = 5
@@ -230,12 +238,16 @@ class TrainingConfig:
     sim_pretrain_steps: int = 0
     transfer_from_sim: bool = False
     transfer_learning_rate: float = 5e-5
-    transfer_epsilon_start: float = 0.5
-    transfer_epsilon_restart: float = 0.45
-    transfer_demo_delay_episodes: int = 12
+    # Keep exploration moderate — 0.5 + frame_skip=2 destroys early landings.
+    transfer_epsilon_start: float = 0.28
+    transfer_epsilon_restart: float = 0.22
+    transfer_demo_delay_episodes: int = 25
     transfer_plateau_episodes: int = 12
     transfer_frame_skip: int = 2
-    browser_epsilon_cap: float = 0.35
+    # After sim, adapt CNN on rendered frames before browser (closes visual gap).
+    transfer_visual_bridge_steps: int = 40_000
+    transfer_seed_sim_replay: int = 4_000
+    browser_epsilon_cap: float = 0.28
     browser_epsilon_floor: float = 0.05
     browser_plateau_epsilon_decay: float = 0.97
     score_sanity_cap: float = 20_000.0
@@ -249,7 +261,7 @@ class TrainingConfig:
     target_detection_min_samples: int = 80
     target_special_min_rate: float = 0.02
     finetune_max_seconds: int = 600
-    mixed_sim_replay_ratio: float = 0.3
+    mixed_sim_replay_ratio: float = 0.25
     sim_epsilon_end: float = 0.03
     sim_epsilon_decay: float = 0.990
     sim_epsilon_anneal_steps: int = 100_000
@@ -258,18 +270,23 @@ class TrainingConfig:
     target_score: int = 10000
     device_mode: DeviceMode = DeviceMode.GPU
     watch_mode: bool = False
-    # Fast headless pretrain: parallel envs, batched inference, lightweight obs.
+    # Headless pretrain: parallel envs, batched inference.
+    # Prefer rendered obs (False) for browser transfer; set True only for speed.
     sim_pretrain_envs: int = 0
     sim_pretrain_train_every: int = 32
     sim_pretrain_batch_size: int = 128
     sim_pretrain_min_replay: int = 256
-    sim_fast_observations: bool = True
+    sim_fast_observations: bool = False
     sim_warmstart_teacher: bool = True
     sim_warmstart_demos: bool = True
     sim_best_eval_checkpoint_path: Path = Path("checkpoints/sim_best_eval.keras")
     consistency_eval_episodes: int = 20
     consistency_mean_score: float = 10000.0
     consistency_min_score: float = 7000.0
+    # Rolling reliability target (ε=0 consecutive evals).
+    reliability_eval_episodes: int = 100
+    reliability_mean_score: float = 5000.0
+    reliability_min_score: float = 1000.0
     log_dir: Path = Path("logs")
     log_interval_steps: int = 500
     log_interval_steps_sim: int = 2500

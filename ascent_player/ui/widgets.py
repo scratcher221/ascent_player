@@ -26,7 +26,8 @@ from PyQt6.QtWidgets import (
 TOOLTIPS = {
     "mode": (
         "Train: the agent explores and updates its neural network.\n"
-        "Watch: the agent plays using the loaded checkpoint with no learning."
+        "Watch: the agent plays using the loaded checkpoint with no learning.\n"
+        "Use Watch (after Load best model) to verify skill — Train scores can look weak due to exploration."
     ),
     "device": (
         "Where TensorFlow runs the network.\n"
@@ -67,8 +68,8 @@ TOOLTIPS = {
         "Higher speeds up wall-clock training but makes control coarser."
     ),
     "use_demos": (
-        "On start, load recorded human demonstrations into the replay buffer\n"
-        "so the agent can imitate good play before (and while) exploring."
+        "On Train start, load recorded human demonstrations into the replay buffer.\n"
+        "Ignored in Watch mode — Watch never runs demo BC so loaded weights stay intact."
     ),
     "auto_launch": (
         "If no Ascent game tab is found on a CDP port, launch Chromium\n"
@@ -109,7 +110,13 @@ TOOLTIPS = {
     "pause": "Temporarily halt the loop without closing the browser.",
     "resume": "Continue the paused training or watch session.",
     "save_ckpt": "Write the current network weights to the checkpoint file now.",
-    "load_ckpt": "Reload weights from the checkpoint file into the running agent.",
+    "load_ckpt": "Reload weights from the default checkpoint (dqn_latest) into the running agent.",
+    "load_best": (
+        "Load the strongest saved policy.\n"
+        "Prefers browser_best (Watch-adapted) when present, else best_playable / sim_best_eval.\n"
+        "Copies into dqn_latest for the next Train/Watch session.\n"
+        "Tip: use Watch mode to verify — Train still explores."
+    ),
     "record": (
         "Record your play in the browser (A / D / Space) as a demonstration\n"
         "that can be loaded on future training starts."
@@ -442,6 +449,7 @@ class SessionControls(QGroupBox):
     pause_clicked = pyqtSignal()
     save_clicked = pyqtSignal()
     load_clicked = pyqtSignal()
+    load_best_clicked = pyqtSignal()
     record_clicked = pyqtSignal()
     stop_record_clicked = pyqtSignal()
     changed = pyqtSignal()
@@ -458,6 +466,7 @@ class SessionControls(QGroupBox):
         self.pause_button = QPushButton("Pause")
         self.save_button = QPushButton("Save checkpoint")
         self.load_button = QPushButton("Load checkpoint")
+        self.load_best_button = QPushButton("Load best model")
         self.record_button = QPushButton("Record demo")
         self.stop_record_button = QPushButton("Stop recording")
         self.use_demos = QCheckBox("Load demonstrations on start")
@@ -468,6 +477,7 @@ class SessionControls(QGroupBox):
         self.pause_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.load_button.setEnabled(False)
+        self.load_best_button.setEnabled(True)
         self.stop_record_button.setEnabled(False)
 
         _apply_tip(self.start_button, "start")
@@ -475,6 +485,7 @@ class SessionControls(QGroupBox):
         _apply_tip(self.pause_button, "pause")
         _apply_tip(self.save_button, "save_ckpt")
         _apply_tip(self.load_button, "load_ckpt")
+        _apply_tip(self.load_best_button, "load_best")
         _apply_tip(self.record_button, "record")
         _apply_tip(self.stop_record_button, "stop_record")
         _apply_tip(self.use_demos, "use_demos")
@@ -499,6 +510,10 @@ class SessionControls(QGroupBox):
         ckpt_row.addWidget(self.save_button, stretch=1)
         ckpt_row.addWidget(self.load_button, stretch=1)
 
+        best_row = QHBoxLayout()
+        best_row.setSpacing(8)
+        best_row.addWidget(self.load_best_button, stretch=1)
+
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
         layout.addLayout(mode_row)
@@ -506,6 +521,7 @@ class SessionControls(QGroupBox):
         layout.addWidget(self.use_demos)
         layout.addLayout(demo_row)
         layout.addLayout(ckpt_row)
+        layout.addLayout(best_row)
 
         self.mode.currentIndexChanged.connect(self._on_mode_changed)
         self.use_demos.toggled.connect(self.changed.emit)
@@ -514,6 +530,7 @@ class SessionControls(QGroupBox):
         self.pause_button.clicked.connect(self.pause_clicked.emit)
         self.save_button.clicked.connect(self.save_clicked.emit)
         self.load_button.clicked.connect(self.load_clicked.emit)
+        self.load_best_button.clicked.connect(self.load_best_clicked.emit)
         self.record_button.clicked.connect(self.record_clicked.emit)
         self.stop_record_button.clicked.connect(self.stop_record_clicked.emit)
         self._refresh_start_label()
@@ -545,6 +562,7 @@ class SessionControls(QGroupBox):
         _apply_tip(self.pause_button, "pause")
         self.save_button.setEnabled(False)
         self.load_button.setEnabled(False)
+        self.load_best_button.setEnabled(True)
         self.record_button.setEnabled(True)
         self.stop_record_button.setEnabled(False)
         self.mode.setEnabled(True)
@@ -557,6 +575,7 @@ class SessionControls(QGroupBox):
         self.pause_button.setEnabled(True)
         self.save_button.setEnabled(True)
         self.load_button.setEnabled(True)
+        self.load_best_button.setEnabled(True)
         self.record_button.setEnabled(False)
         self.stop_record_button.setEnabled(False)
         self.mode.setEnabled(False)
@@ -568,6 +587,7 @@ class SessionControls(QGroupBox):
         self.pause_button.setEnabled(False)
         self.save_button.setEnabled(False)
         self.load_button.setEnabled(False)
+        self.load_best_button.setEnabled(False)
         self.record_button.setEnabled(False)
         self.stop_record_button.setEnabled(True)
         self.mode.setEnabled(False)
