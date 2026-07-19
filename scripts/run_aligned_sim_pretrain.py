@@ -45,6 +45,8 @@ def main() -> int:
     config.training.device_mode = DeviceMode.GPU
     config.training.sim_mode = True
     config.training.sim_fast_observations = False  # rendered ≈ browser preprocess
+    config.training.sim_jpeg_augment = True
+    config.training.sim_jpeg_quality = 0.82
     config.training.sim_pretrain_envs = max(1, args.envs)
     config.training.sim_resume_from_best = True
     config.training.sim_resume_epsilon = 0.20

@@ -277,6 +277,9 @@ class TrainingConfig:
     sim_pretrain_batch_size: int = 128
     sim_pretrain_min_replay: int = 256
     sim_fast_observations: bool = False
+    # JPEG round-trip on rendered sim frames to match browser capture domain.
+    sim_jpeg_augment: bool = True
+    sim_jpeg_quality: float = 0.82
     sim_warmstart_teacher: bool = True
     sim_warmstart_demos: bool = True
     sim_best_eval_checkpoint_path: Path = Path("checkpoints/sim_best_eval.keras")

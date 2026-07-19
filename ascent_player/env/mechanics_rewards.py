@@ -108,7 +108,7 @@ class MechanicsRewardTracker:
     def _falling_penalty(self, previous: FrameState, state: FrameState) -> float:
         if state.orb_vy is None or previous.orb_vy is None:
             return 0.0
-        if state.orb_vy < -0.35 and state.orb_y is not None and state.orb_y > 0.72:
+        if state.orb_vy < -0.35 and state.orb_y is not None and state.orb_y < 0.28:
             return self.config.falling_penalty
         return 0.0
 

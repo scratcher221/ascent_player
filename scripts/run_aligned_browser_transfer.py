@@ -38,6 +38,8 @@ def main() -> int:
     parser.add_argument("--eval-episodes", type=int, default=10)
     parser.add_argument("--target-mean", type=float, default=5000.0)
     parser.add_argument("--target-min", type=float, default=1500.0)
+    parser.add_argument("--bridge-steps", type=int, default=40_000)
+    parser.add_argument("--skip-bridge", action="store_true")
     args = parser.parse_args()
 
     transfer = _load_transfer_mod()
@@ -54,13 +56,18 @@ def main() -> int:
     config.training.transfer_epsilon_start = 0.18
     config.training.browser_epsilon_cap = 0.18
     config.training.learning_rate = 3e-5
+    config.training.sim_jpeg_augment = True
+    config.training.mixed_sim_replay_ratio = 0.15
     config.training.sim_best_eval_checkpoint_path = src
     config.training.sim_checkpoint_path = aligned_latest
+    config.training.playable_checkpoint_path = src
 
     agent = DQNAgent(config)
     assert agent.load(src)
-    # Keep a dedicated copy for the transfer loader without wiping aligned files.
     print(f"ALIGNED_TRANSFER_SEED {src} best={agent.progress.best_score}", flush=True)
+
+    if not args.skip_bridge:
+        transfer._run_visual_bridge(config, args.bridge_steps)
 
     deadline = time.time() + max(600.0, args.hours * 3600.0)
     print(

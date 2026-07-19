@@ -7,9 +7,9 @@ import numpy as np
 
 from ascent_player.config import AppConfig
 from ascent_player.env.game_env import ACTION_LABELS, StepResult
-from ascent_player.env.platform_detector import Platform, nearest_safe_platform
+from ascent_player.env.platform_detector import Platform
 from ascent_player.env.fast_sim_obs import fast_build_observation
-from ascent_player.env.navigation import enrich_navigation
+from ascent_player.env.sim_state_adapter import build_frame_state_from_world
 from ascent_player.env.reward_factory import create_reward_tracker
 from ascent_player.env.sim_physics import SimBooster, SimPlatform, SimPhysicsConfig, SimWorld
 from ascent_player.env.state_detector import FrameState, mask_jump_action
@@ -19,6 +19,7 @@ from ascent_player.utils.preprocessing import (
     append_observation_channels,
     build_observation,
     preprocess_frame,
+    apply_jpeg_augment,
 )
 
 
@@ -149,73 +150,15 @@ def build_platform_mask_from_list(
 
 
 def frame_state_from_world(world: SimWorld, frame_rgb: np.ndarray) -> FrameState:
-    ball = world.ball
-    screen_y = ball.y - world.camera_y
     platforms = [_to_detector_platform(platform, world.camera_y) for platform in world.platforms]
-    platform_dx, platform_dy = nearest_safe_platform(
-        ball.x,
-        screen_y,
-        platforms,
-        frame_rgb.shape,
-    )
-    ndx, ndy, wear, pwidth = world.nearest_platform_below()
-    adx, ady, awear, awidth, atype = world.nearest_platform_above()
-    booster_dx = booster_dy = None
-    booster_type = None
-    best_dist = float("inf")
-    for booster in world.boosters:
-        if booster.used:
-            continue
-        dx = (booster.cx - ball.x) / world.config.width
-        dy = (booster.cy - world.camera_y - screen_y) / world.config.height
-        dist = dx * dx + dy * dy
-        if dist < best_dist:
-            best_dist = dist
-            booster_dx = dx
-            booster_dy = dy
-            booster_type = booster.type
-
-    state = FrameState(
-        orb_x=ball.x,
-        orb_y=screen_y / max(world.config.height, 1.0),
-        orb_vx=ball.vx,
-        orb_vy=ball.vy,
-        score=world.score,
-        boost_level=world.boost_level,
-        can_boost=world.can_boost,
-        nearest_platform_dx=ndx,
-        nearest_platform_dy=ndy,
-        nearest_platform_width=pwidth,
-        platform_wear=wear,
-        nearest_platform_above_dx=adx,
-        nearest_platform_above_dy=ady,
-        nearest_platform_above_width=awidth,
-        nearest_platform_above_wear=awear,
-        nearest_platform_above_type=atype,
-        target_dx=adx if ady < ndy or ndy == 0 else ndx,
-        target_dy=ady if ady < ndy or ndy == 0 else ndy,
-        target_platform_type=atype if ady < ndy or ndy == 0 else "neutral",
-        booster_dx=booster_dx,
-        booster_dy=booster_dy,
-        booster_type=booster_type,
-        combo=world.combo,
-        score_multiplier=world.score_multiplier,
-        bonus=world.bonus,
-        bank_style=world.bank_style,
-        height=world.height,
-        bounces=world.bounces,
-        canvas_w=float(world.config.width),
-        canvas_h=float(world.config.height),
-        agent_hook_ok=True,
-        platform_landed=world.platform_landed,
+    return build_frame_state_from_world(
+        world,
         platform_mask=build_platform_mask_from_list(
             platforms,
             frame_rgb.shape[:2],
             0.0,
         ),
-        game_over=False,
     )
-    return enrich_navigation(state)
 
 
 class AscentSimEnv:
@@ -286,44 +229,16 @@ class AscentSimEnv:
         return visual
 
     def _frame_state_fast(self) -> FrameState:
-        ball = self.world.ball
-        screen_y = ball.y - self.world.camera_y
-        ndx, ndy, wear, pwidth = self.world.nearest_platform_below()
-        adx, ady, awear, awidth, atype = self.world.nearest_platform_above()
-        state = FrameState(
-            orb_x=ball.x / self.world.config.width,
-            orb_y=screen_y / max(self.world.config.height, 1.0),
-            orb_vx=ball.vx,
-            orb_vy=ball.vy,
-            score=self.world.score,
-            boost_level=self.world.boost_level,
-            can_boost=self.world.can_boost,
-            nearest_platform_dx=ndx,
-            nearest_platform_dy=ndy,
-            nearest_platform_width=pwidth,
-            platform_wear=wear,
-            nearest_platform_above_dx=adx,
-            nearest_platform_above_dy=ady,
-            nearest_platform_above_width=awidth,
-            nearest_platform_above_wear=awear,
-            nearest_platform_above_type=atype,
-            target_dx=adx if ady < ndy or ndy == 0 else ndx,
-            target_dy=ady if ady < ndy or ndy == 0 else ndy,
-            target_platform_type=atype if ady < ndy or ndy == 0 else "neutral",
-            combo=self.world.combo,
-            score_multiplier=self.world.score_multiplier,
-            bonus=self.world.bonus,
-            bank_style=self.world.bank_style,
-            height=self.world.height,
-            bounces=self.world.bounces,
-            canvas_w=float(self.world.config.width),
-            canvas_h=float(self.world.config.height),
-            agent_hook_ok=True,
-            platform_landed=self.world.platform_landed,
-            booster_type=self.world.booster_collected,
-            game_over=False,
-        )
-        return enrich_navigation(state)
+        return build_frame_state_from_world(self.world)
+
+    def _render_frame(self) -> np.ndarray:
+        frame = render_sim_frame(self.world)
+        if self.config.training.sim_jpeg_augment:
+            frame = apply_jpeg_augment(
+                frame,
+                quality=self.config.training.sim_jpeg_quality,
+            )
+        return frame
 
     def _build_state(self):
         if self.fast_mode:
@@ -336,7 +251,7 @@ class AscentSimEnv:
             )
             return self._finalize_observation(visual, frame_state)
 
-        frame = render_sim_frame(self.world)
+        frame = self._render_frame()
         frame_state = frame_state_from_world(self.world, frame)
         self._last_frame_state = frame_state
         gray = preprocess_frame(frame, self.config.observation)
@@ -369,7 +284,7 @@ class AscentSimEnv:
             if done:
                 break
 
-        frame = render_sim_frame(self.world)
+        frame = self._render_frame()
         frame_state = frame_state_from_world(self.world, frame)
         frame_state.game_over = done
         self._last_frame_state = frame_state

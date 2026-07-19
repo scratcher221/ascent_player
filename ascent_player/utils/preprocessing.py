@@ -57,6 +57,17 @@ def preprocess_frame(frame_rgb: np.ndarray, config: ObservationConfig) -> np.nda
     return resized.astype(np.float32) / 255.0
 
 
+def apply_jpeg_augment(frame_rgb: np.ndarray, quality: float = 0.82) -> np.ndarray:
+    """Round-trip through JPEG like browser canvas capture."""
+    q = int(max(10, min(100, round(float(quality) * 100))))
+    bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+    if not ok:
+        return frame_rgb
+    decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+
+
 def build_observation(
     frame_rgb: np.ndarray,
     frame_stack: FrameStack,

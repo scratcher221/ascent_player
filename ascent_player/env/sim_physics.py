@@ -146,6 +146,7 @@ class SimWorld:
     booster_timer: float = 0.0
     _spawn_index: int = 0
     _last_platform_x: float = 0.0
+    _pressure_phase: float = 0.0
 
     def __post_init__(self) -> None:
         self.rng = random.Random(self.config.seed)
@@ -170,6 +171,7 @@ class SimWorld:
         self.booster_timer = 0.0
         self._spawn_index = 0
         self._last_platform_x = self.ball.x
+        self._pressure_phase = 0.0
         start_y = self.ball.y
         self.next_platform_y = start_y - 36.0
         # Guaranteed floor + near-center staircase (game.js seedPlatforms).
@@ -385,7 +387,11 @@ class SimWorld:
         ball.x += ball.vx * dt
         ball.y += ball.vy * dt
 
-        regen = cfg.energy_regen_per_sec * (1.0 + max(0.0, cfg.energy_pressure) * 0.45)
+        import math
+
+        self._pressure_phase += dt
+        live_pressure = cfg.energy_pressure + 0.12 * math.sin(self._pressure_phase * 0.15)
+        regen = cfg.energy_regen_per_sec * (1.0 + max(0.0, live_pressure) * 0.45)
         ball.energy = min(100.0, ball.energy + regen * dt)
 
         self._resolve_platform_collisions()
@@ -540,22 +546,11 @@ class SimWorld:
         return self.ball.energy + self.ball.reserve >= self.config.boost_cost
 
     def nearest_platform_below(self) -> tuple[float, float, float, float]:
-        ball = self.ball
-        nearest: SimPlatform | None = None
-        for platform in self.platforms:
-            if platform.cy >= ball.y - 8:
-                continue
-            if nearest is None or platform.cy > nearest.cy:
-                nearest = platform
-        if nearest is None:
-            return 0.0, 0.0, 0.0, 0.0
-        dx = (nearest.cx - ball.x) / max(self.config.width, 1.0)
-        dy = (ball.y - nearest.cy) / max(self.config.height, 1.0)
-        wear = nearest.receptions / max(nearest.bounce_limit, 1)
-        width = nearest.width / max(self.config.width, 1.0)
-        return dx, dy, wear, width
+        """Match game.js nearestPlatformBelow (lower worldY = below orb).
 
-    def nearest_platform_above(self) -> tuple[float, float, float, float, str]:
+        In sim y-down coords, below = larger cy. dy uses game sign:
+        (orb.worldY - plat.worldY) / H → (plat.cy - ball.y) / H when mapped.
+        """
         ball = self.ball
         nearest: SimPlatform | None = None
         for platform in self.platforms:
@@ -564,9 +559,27 @@ class SimWorld:
             if nearest is None or platform.cy < nearest.cy:
                 nearest = platform
         if nearest is None:
-            return 0.0, 0.0, 0.0, 0.0, "neutral"
+            return 0.0, 0.0, 0.0, 0.0
         dx = (nearest.cx - ball.x) / max(self.config.width, 1.0)
         dy = (nearest.cy - ball.y) / max(self.config.height, 1.0)
         wear = nearest.receptions / max(nearest.bounce_limit, 1)
         width = nearest.width / max(self.config.width, 1.0)
-        return dx, dy, wear, width, "neutral"
+        return dx, dy, wear, width
+
+    def nearest_platform_above(self) -> tuple[float, float, float, float, str]:
+        """Match game.js nearestPlatformAbove (higher worldY = above orb)."""
+        ball = self.ball
+        nearest: SimPlatform | None = None
+        for platform in self.platforms:
+            if platform.cy >= ball.y - 8:
+                continue
+            if nearest is None or platform.cy > nearest.cy:
+                nearest = platform
+        if nearest is None:
+            return 0.0, 0.0, 0.0, 0.0, "neutral"
+        dx = (nearest.cx - ball.x) / max(self.config.width, 1.0)
+        dy = (ball.y - nearest.cy) / max(self.config.height, 1.0)
+        wear = nearest.receptions / max(nearest.bounce_limit, 1)
+        width = nearest.width / max(self.config.width, 1.0)
+        ptype = "sell" if nearest.is_hazard else "neutral"
+        return dx, dy, wear, width, ptype

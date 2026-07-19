@@ -429,7 +429,8 @@ def platform_mask_from_agent_payload(
         if not isinstance(plat, dict):
             continue
         world_y = float(plat.get("worldY", 0))
-        screen_y = world_y - camera_y
+        # game.js w2s: H - (worldY - cameraY)
+        screen_y = canvas_h - (world_y - camera_y)
         if screen_y < -30 or screen_y > canvas_h + 30:
             continue
         cx = float(plat.get("x", 0)) * scale_x

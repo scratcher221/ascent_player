@@ -58,6 +58,8 @@ def _run_visual_bridge(config: AppConfig, steps: int) -> None:
     bridge.mechanics_curriculum = config.mechanics_curriculum
     bridge.training.sim_mode = True
     bridge.training.sim_fast_observations = False  # rendered frames ≈ browser preprocess
+    bridge.training.sim_jpeg_augment = True
+    bridge.training.sim_jpeg_quality = 0.82
     bridge.training.sim_resume_from_best = True
     bridge.training.sim_resume_epsilon = 0.10
     bridge.training.sim_pretrain_envs = 4  # rendering is heavier
