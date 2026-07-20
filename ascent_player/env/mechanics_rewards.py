@@ -51,8 +51,8 @@ class MechanicsRewardTracker:
             # Phase 2: ungate climb/score signals early so the policy optimizes score.
             reward += self._score_reward(previous, state) * self._early_score_scale()
             reward += self._height_milestone_reward(state)
-            if self._stage_at_least("M1"):
-                reward += self._approach_reward(previous, state)
+            # Approach from M0 — horizontal closing is core survival, not a later skill.
+            reward += self._approach_reward(previous, state)
             if self._stage_at_least("M2"):
                 reward += self._combo_reward(previous, state)
             if self._stage_at_least("M3"):
@@ -113,11 +113,17 @@ class MechanicsRewardTracker:
         return 0.0
 
     def _steer_reward(self, previous: FrameState, state: FrameState, action: int) -> float:
-        dx = state.target_dx if state.target_dx is not None else state.nearest_platform_dx
+        # While falling, reward steering toward the pad below — not above/booster targets.
+        if state.falling or state.landing_window or state.miss_risk:
+            dx = state.nearest_platform_dx
+        else:
+            dx = state.target_dx if state.target_dx is not None else state.nearest_platform_dx
         if dx is None:
             return 0.0
         reward = 0.0
         gain = self.config.steer_gain
+        if state.falling or state.miss_risk:
+            gain *= 2.0
         if dx < -0.012:
             if action in LEFT_ACTIONS:
                 reward += gain * min(abs(dx) * 6.0, 2.0)
@@ -135,12 +141,16 @@ class MechanicsRewardTracker:
         return reward
 
     def _approach_reward(self, previous: FrameState, state: FrameState) -> float:
-        prev_dx = abs(previous.target_dx or previous.nearest_platform_dx or 1.0)
-        curr_dx = abs(state.target_dx or state.nearest_platform_dx or 1.0)
+        if state.falling or state.landing_window or previous.falling:
+            prev_dx = abs(previous.nearest_platform_dx or 1.0)
+            curr_dx = abs(state.nearest_platform_dx or 1.0)
+        else:
+            prev_dx = abs(previous.target_dx or previous.nearest_platform_dx or 1.0)
+            curr_dx = abs(state.target_dx or state.nearest_platform_dx or 1.0)
         if curr_dx < prev_dx:
-            return 0.04
+            return 0.06
         if curr_dx > prev_dx + 0.02:
-            return -0.03
+            return -0.05
         return 0.0
 
     def _boost_economy_reward(

@@ -22,16 +22,23 @@ class RulePolicy:
     recovery_dx_threshold: float = 0.18
 
     def target_dx(self, state: FrameState) -> float | None:
+        # Survival: always aim at the pad below when falling.
+        if state.falling or state.landing_window or state.miss_risk:
+            if state.nearest_platform_dx is not None:
+                return state.nearest_platform_dx
         if state.target_dx is not None:
             return state.target_dx
-        if state.nearest_platform_above_dx is not None and (state.rising or state.airborne):
+        if state.nearest_platform_above_dx is not None and state.rising:
             return state.nearest_platform_above_dx
         return state.nearest_platform_dx
 
     def target_dy(self, state: FrameState) -> float | None:
+        if state.falling or state.landing_window or state.miss_risk:
+            if state.nearest_platform_dy is not None:
+                return state.nearest_platform_dy
         if state.target_dy is not None:
             return state.target_dy
-        if state.nearest_platform_above_dy is not None and (state.rising or state.airborne):
+        if state.nearest_platform_above_dy is not None and state.rising:
             return state.nearest_platform_above_dy
         return state.nearest_platform_dy
 

@@ -134,6 +134,22 @@ _ENSURE_AGENT_MODE_JS = """
 }
 """
 
+_SET_RUN_SEED_JS = """
+({ seed, lock }) => {
+    window.CHART_TRIAL_CONFIG = window.CHART_TRIAL_CONFIG || {};
+    if (seed == null) {
+        window.CHART_TRIAL_CONFIG.runSeed = null;
+        return null;
+    }
+    window.CHART_TRIAL_CONFIG.runSeed = seed;
+    window.CHART_TRIAL_CONFIG.lockRunSeed = Boolean(lock);
+    if (typeof window.__ASCENT_SET_RUN_SEED__ === "function") {
+        window.__ASCENT_SET_RUN_SEED__(seed);
+    }
+    return seed;
+}
+"""
+
 
 @dataclass(slots=True)
 class HudSnapshot:
@@ -276,6 +292,7 @@ class BrowserBackend:
             pass
         if self.config.agent_mode:
             await self.ensure_agent_mode()
+        await self.ensure_run_seed()
 
     async def ensure_agent_mode(self) -> None:
         self._require_page()
@@ -283,6 +300,27 @@ class BrowserBackend:
             await self.page.evaluate(_ENSURE_AGENT_MODE_JS)
         except Exception:
             pass
+
+    async def ensure_run_seed(self) -> None:
+        """Push BrowserConfig.run_seed into the page before startGame()."""
+        self._require_page()
+        try:
+            await self.page.evaluate(
+                _SET_RUN_SEED_JS,
+                {
+                    "seed": self.config.run_seed,
+                    "lock": self.config.lock_run_seed,
+                },
+            )
+        except Exception:
+            pass
+
+    async def set_run_seed(self, seed: int | None, *, lock: bool | None = None) -> None:
+        """Set/clear the layout seed for the next startGame()."""
+        self.config.run_seed = seed
+        if lock is not None:
+            self.config.lock_run_seed = lock
+        await self.ensure_run_seed()
 
     async def read_agent_state(self) -> dict | None:
         self._require_page()

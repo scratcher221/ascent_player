@@ -303,9 +303,9 @@ class TrainingLogger:
     if frame_state.orb_x is not None and frame_state.orb_y is not None:
       parts.append(f"orb=({frame_state.orb_x:.0f},{frame_state.orb_y:.0f})")
     if frame_state.nearest_platform_dx is not None:
-      parts.append(f"plat_dx={frame_state.nearest_platform_dx:.0f}")
+      parts.append(f"plat_dx={frame_state.nearest_platform_dx:.3f}")
     if frame_state.nearest_platform_dy is not None:
-      parts.append(f"plat_dy={frame_state.nearest_platform_dy:.0f}")
+      parts.append(f"plat_dy={frame_state.nearest_platform_dy:.3f}")
     if frame_state.target_kind is not None:
       parts.append(f"target={frame_state.target_kind}")
     if frame_state.target_dx is not None:

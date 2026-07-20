@@ -69,6 +69,12 @@ def main() -> int:
         action="store_true",
         help="Once-seed rendered sim_replay if empty (only useful with --mixed-sim-ratio>0)",
     )
+    parser.add_argument(
+        "--run-seed",
+        type=int,
+        default=None,
+        help="Fixed game map seed (platforms/boosters). Omit for random layouts.",
+    )
     args = parser.parse_args()
 
     transfer = _load_transfer_mod()
@@ -84,6 +90,10 @@ def main() -> int:
         20_000,
         int(config.training.browser_replay_max_items),
     )
+    if args.run_seed is not None:
+        config.browser.run_seed = int(args.run_seed)
+        config.browser.lock_run_seed = True
+        print(f"FIXED_MAP_SEED {config.browser.run_seed}", flush=True)
 
     browser_best = config.training.browser_best_checkpoint_path
     aligned = Path("checkpoints/aligned_sim_best_eval.keras")
@@ -94,10 +104,25 @@ def main() -> int:
             print("MISSING_BROWSER_BEST", flush=True)
             return 1
         config.training.transfer_from_sim = False
-        config.training.transfer_learning_rate = 1.5e-5
-        config.training.transfer_epsilon_start = 0.12
-        config.training.browser_epsilon_cap = 0.12
-        config.training.learning_rate = 1.5e-5
+        # Stronger learning on a fixed map; FS=1 for tighter steer timing.
+        config.training.frame_skip = 1
+        config.training.transfer_frame_skip = 1
+        config.training.transfer_learning_rate = 4e-5
+        config.training.transfer_epsilon_start = 0.18
+        config.training.transfer_epsilon_restart = 0.15
+        config.training.browser_epsilon_cap = 0.18
+        config.training.browser_epsilon_floor = 0.10
+        config.training.browser_epsilon_cap_after_gate_a = 0.18
+        config.training.learning_rate = 4e-5
+        # Mature checkpoint: keep some rule prior so corrected below-steer teaches fast.
+        config.training.rule_prior_start = 0.25
+        config.training.rule_prior_end = 0.12
+        config.training.rule_prior_steps = 40_000
+        config.demo.use_demos_on_start = False
+        # Stronger horizontal steering pressure.
+        config.mechanics_reward.steer_gain = 0.22
+        config.mechanics_reward.wrong_way_penalty = -0.28
+        config.mechanics_reward.aligned_bonus = 0.04
         agent = DQNAgent(config)
         assert agent.load(browser_best)
         agent.set_learning_rate(config.training.learning_rate)
@@ -138,14 +163,29 @@ def main() -> int:
             flush=True,
         )
 
-    # Floor from env or known plateau so we never clobber a stronger browser_best.
-    if "ASCENT_BROWSER_BEST_MEAN" not in os.environ and browser_best.exists():
-        os.environ["ASCENT_BROWSER_BEST_MEAN"] = "1268"
+    # Floor from env or last promoted Watch mean so we never clobber a stronger browser_best.
+    # Fixed-seed curriculum starts from a seed-relative floor so early map gains can promote.
+    keep_weights = args.run_seed is not None
+    if keep_weights:
+        # Don't use the random-map 1408 floor — seed layouts score differently.
+        os.environ.pop("ASCENT_BROWSER_BEST_MEAN", None)
+        print(
+            "SEED_CURRICULUM keep_weights_on_regress=1 "
+            "(no browser_best restore; compounds dqn_latest)",
+            flush=True,
+        )
+    elif "ASCENT_BROWSER_BEST_MEAN" not in os.environ and browser_best.exists():
+        os.environ["ASCENT_BROWSER_BEST_MEAN"] = "1408.6"
 
     deadline = time.time() + max(600.0, args.hours * 3600.0)
     print(
         f"BROWSER_FRAME_FINETUNE_START hours={args.hours} "
         f"from={args.seed_from} mixed_sim={config.training.mixed_sim_replay_ratio:.3f} "
+        f"run_seed={config.browser.run_seed} "
+        f"eps={config.training.transfer_epsilon_start} "
+        f"lr={config.training.learning_rate} "
+        f"frame_skip={config.training.frame_skip} "
+        f"steer_gain={config.mechanics_reward.steer_gain} "
         f"target_mean>={args.target_mean} target_min>={args.target_min} "
         f"(no visual bridge — real canvas JPEG only)",
         flush=True,
@@ -160,6 +200,7 @@ def main() -> int:
             target_min=args.target_min,
             start_from_browser_best=start_from_browser_best,
             ledger_mode="browser_frame_finetune",
+            keep_weights_on_regress=keep_weights,
         )
     )
 

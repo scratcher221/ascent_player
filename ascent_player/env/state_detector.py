@@ -372,19 +372,29 @@ def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameSta
         frame_state.nearest_platform_above_wear = float(above.get("wear", 0.0))
         frame_state.nearest_platform_above_type = str(above.get("type") or "neutral")
 
-    landing = payload.get("bestLandingPlatform")
-    if isinstance(landing, dict):
-        frame_state.target_dx = float(landing.get("dx", 0.0))
-        frame_state.target_dy = float(landing.get("dy", 0.0))
-        frame_state.target_platform_type = str(landing.get("type") or "neutral")
-        frame_state.target_kind = "platform"
-
+    # Phase before target selection — while falling, always aim at the pad below.
     phase = payload.get("orbPhase")
     if isinstance(phase, dict):
         frame_state.rising = bool(phase.get("rising"))
         frame_state.falling = bool(phase.get("falling"))
         frame_state.landing_window = bool(phase.get("landingWindow"))
         frame_state.airborne = bool(phase.get("airborne"))
+
+    survival_steer = (
+        frame_state.falling
+        or frame_state.landing_window
+        or frame_state.miss_risk
+    )
+    landing = payload.get("bestLandingPlatform")
+    if isinstance(landing, dict) and not survival_steer:
+        frame_state.target_dx = float(landing.get("dx", 0.0))
+        frame_state.target_dy = float(landing.get("dy", 0.0))
+        frame_state.target_platform_type = str(landing.get("type") or "neutral")
+        frame_state.target_kind = "platform"
+    elif survival_steer and frame_state.nearest_platform_dx is not None:
+        frame_state.target_dx = frame_state.nearest_platform_dx
+        frame_state.target_dy = frame_state.nearest_platform_dy
+        frame_state.target_kind = "platform"
 
     if payload.get("timeToPlatform") is not None:
         frame_state.time_to_platform = float(payload["timeToPlatform"])
@@ -396,14 +406,28 @@ def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameSta
         frame_state.danger_worn = bool(danger.get("worn"))
         frame_state.danger_sell = bool(danger.get("sell"))
         frame_state.miss_risk = bool(danger.get("missRisk"))
+        if frame_state.miss_risk and frame_state.nearest_platform_dx is not None:
+            # Re-assert below target after danger merge (miss risk ⇒ survival steer).
+            frame_state.target_dx = frame_state.nearest_platform_dx
+            frame_state.target_dy = frame_state.nearest_platform_dy
+            frame_state.target_kind = "platform"
+            survival_steer = True
 
     booster = payload.get("nearestBooster")
     if isinstance(booster, dict):
         frame_state.booster_dx = float(booster.get("dx", 0.0))
         frame_state.booster_dy = float(booster.get("dy", 0.0))
         frame_state.booster_type = str(booster.get("type") or "")
-        if frame_state.target_kind != "platform" or abs(frame_state.booster_dy or 1) < abs(
-            frame_state.nearest_platform_dy or 1
+        near_pad = abs(frame_state.nearest_platform_dy or 99) < 0.45
+        # Never let boosters steal the landing aim while falling or near a pad.
+        if (
+            not survival_steer
+            and not near_pad
+            and (
+                frame_state.target_kind != "platform"
+                or abs(frame_state.booster_dy or 1)
+                < abs(frame_state.nearest_platform_dy or 1)
+            )
         ):
             frame_state.target_dx = frame_state.booster_dx
             frame_state.target_dy = frame_state.booster_dy

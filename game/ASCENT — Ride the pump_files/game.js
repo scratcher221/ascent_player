@@ -69,6 +69,69 @@ const DEV_UNLOCK_TIERS = window.CHART_TRIAL_CONFIG?.devUnlockTiers
   || (/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)
   && new URLSearchParams(location.search).has("devUnlockTiers"));
 const AGENT_MODE = Boolean(window.CHART_TRIAL_CONFIG?.agentMode);
+
+// ── RUN SEED / LAYOUT RNG ────────────────────────────────────────────────────
+// Deterministic layout for training curriculum. Cosmetics/FX keep Math.random().
+function hashSeedString(value) {
+  const s = String(value);
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function makeRng(seed) {
+  let a = (seed >>> 0) || 1;
+  return function runRnd() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+let runSeed = 0;
+let runRng = Math.random;
+
+function resolveConfiguredRunSeed() {
+  const cfg = window.CHART_TRIAL_CONFIG || {};
+  const fromUrl = new URLSearchParams(location.search).get("runSeed");
+  const raw = fromUrl != null && fromUrl !== "" ? fromUrl : cfg.runSeed;
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  if (Number.isFinite(n)) return (n >>> 0);
+  return hashSeedString(raw);
+}
+
+function beginRunSeed() {
+  let seed = resolveConfiguredRunSeed();
+  if (seed == null) {
+    seed = (Math.random() * 0x100000000) >>> 0;
+  }
+  runSeed = seed >>> 0;
+  runRng = makeRng(runSeed);
+  window.__ASCENT_RUN_SEED__ = runSeed;
+  return runSeed;
+}
+
+/** Layout / gameplay RNG — use instead of Math.random for spawns. */
+function rnd() {
+  return runRng();
+}
+
+window.__ASCENT_SET_RUN_SEED__ = (seed) => {
+  window.CHART_TRIAL_CONFIG = window.CHART_TRIAL_CONFIG || {};
+  window.CHART_TRIAL_CONFIG.runSeed = seed;
+  window.CHART_TRIAL_CONFIG.lockRunSeed = true;
+  return seed;
+};
+
+window.__ASCENT_GET_RUN_SEED__ = () =>
+  window.__ASCENT_RUN_SEED__ ?? resolveConfiguredRunSeed();
+
 const LB_MAX         = 10;
 const LB_ARCHIVE_MAX = 1000; // mirrors worker LEADERBOARD_ARCHIVE_MAX; ranks beyond it are unknown
 const PLAYER_NAME_KEY = "ascent-player-name";
@@ -1554,17 +1617,17 @@ function seedPlatforms() {
 
   // Guaranteed wide platform directly under orb start
   const sw = gs * 180;
-  platforms.push(neutralPlatform({ worldY:baseY - 14, x:W/2 - sw/2, width:sw, bounce:1.0, age:0, seed:Math.random() },sessionGameplay.platforms.baseBounceLimit));
+  platforms.push(neutralPlatform({ worldY:baseY - 14, x:W/2 - sw/2, width:sw, bounce:1.0, age:0, seed:rnd() },sessionGameplay.platforms.baseBounceLimit));
 
   // Build a guaranteed reachable staircase near the center,
   // alternating offset so the player needs light steering but always has a target.
   const offsets = [0, -0.18, 0.18, -0.12, 0.12, 0, -0.2, 0.2, -0.08, 0.08, 0, -0.16, 0.16, 0, -0.1, 0.1, 0, 0];
   for (let i = 0; i < 18; i++) {
     const worldY = baseY + gs * 80 + i * step;
-    const width  = gs * (90 + Math.random() * 70);   // wider than before
+    const width  = gs * (90 + rnd() * 70);   // wider than before
     const cx     = W / 2 + offsets[i] * W;            // near-center X
     const x      = Math.max(margin, Math.min(W - width - margin, cx - width / 2));
-    platforms.push(neutralPlatform({ worldY, x, width, bounce:0.95 + Math.random() * 0.18, age:0, seed:Math.random() },sessionGameplay.platforms.baseBounceLimit));
+    platforms.push(neutralPlatform({ worldY, x, width, bounce:0.95 + rnd() * 0.18, age:0, seed:rnd() },sessionGameplay.platforms.baseBounceLimit));
   }
 }
 
@@ -1577,19 +1640,19 @@ function spawnLivePlatforms(pressure) {
   const width = gs * Math.max(70, Math.min(180, 90 + absPrs * 170));
   const bounce = Math.max(0.9, Math.min(2.2, 1.0 + absPrs * 0.8));
   const margin = 22;
-  const x      = margin + Math.random() * (W - width - margin * 2);
-  const worldY = baseY + Math.random() * H * 0.45;
+  const x      = margin + rnd() * (W - width - margin * 2);
+  const worldY = baseY + rnd() * H * 0.45;
 
-  platforms.push({ worldY, x, width, bounce, type:"buy", age:0, seed:Math.random() });
+  platforms.push({ worldY, x, width, bounce, type:"buy", age:0, seed:rnd() });
 
   // Strong buy surge → second platform formation
   if (pressure > 1.0) {
     platforms.push({
-      worldY: worldY + 50 + Math.random() * 40,
+      worldY: worldY + 50 + rnd() * 40,
       x: W - x - width - 10,
       width: width * 0.65,
       bounce: bounce * 1.12,
-      type: "buy", age:0, seed:Math.random()
+      type: "buy", age:0, seed:rnd()
     });
   }
 }
@@ -1607,13 +1670,13 @@ function ensureNeutralCoverage() {
   for (let i = 0; i < needed; i++) {
     const spawnMin = Math.max(cameraY + H * 0.55, orb.worldY - H * 0.18);
     const spawnMax = Math.max(spawnMin + gs * 90, hi);
-    const worldY = spawnMin + Math.random() * (spawnMax - spawnMin);
+    const worldY = spawnMin + rnd() * (spawnMax - spawnMin);
     const shrink = sl * 10;
-    const width  = gs * Math.max(25, (80 - shrink) + Math.random() * 60);
+    const width  = gs * Math.max(25, (80 - shrink) + rnd() * 60);
     const margin = 22;
-    const x = margin + Math.random() * (W - width - margin * 2);
+    const x = margin + rnd() * (W - width - margin * 2);
     platforms.push(neutralPlatform(
-      { worldY, x, width, bounce: 0.95 + Math.random() * 0.15, age: 0, seed: Math.random() },
+      { worldY, x, width, bounce: 0.95 + rnd() * 0.15, age: 0, seed: rnd() },
       Math.max(1, sessionGameplay.platforms.baseBounceLimit - sl)
     ));
   }
@@ -1623,13 +1686,13 @@ function spawnNotableBuyPlatform(strength) {
   const { width, bounce } = notableBuyPlatformStats(strength,gs);
   const margin = 22;
   platforms.push({
-    worldY:cameraY+H*(.72+Math.random()*.82),
-    x:margin+Math.random()*(W-width-margin*2),
+    worldY:cameraY+H*(.72+rnd()*.82),
+    x:margin+rnd()*(W-width-margin*2),
     width,
     bounce,
     type:"buy",
     age:0,
-    seed:Math.random()
+    seed:rnd()
   });
 }
 
@@ -1649,7 +1712,7 @@ function mkBooster(type,x,worldY) {
   const widthScale = type === "drag" ? 1 - 0.15 * narrowScreenRamp() : 1 - difficulty * .25;
   const baseWidth = type === "stream" ? gs*64 : type === "surge" ? gs*30 : gs*150;
   const booster = {
-    type,x,worldY,age:0,used:false,entered:false,phase:Math.random()*7,
+    type,x,worldY,age:0,used:false,entered:false,phase:rnd()*7,
     w:baseWidth * config.size * widthScale,
     h:gs*16
   };
@@ -1657,11 +1720,15 @@ function mkBooster(type,x,worldY) {
   return booster;
 }
 
-function spawnBooster(worldY = cameraY + H * (1.05 + Math.random() * .55)) {
-  const type = pickBoosterType(boosterWeights(sessionGameplay.boosters,livePressure,boosterRunHeight(),H));
+function spawnBooster(worldY) {
+  if (worldY === undefined) worldY = cameraY + H * (1.05 + rnd() * .55);
+  const type = pickBoosterType(
+    boosterWeights(sessionGameplay.boosters, livePressure, boosterRunHeight(), H),
+    rnd()
+  );
   const margin = 40;
   const booster = mkBooster(type,W/2,worldY);
-  booster.x = Math.max(margin + booster.w/2,Math.min(W - margin - booster.w/2,margin + Math.random() * (W - margin*2)));
+  booster.x = Math.max(margin + booster.w/2,Math.min(W - margin - booster.w/2,margin + rnd() * (W - margin*2)));
   boosters.push(booster);
 }
 
@@ -1758,7 +1825,7 @@ function updateBoosters(dt) {
         width:booster.w,
         bounce:1.0,
         age:0,
-        seed:Math.random()
+        seed:rnd()
       },sessionGameplay.platforms.baseBounceLimit));
     } else {
       orb.vy = Math.min(MAX_ORB_VY,Math.max(orb.vy,60) + config.boost);
@@ -1850,11 +1917,11 @@ function initAnomalyTestPanel() {
 
 function makeShortSqueezeHazards(count) {
   return Array.from({ length: count }, (_, index) => ({
-    x: W * (0.18 + index * (0.64 / Math.max(1, count - 1))) + (Math.random() - 0.5) * W * 0.12,
-    worldY: cameraY + H * (0.85 + Math.random() * 0.7),
-    r: gs * (16 + Math.random() * 7),
-    speed: gs * (250 + Math.random() * 150),
-    phase: Math.random() * 7
+    x: W * (0.18 + index * (0.64 / Math.max(1, count - 1))) + (rnd() - 0.5) * W * 0.12,
+    worldY: cameraY + H * (0.85 + rnd() * 0.7),
+    r: gs * (16 + rnd() * 7),
+    speed: gs * (250 + rnd() * 150),
+    phase: rnd() * 7
   }));
 }
 
@@ -1862,16 +1929,16 @@ function makeLiquidityVoidHazards(count, portal) {
   return Array.from({ length: count }, (_, index) => {
     const lane = (index + 1) / (count + 1);
     // Spread across the frozen chamber band (camera-relative), not above the orb.
-    const worldY = cameraY + H * (0.12 + lane * 0.74) + (Math.random() - 0.5) * H * 0.12;
+    const worldY = cameraY + H * (0.12 + lane * 0.74) + (rnd() - 0.5) * H * 0.12;
     return {
       kind: "voidShard",
-      x: Math.max(gs * 34, Math.min(W - gs * 34, portal.x + (Math.random() - 0.5) * W * 0.86)),
+      x: Math.max(gs * 34, Math.min(W - gs * 34, portal.x + (rnd() - 0.5) * W * 0.86)),
       worldY,
-      r: gs * (13 + Math.random() * 8),
-      vx: gs * ((Math.random() - 0.5) * 52),
-      vy: gs * ((Math.random() - 0.5) * 36),
-      spin: (Math.random() - 0.5) * 2.4,
-      phase: Math.random() * 7
+      r: gs * (13 + rnd() * 8),
+      vx: gs * ((rnd() - 0.5) * 52),
+      vy: gs * ((rnd() - 0.5) * 36),
+      spin: (rnd() - 0.5) * 2.4,
+      phase: rnd() * 7
     };
   });
 }
@@ -1882,10 +1949,10 @@ function makeLiquidityVoidPortal() {
   // on-screen, in the upper band and horizontally offset to force the player to
   // navigate toward it rather than just flying up.
   return {
-    x: Math.max(radius + gs * 24, Math.min(W - radius - gs * 24, orb.x + (Math.random() - 0.5) * W * 0.46)),
-    worldY: cameraY + H * (0.62 + Math.random() * 0.26),
+    x: Math.max(radius + gs * 24, Math.min(W - radius - gs * 24, orb.x + (rnd() - 0.5) * W * 0.46)),
+    worldY: cameraY + H * (0.62 + rnd() * 0.26),
     r: radius,
-    phase: Math.random() * 7
+    phase: rnd() * 7
   };
 }
 
@@ -1899,7 +1966,7 @@ function runElapsedSeconds() {
 
 // Flat 25–35 s gap between anomalies — same on every tier and the first anomaly too.
 function anomalyTimeRange() {
-  return 25 + Math.random() * 10;
+  return 25 + rnd() * 10;
 }
 
 function resetAutoAnomalySchedule() {
@@ -1916,7 +1983,7 @@ function scheduleNextAutoAnomaly() {
 function maybeTriggerAutoAnomaly() {
   if (activeAnomaly || state !== "playing" || anomalyMinDelay > 0) return;
   if (runElapsedSeconds() < nextAnomalyAt) return;
-  const type = ANOMALY_TYPES[Math.floor(Math.random() * ANOMALY_TYPES.length)];
+  const type = ANOMALY_TYPES[Math.floor(rnd() * ANOMALY_TYPES.length)];
   triggerAnomaly(type, { auto: true });
 }
 
@@ -2065,7 +2132,7 @@ function applyShortSqueezeHit(hazard) {
   breakCombo();
   updateEnergyBar();
   hazard.worldY = cameraY + H * 1.35;
-  hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + Math.random() * (W - hazard.r * 2)));
+  hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + rnd() * (W - hazard.r * 2)));
   const sy = w2s(orb.worldY);
   burst(orb.x, sy, "#ff4d6d", isMobile ? 10 : 22, { spread: 120, up: 40, size: 3.5 });
   shockwaves.push({ x: orb.x, y: sy, r: 0, life: 0.6 });
@@ -2075,13 +2142,13 @@ function applyShortSqueezeHit(hazard) {
 }
 
 function resetVoidShard(hazard) {
-  hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + Math.random() * (W - hazard.r * 2)));
+  hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + rnd() * (W - hazard.r * 2)));
   // Respawn inside the frozen chamber band so no shard reappears off-screen.
-  hazard.worldY = cameraY + H * (0.08 + Math.random() * 0.87);
-  hazard.vx = gs * ((Math.random() - 0.5) * 52);
-  hazard.vy = gs * ((Math.random() - 0.5) * 36);
-  hazard.spin = (Math.random() - 0.5) * 2.4;
-  hazard.phase = Math.random() * 7;
+  hazard.worldY = cameraY + H * (0.08 + rnd() * 0.87);
+  hazard.vx = gs * ((rnd() - 0.5) * 52);
+  hazard.vy = gs * ((rnd() - 0.5) * 36);
+  hazard.spin = (rnd() - 0.5) * 2.4;
+  hazard.phase = rnd() * 7;
 }
 
 function applyVoidShardHit(hazard) {
@@ -2137,8 +2204,8 @@ function updateAnomaly(dt) {
     for (const hazard of anomalyHazards) {
       hazard.worldY -= hazard.speed * dt;
       if (hazard.worldY < cameraY - H * 0.2) {
-        hazard.worldY = cameraY + H * (1.05 + Math.random() * 0.7);
-        hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + Math.random() * (W - hazard.r * 2)));
+        hazard.worldY = cameraY + H * (1.05 + rnd() * 0.7);
+        hazard.x = Math.max(hazard.r, Math.min(W - hazard.r, hazard.r + rnd() * (W - hazard.r * 2)));
       }
       const dx = orb.x - hazard.x;
       const dy = orb.worldY - hazard.worldY;
@@ -2970,10 +3037,13 @@ function exportAgentState() {
     }
     return best;
   };
-  const bestLandingPlatform = pickTarget([nearestPlatformAbove, nearestPlatformBelow]);
   const vy = orb.vy ?? 0;
   const rising = vy > 20;
   const falling = vy < -20;
+  // While falling, best landing is always the pad below (not a nearer above pad).
+  const bestLandingPlatform = falling
+    ? (nearestPlatformBelow || nearestPlatformAbove)
+    : pickTarget([nearestPlatformAbove, nearestPlatformBelow]);
   const landingWindow = falling && nearestPlatformBelow
     && nearestPlatformBelow.dy > 0.05 && nearestPlatformBelow.dy < 0.35;
   let timeToPlatform = 0;
@@ -3008,6 +3078,7 @@ function exportAgentState() {
   }
   window.__ASCENT_AGENT__ = {
     state,
+    runSeed,
     orb: {
       x: orb.x,
       worldY: orb.worldY,
@@ -5706,13 +5777,13 @@ function applyUltiImmediate(ultiTier) {
       const zones = [margin, W/2 - bw/2, W - bw - margin];
       for (let i = 0; i < 3; i++) {
         platforms.push({
-          worldY: orb.worldY + 90 + i * 95 + Math.random() * 30,
-          x: Math.max(margin, Math.min(W - bw - margin, zones[i] + (Math.random() - 0.5) * 20)),
+          worldY: orb.worldY + 90 + i * 95 + rnd() * 30,
+          x: Math.max(margin, Math.min(W - bw - margin, zones[i] + (rnd() - 0.5) * 20)),
           width: bw,
-          bounce: 1.2 + Math.random() * 0.2,
+          bounce: 1.2 + rnd() * 0.2,
           type: 'buy',
           age: 0,
-          seed: Math.random(),
+          seed: rnd(),
         });
       }
       break;
@@ -6057,6 +6128,7 @@ function startGame() {
   updateUltiHud();
   sessionGameplay = structuredClone(gameplayConfig);
   sessionTrend = trendStrength(marketTrendPct,sessionGameplay.trend);
+  beginRunSeed();
   seedPlatforms();
   resetOrb();
   magnetParticles = [];

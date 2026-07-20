@@ -20,6 +20,30 @@ def platform_type_onehot(platform_type: str | None) -> tuple[float, float, float
 
 def enrich_navigation(state: "FrameState") -> "FrameState":
     """Fill derived navigation fields when platform targets are known."""
+    vx = state.orb_vx or 0.0
+    vy = state.orb_vy or 0.0
+    # Prefer agent-hook phase when present; otherwise derive from velocity.
+    if not state.falling and not state.rising:
+        state.rising = vy > 20.0
+        state.falling = vy < -20.0
+    else:
+        # Keep hook phase but refresh if velocity strongly disagrees.
+        if vy < -20.0:
+            state.falling = True
+            state.rising = False
+        elif vy > 20.0:
+            state.rising = True
+            state.falling = False
+    state.airborne = abs(vy) > 20.0 or (state.nearest_platform_dy or 1.0) > 0.08
+    state.landing_window = state.falling and 0.05 < (state.nearest_platform_dy or 0.0) < 0.35
+
+    # While falling, lock aim to the pad below — never above/booster.
+    if state.falling or state.landing_window:
+        if state.nearest_platform_dx is not None:
+            state.target_dx = state.nearest_platform_dx
+            state.target_dy = state.nearest_platform_dy
+            state.target_kind = "platform"
+
     target_dx = state.target_dx
     if target_dx is None:
         target_dx = state.nearest_platform_above_dx
@@ -36,13 +60,6 @@ def enrich_navigation(state: "FrameState") -> "FrameState":
     if target_dy is not None:
         state.target_dy = target_dy
 
-    vx = state.orb_vx or 0.0
-    vy = state.orb_vy or 0.0
-    state.rising = vy > 20.0
-    state.falling = vy < -20.0
-    state.airborne = abs(vy) > 20.0 or (state.nearest_platform_dy or 1.0) > 0.08
-    state.landing_window = state.falling and 0.05 < (state.nearest_platform_dy or 0.0) < 0.35
-
     if target_dx is not None:
         state.horizontal_error = target_dx
     elif state.orb_x is not None:
@@ -51,10 +68,11 @@ def enrich_navigation(state: "FrameState") -> "FrameState":
     wear = max(state.platform_wear, state.nearest_platform_above_wear)
     state.danger_worn = wear >= 0.85
     state.danger_sell = state.target_platform_type == "sell" or state.nearest_platform_above_type == "sell"
+    below_dx = state.nearest_platform_dx if state.nearest_platform_dx is not None else target_dx
     state.miss_risk = (
         state.falling
-        and target_dx is not None
-        and abs(target_dx) > 0.18
+        and below_dx is not None
+        and abs(below_dx) > 0.18
         and (state.nearest_platform_dy or 0.0) < 0.4
     )
 

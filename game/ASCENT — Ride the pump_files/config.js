@@ -7,6 +7,13 @@ window.CHART_TRIAL_CONFIG = {
   devUnlockTiers: true,
   // Training runs on tier 0 (GENESIS) until the agent curriculum unlocks higher tiers.
   trainingTierIndex: 0,
+  // Map / layout seed. null = fresh random seed each run (default gameplay).
+  // Set to an integer (or string) for a reproducible platform/booster layout.
+  // URL ?runSeed=12345 overrides this. Agents can also call __ASCENT_SET_RUN_SEED__.
+  runSeed: null,
+  // If true and runSeed is set, every startGame() reuses the same seed.
+  // If false with a fixed runSeed, still uses that seed each run (deterministic).
+  lockRunSeed: true,
 };
 
 /* ── Radix / ASCENT constants (kept for shop UI labels; wallet is stubbed offline) ── */

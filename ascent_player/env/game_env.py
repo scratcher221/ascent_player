@@ -98,6 +98,7 @@ class AscentGameEnv:
             await self.backend.select_training_tier(
                 self.config.mechanics_curriculum.training_tier_index
             )
+        await self.backend.ensure_run_seed()
         await self._start_or_restart()
         frame, hud = await self._capture_turn()
         frame_state = await self._detect_state(frame, hud)
@@ -251,6 +252,8 @@ class AscentGameEnv:
         for key in list(self.held_keys):
             try:
                 await self.backend.key_up(key)
+            except Exception:
+                pass
             finally:
                 self.held_keys.discard(key)
 

@@ -999,14 +999,18 @@ class DQNAgent:
         self.epsilon = progress.epsilon
         if not self.config.training.sim_mode:
             self._cap_browser_epsilon()
-            # Strong sim checkpoints should not re-open heavy exploration in the browser.
+            # Strong checkpoints: keep exploration modest, but respect floor/cap
+            # (hardcoding 0.06 fought fine-tune floors and stalled map learning).
             if progress.best_score >= self.config.training.gate_b_score:
                 play_eps = min(
                     self.epsilon,
                     self.config.training.browser_epsilon_cap_after_gate_a,
-                    0.06,
                 )
-                if play_eps < self.epsilon:
+                play_eps = max(
+                    self.config.training.browser_epsilon_floor,
+                    min(play_eps, self.config.training.browser_epsilon_cap),
+                )
+                if abs(play_eps - self.epsilon) > 1e-6:
                     print(
                         f"Progress sanitize: epsilon {self.epsilon:.3f}→{play_eps:.3f} "
                         f"(strong checkpoint)"

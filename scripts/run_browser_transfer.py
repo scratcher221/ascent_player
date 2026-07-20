@@ -119,6 +119,7 @@ async def _transfer_loop(
     target_min: float,
     start_from_browser_best: bool = False,
     ledger_mode: str = "transfer_watch",
+    keep_weights_on_regress: bool = False,
 ) -> int:
     best_eval_mean = -1.0
     round_id = 0
@@ -219,7 +220,11 @@ async def _transfer_loop(
 
         # Promote only when mean improves and min clears the floor (mean ∧ min).
         promote_min_floor = float(config.training.sim_eval_promote_min) * 0.6
-        if mean > best_eval_mean and emin >= promote_min_floor:
+        if (
+            not keep_weights_on_regress
+            and mean > best_eval_mean
+            and emin >= promote_min_floor
+        ):
             best_eval_mean = mean
             agent = DQNAgent(config)
             if agent.load(config.training.checkpoint_path):
@@ -228,6 +233,32 @@ async def _transfer_loop(
                     f"PERSISTED_BROWSER_BEST mean={mean:.0f} min={emin:.0f} -> {path.name}",
                     flush=True,
                 )
+        elif keep_weights_on_regress:
+            # Fixed-seed / curriculum: keep dqn_latest so map learning compounds.
+            # Do NOT write browser_best (protects the random-map elite).
+            if mean > best_eval_mean:
+                best_eval_mean = mean
+                # Persist working weights only.
+                agent = DQNAgent(config)
+                if agent.load(config.training.checkpoint_path):
+                    agent.save(config.training.checkpoint_path)
+                print(
+                    f"TRANSFER_SEED_BEST mean={mean:.1f} min={emin:.1f} "
+                    f"(kept weights, no browser_best write)",
+                    flush=True,
+                )
+                # Reward progress: hold LR/ε so learning stays aggressive.
+                print(f"TRANSFER_HOLD lr={lr:.2e} eps={eps:.3f}", flush=True)
+            else:
+                print(
+                    f"TRANSFER_KEEP mean={mean:.1f} min={emin:.1f} "
+                    f"seed_best={best_eval_mean:.1f} (no restore)",
+                    flush=True,
+                )
+                # Only cool after a flat/worse eval.
+                lr = max(2e-5, lr * 0.95)
+                eps = max(0.10, eps * 0.97)
+                print(f"TRANSFER_COOL lr={lr:.2e} eps={eps:.3f}", flush=True)
         else:
             # Regression: roll back to browser_best and cool exploration/LR.
             print(

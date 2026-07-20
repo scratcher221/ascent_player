@@ -54,6 +54,10 @@ class BrowserConfig:
     capture_max_height: int = 360
     capture_jpeg_quality: float = 0.82
     chromium_args: tuple[str, ...] = field(default_factory=default_chromium_args)
+    # Fixed map seed for curriculum. None = game picks a fresh seed each run.
+    # Applied via CHART_TRIAL_CONFIG / __ASCENT_SET_RUN_SEED__ before play.
+    run_seed: int | None = None
+    lock_run_seed: bool = True
 
 
 @dataclass(slots=True)
