@@ -216,7 +216,9 @@ def _sim_env_count(config: AppConfig) -> int:
 def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
     """Fast vectorized simulator pretraining (sync, batched inference)."""
     config.training.sim_mode = True
-    config.training.frame_skip = 1
+    # Bulk pretrain stays FS=1 for speed; visual bridge keeps transfer_frame_skip.
+    if not config.training.sim_keep_frame_skip:
+        config.training.frame_skip = 1
     env_count = _sim_env_count(config)
     target_steps = steps or config.training.sim_pretrain_steps or 500_000
     max_steps = int(target_steps * config.training.sim_max_steps_multiplier)
@@ -299,6 +301,7 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
         else 0
     )
     best_eval_mean = 0.0
+    best_eval_min = 0.0
     consistency_met = False
 
     obs_mode = (
@@ -452,13 +455,30 @@ def run_sim_pretrain(config: AppConfig, steps: int | None = None) -> None:
                     config,
                 )
                 gate_label = ",".join(gates) if gates else "none"
-                if eval_metrics.mean_score >= best_eval_mean:
+                promote_min_floor = float(config.training.sim_eval_promote_min)
+                min_ok = (
+                    eval_metrics.min_score >= best_eval_min
+                    if best_eval_mean > 0
+                    else eval_metrics.min_score >= 0
+                )
+                floor_ok = (
+                    best_eval_mean <= 0
+                    or eval_metrics.min_score >= promote_min_floor
+                    or eval_metrics.min_score >= best_eval_min
+                )
+                if (
+                    eval_metrics.mean_score > best_eval_mean
+                    and min_ok
+                    and floor_ok
+                ):
                     best_eval_mean = eval_metrics.mean_score
+                    best_eval_min = float(eval_metrics.min_score)
                     agent.save(config.training.sim_best_eval_checkpoint_path)
                     agent.save(config.training.playable_checkpoint_path)
                     agent.save(config.training.checkpoint_path)
                     logger.log_note(
                         f"best_eval_ckpt mean={best_eval_mean:.0f} "
+                        f"min={best_eval_min:.0f} "
                         f"-> {config.training.sim_best_eval_checkpoint_path} "
                         f"(also playable + dqn_latest)"
                     )
@@ -542,6 +562,24 @@ async def run_training_no_ui(
     agent = DQNAgent(config)
     load_result = agent.try_autoload()
     print(load_result.message)
+    if not config.training.sim_mode:
+        replay_path = config.training.browser_replay_path
+        loaded = agent.replay.load_pickle(
+            replay_path,
+            max_items=config.training.browser_replay_max_items,
+        )
+        if loaded:
+            print(f"Loaded {loaded} browser replay transitions from {replay_path.name}")
+            # Decay mixed sim replay as browser experience accumulates.
+            fill = min(1.0, loaded / max(1, config.training.browser_replay_max_items))
+            config.training.mixed_sim_replay_ratio = max(
+                0.05,
+                float(config.training.mixed_sim_replay_ratio) * (1.0 - 0.6 * fill),
+            )
+            print(
+                f"mixed_sim_replay_ratio→{config.training.mixed_sim_replay_ratio:.3f} "
+                f"(browser_replay fill={fill:.2f})"
+            )
     logger.log_session_start(
         agent,
         message=load_result.message,
@@ -743,6 +781,16 @@ async def run_training_no_ui(
         removed = agent.trim_replay_buffers()
         if removed:
             print(f"Trimmed {removed} replay transitions")
+        if not config.training.sim_mode:
+            saved = agent.replay.save_pickle(
+                config.training.browser_replay_path,
+                max_items=config.training.browser_replay_max_items,
+            )
+            if saved:
+                print(
+                    f"Saved {saved} browser replay transitions -> "
+                    f"{config.training.browser_replay_path}"
+                )
         release_gpu_between_runs()
         agent.save()
         await env.close()
@@ -757,6 +805,7 @@ async def run_training_no_ui(
         "episodes": float(agent.progress.episodes_completed),
         "log_path": str(logger.path),
         "epsilon": agent.epsilon,
+        "total_steps": float(agent.progress.total_steps),
         "demo_replay_size": float(len(agent.demo_replay)),
         "curriculum_stage": float(
             int(agent.curriculum_stage[1:])

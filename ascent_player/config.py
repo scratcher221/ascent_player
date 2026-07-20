@@ -280,9 +280,19 @@ class TrainingConfig:
     # JPEG round-trip on rendered sim frames to match browser capture domain.
     sim_jpeg_augment: bool = True
     sim_jpeg_quality: float = 0.82
+    # When True, run_sim_pretrain keeps config.frame_skip (bridge uses FS=2).
+    sim_keep_frame_skip: bool = False
+    # Promote sim_best_eval only when ε=0 mean improves and min clears this floor
+    # (after the first promote, min must also beat the previous best's min).
+    sim_eval_promote_min: float = 1000.0
     sim_warmstart_teacher: bool = True
     sim_warmstart_demos: bool = True
     sim_best_eval_checkpoint_path: Path = Path("checkpoints/sim_best_eval.keras")
+    # Overnight: continue from dqn_latest (working), elite lives in browser_best.
+    overnight_prefer_latest: bool = True
+    browser_replay_path: Path = Path("checkpoints/browser_replay.pkl")
+    browser_replay_max_items: int = 20_000
+    skill_ledger_path: Path = Path("logs/skill_ledger.csv")
     consistency_eval_episodes: int = 20
     consistency_mean_score: float = 10000.0
     consistency_min_score: float = 7000.0

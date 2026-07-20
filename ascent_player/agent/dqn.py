@@ -908,7 +908,15 @@ class DQNAgent:
             return LoadResult(False, "Auto-load disabled — starting from scratch.")
 
         preferred = target
-        if self.config.training.prefer_best_checkpoint:
+        if self.config.training.overnight_prefer_latest and not self.config.training.sim_mode:
+            # Overnight working weights: continue dqn_latest; elite is browser_best.
+            if checkpoint_exists(target):
+                preferred = target
+            elif self.config.training.prefer_best_checkpoint:
+                best = self.resolve_best_checkpoint()
+                if best is not None:
+                    preferred = best
+        elif self.config.training.prefer_best_checkpoint:
             best = self.resolve_best_checkpoint()
             if best is not None:
                 preferred = best
@@ -922,7 +930,11 @@ class DQNAgent:
                 f"Checkpoint load failed ({detail}) — starting from scratch.",
             )
         # Keep UI default path aligned with the strongest weights we just loaded.
-        if preferred != target:
+        # Overnight mode: do NOT overwrite dqn_latest with browser_best.
+        if (
+            preferred != target
+            and not self.config.training.overnight_prefer_latest
+        ):
             try:
                 self.save(target)
                 self.save(self.config.training.playable_checkpoint_path)

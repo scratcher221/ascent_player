@@ -17,9 +17,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ascent_player.agent.dqn import DQNAgent
 from ascent_player.agent.progress_sanitize import patch_checkpoint_epsilon
 from ascent_player.config import AppConfig
 from ascent_player.training import run_eval_watch, run_sim_pretrain, run_training_no_ui
+from ascent_player.utils.skill_ledger import append_skill_ledger
 
 EPISODE_SCORE_RE = re.compile(r"max_score=([\d.]+)")
 SUMMARY_LAST50_RE = re.compile(
@@ -77,6 +79,7 @@ class OvernightState:
     run_count: int = 0
     session_seconds: int = INITIAL_SESSION_SECONDS
     best_eval_mean: float = 0.0
+    best_eval_min: float = 0.0
     best_eval_max: float = 0.0
     best_rolling_eval_mean: float = 0.0
     best_training_recent_avg: float = 0.0
@@ -155,6 +158,9 @@ def _apply_browser_profile(config: AppConfig, state: OvernightState) -> None:
     config.training.sim_mode = False
     config.training.transfer_from_sim = False
     config.training.watch_mode = False
+    # Working weights = dqn_latest; elite = browser_best (promoted after eval).
+    config.training.overnight_prefer_latest = True
+    config.training.prefer_best_checkpoint = False
     skip_min = config.training.browser_frame_skip_min
     skip_max = config.training.browser_frame_skip_max
     state.frame_skip = max(skip_min, min(skip_max, state.frame_skip))
@@ -402,6 +408,13 @@ async def run_overnight_session(
                 ),
             ),
         )
+    # Seed elite floors from env or prior so overnight never clobbers a stronger browser_best.
+    prior = os.environ.get("ASCENT_BROWSER_BEST_MEAN")
+    if prior and float(prior) > state.best_eval_mean:
+        state.best_eval_mean = float(prior)
+    if state.best_eval_mean <= 0 and config.training.browser_best_checkpoint_path.exists():
+        # Conservative floor from last known Watch plateau.
+        state.best_eval_mean = max(state.best_eval_mean, 1268.0)
 
     budget_start = time.perf_counter()
     if state.total_elapsed_s > 0:
@@ -447,6 +460,17 @@ async def run_overnight_session(
             refresh_config = AppConfig()
             refresh_config.training.sim_mode = True
             refresh_config.training.sim_pretrain_steps = config.training.sim_refresh_steps
+            refresh_config.training.sim_fast_observations = False
+            refresh_config.training.sim_jpeg_augment = True
+            refresh_config.training.frame_skip = 2
+            refresh_config.training.sim_keep_frame_skip = True
+            aligned = Path("checkpoints/aligned_sim_best_eval.keras")
+            if aligned.exists():
+                refresh_config.training.sim_best_eval_checkpoint_path = aligned
+                refresh_config.training.sim_checkpoint_path = Path(
+                    "checkpoints/aligned_sim_latest.keras"
+                )
+                refresh_config.training.playable_checkpoint_path = aligned
             await asyncio.to_thread(run_sim_pretrain, refresh_config)
             state.sim_refresh_count += 1
             state.plateau_runs = 0
@@ -499,13 +523,46 @@ async def run_overnight_session(
         state.total_elapsed_s += eval_elapsed
 
         eval_mean = float(eval_stats.get("recent_avg", 0.0))
+        eval_min = float(eval_stats.get("recent_min", 0.0))
+        eval_max = float(eval_stats.get("recent_max", 0.0))
+        append_skill_ledger(
+            config.training.skill_ledger_path,
+            mode="overnight_watch",
+            mean=eval_mean,
+            min_score=eval_min,
+            max_score=eval_max,
+            steps=int(training.get("total_steps", 0) or 0),
+            checkpoint=str(config.training.checkpoint_path),
+        )
+        # Elite promotion: mean ∧ min beat floors; else restore browser_best.
+        promote_min_floor = float(config.training.sim_eval_promote_min) * 0.6
+        floor_mean = float(state.best_eval_mean)
+        if eval_mean > floor_mean and eval_min >= promote_min_floor:
+            agent = DQNAgent(config)
+            if agent.load(config.training.checkpoint_path):
+                path = agent.promote_browser_best()
+                state.best_eval_mean = eval_mean
+                state.best_eval_min = eval_min
+                journal(
+                    f"PROMOTED browser_best mean={eval_mean:.0f} "
+                    f"min={eval_min:.0f} -> {path.name}"
+                )
+        elif floor_mean > 0 and eval_mean < floor_mean:
+            restore = DQNAgent(config)
+            if restore.load(config.training.browser_best_checkpoint_path):
+                restore.save(config.training.checkpoint_path)
+                journal(
+                    f"REGRESS mean={eval_mean:.0f} < best={floor_mean:.0f} — "
+                    f"restored browser_best into dqn_latest"
+                )
+
         state.eval_history.append(eval_mean)
         state.eval_history = state.eval_history[-ROLLING_EVAL_WINDOW:]
         rolling_eval_mean = rolling_mean(state.eval_history, ROLLING_EVAL_WINDOW)
 
         journal(
             f"EVAL done {eval_elapsed:.0f}s ({eval_episodes} ep) "
-            f"mean={eval_mean:.0f} rolling={rolling_eval_mean:.0f}"
+            f"mean={eval_mean:.0f} min={eval_min:.0f} rolling={rolling_eval_mean:.0f}"
         )
 
         improved, improve_notes = _score_improved(

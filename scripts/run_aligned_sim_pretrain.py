@@ -47,6 +47,9 @@ def main() -> int:
     config.training.sim_fast_observations = False  # rendered ≈ browser preprocess
     config.training.sim_jpeg_augment = True
     config.training.sim_jpeg_quality = 0.82
+    # Last-chunk / short retrain: match transfer decision rate.
+    config.training.frame_skip = max(1, int(config.training.transfer_frame_skip))
+    config.training.sim_keep_frame_skip = True
     config.training.sim_pretrain_envs = max(1, args.envs)
     config.training.sim_resume_from_best = True
     config.training.sim_resume_epsilon = 0.20

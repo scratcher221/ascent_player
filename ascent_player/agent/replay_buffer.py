@@ -194,3 +194,45 @@ class ReplayBuffer:
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)
+
+    def save_pickle(self, path, *, max_items: int | None = None) -> int:
+        """Persist recent transitions for cross-session compounding."""
+        import pickle
+        from pathlib import Path
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            items = list(self._items)
+        if max_items is not None:
+            items = items[-max(1, int(max_items)) :]
+        with path.open("wb") as handle:
+            pickle.dump(items, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return len(items)
+
+    def load_pickle(self, path, *, max_items: int | None = None) -> int:
+        """Reload transitions saved by save_pickle. Returns count loaded."""
+        import pickle
+        from pathlib import Path
+
+        path = Path(path)
+        if not path.exists():
+            return 0
+        with path.open("rb") as handle:
+            items = pickle.load(handle)
+        if not isinstance(items, list):
+            return 0
+        if max_items is not None:
+            items = items[-max(1, int(max_items)) :]
+        loaded = 0
+        with self._lock:
+            for item in items:
+                if len(item) == 5:
+                    state, action, reward, next_state, done = item
+                    self._items.append((state, action, reward, next_state, done, 1.0))
+                else:
+                    self._items.append(item)
+                if self.prioritized:
+                    self._priorities.append(self._max_priority)
+                loaded += 1
+        return loaded

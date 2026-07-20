@@ -7,6 +7,8 @@ from ascent_player.env.sim_state_adapter import (
     build_frame_state_from_world,
     game_orb_vy,
     game_orb_y,
+    pick_target_like_game,
+    time_to_platform_game,
 )
 
 
@@ -46,6 +48,33 @@ class SimStateAdapterTests(unittest.TestCase):
         world.platforms = [above]
         state = build_frame_state_from_world(world)
         self.assertGreater(state.nearest_platform_above_dy or 0.0, 0.0)
+
+    def test_pick_target_prefers_closer_safer(self) -> None:
+        dx, dy, ptype = pick_target_like_game(
+            below_dx=0.4,
+            below_dy=0.3,
+            below_wear=0.0,
+            below_type="neutral",
+            above_dx=0.05,
+            above_dy=0.2,
+            above_wear=0.0,
+            above_type="neutral",
+            has_below=True,
+            has_above=True,
+        )
+        self.assertAlmostEqual(dx, 0.05)
+        self.assertAlmostEqual(dy, 0.2)
+        self.assertEqual(ptype, "neutral")
+
+    def test_time_to_platform_while_falling(self) -> None:
+        ttp = time_to_platform_game(
+            falling=True,
+            orb_vy=-200.0,
+            below_dy=0.2,
+            height=360.0,
+        )
+        self.assertGreater(ttp, 0.0)
+        self.assertLessEqual(ttp, 1.0)
 
 
 if __name__ == "__main__":

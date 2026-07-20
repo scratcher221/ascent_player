@@ -21,9 +21,11 @@ import time
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+from ascent_player.agent.checkpoint import checkpoint_exists
 from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.training import run_eval_watch, run_sim_pretrain, run_training_no_ui
+from ascent_player.utils.skill_ledger import append_skill_ledger
 
 
 def _build_config() -> AppConfig:
@@ -60,23 +62,38 @@ def _run_visual_bridge(config: AppConfig, steps: int) -> None:
     bridge.training.sim_fast_observations = False  # rendered frames ≈ browser preprocess
     bridge.training.sim_jpeg_augment = True
     bridge.training.sim_jpeg_quality = 0.82
+    # Match browser/transfer decision rate (bulk sim stays FS=1 elsewhere).
+    bridge.training.frame_skip = max(1, int(config.training.transfer_frame_skip))
+    bridge.training.sim_keep_frame_skip = True
     bridge.training.sim_resume_from_best = True
     bridge.training.sim_resume_epsilon = 0.10
     bridge.training.sim_pretrain_envs = 4  # rendering is heavier
     bridge.training.sim_warmstart_teacher = False
     bridge.training.sim_warmstart_demos = False
-    bridge.training.sim_eval_every_steps = 0
+    bridge.training.sim_eval_every_steps = max(
+        10_000, steps // 2
+    )  # ε=0 gate before overwriting
     bridge.training.learning_rate = 5e-5
 
     agent = DQNAgent(bridge)
-    src = agent.resolve_best_checkpoint()
+    # Prefer explicit sim_best_eval / playable from caller over generic resolve.
+    src = None
+    for candidate in (
+        bridge.training.sim_best_eval_checkpoint_path,
+        bridge.training.playable_checkpoint_path,
+        agent.resolve_best_checkpoint(),
+    ):
+        if candidate is not None and checkpoint_exists(candidate):
+            src = candidate
+            break
     if src is None or not agent.load(src):
         print("BRIDGE_FAIL no baseline", flush=True)
         return
     current = int(agent.progress.total_steps)
     target = current + steps
     print(
-        f"BRIDGE_FROM {src.name} steps={current} -> {target}",
+        f"BRIDGE_FROM {src.name} steps={current} -> {target} "
+        f"frame_skip={bridge.training.frame_skip}",
         flush=True,
     )
     run_sim_pretrain(bridge, target)
@@ -101,6 +118,7 @@ async def _transfer_loop(
     target_mean: float,
     target_min: float,
     start_from_browser_best: bool = False,
+    ledger_mode: str = "transfer_watch",
 ) -> int:
     best_eval_mean = -1.0
     round_id = 0
@@ -189,21 +207,32 @@ async def _transfer_loop(
             f"TRANSFER_EVAL_RESULT mean={mean:.1f} min={emin:.1f} max={emax:.1f}",
             flush=True,
         )
+        append_skill_ledger(
+            config.training.skill_ledger_path,
+            mode=ledger_mode,
+            mean=mean,
+            min_score=emin,
+            max_score=emax,
+            steps=int(stats.get("total_steps", 0) or 0),
+            checkpoint=str(config.training.checkpoint_path),
+        )
 
-        if mean > best_eval_mean:
+        # Promote only when mean improves and min clears the floor (mean ∧ min).
+        promote_min_floor = float(config.training.sim_eval_promote_min) * 0.6
+        if mean > best_eval_mean and emin >= promote_min_floor:
             best_eval_mean = mean
             agent = DQNAgent(config)
             if agent.load(config.training.checkpoint_path):
                 path = agent.promote_browser_best()
                 print(
-                    f"PERSISTED_BROWSER_BEST mean={mean:.0f} -> {path.name}",
+                    f"PERSISTED_BROWSER_BEST mean={mean:.0f} min={emin:.0f} -> {path.name}",
                     flush=True,
                 )
         else:
             # Regression: roll back to browser_best and cool exploration/LR.
             print(
-                f"TRANSFER_REGRESS mean={mean:.1f} < best={best_eval_mean:.1f} — "
-                f"restoring browser_best",
+                f"TRANSFER_REGRESS mean={mean:.1f} min={emin:.1f} "
+                f"< best={best_eval_mean:.1f} — restoring browser_best",
                 flush=True,
             )
             restore = DQNAgent(config)
@@ -213,7 +242,8 @@ async def _transfer_loop(
                     config.training.browser_best_checkpoint_path
                 )
             lr = max(1e-5, lr * 0.7)
-            eps = max(0.06, eps * 0.75)
+            # Softer cool: keep exploration usable longer.
+            eps = max(0.08, eps * 0.85)
             print(f"TRANSFER_COOL lr={lr:.2e} eps={eps:.3f}", flush=True)
 
         if mean >= target_mean and emin >= target_min:

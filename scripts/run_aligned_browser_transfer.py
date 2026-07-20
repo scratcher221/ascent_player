@@ -57,10 +57,15 @@ def main() -> int:
     config.training.browser_epsilon_cap = 0.18
     config.training.learning_rate = 3e-5
     config.training.sim_jpeg_augment = True
-    config.training.mixed_sim_replay_ratio = 0.15
+    config.training.mixed_sim_replay_ratio = 0.10
     config.training.sim_best_eval_checkpoint_path = src
     config.training.sim_checkpoint_path = aligned_latest
     config.training.playable_checkpoint_path = src
+    # Softer transfer cool defaults for v4+.
+    config.training.browser_epsilon_floor = 0.08
+    config.training.transfer_frame_skip = 2
+    config.training.frame_skip = 2
+    config.training.sim_pretrain_batch_size = 64  # reduce OOM risk vs Ollama
 
     agent = DQNAgent(config)
     assert agent.load(src)
