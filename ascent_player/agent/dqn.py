@@ -18,6 +18,13 @@ from ascent_player.agent.checkpoint import (
 from ascent_player.agent.progress_sanitize import sanitize_browser_progress
 from ascent_player.agent.model import build_q_network
 from ascent_player.agent.replay_buffer import ReplayBuffer, TransitionBatch
+from ascent_player.agent.reason import (
+    EXPLORE,
+    assign_reason,
+    index_to_reason,
+    reason_count,
+    reason_to_index,
+)
 from ascent_player.agent.teacher import RulePolicy
 from ascent_player.config import AppConfig
 from ascent_player.env.state_detector import FrameState
@@ -78,6 +85,11 @@ class DQNAgent:
         self._episodes_since_best = 0
         self._sim_pretrain_mode = False
         self.curriculum_stage = "M0"
+        self._reason_count = reason_count()
+        self.last_action_source = "greedy"
+        self.last_reason = EXPLORE
+        self.last_reason_pred = EXPLORE
+        self.last_reason_index = reason_to_index(EXPLORE)
         input_shape = (
             config.observation.height,
             config.observation.width,
@@ -96,6 +108,7 @@ class DQNAgent:
                 config.training.learning_rate,
                 vector_dim=self._vector_dim,
                 dueling=config.training.dueling_dqn,
+                reason_count=self._reason_count,
             )
             self.target = build_q_network(
                 input_shape,
@@ -103,6 +116,7 @@ class DQNAgent:
                 config.training.learning_rate,
                 vector_dim=self._vector_dim,
                 dueling=config.training.dueling_dqn,
+                reason_count=self._reason_count,
             )
             self.target.set_weights(self.online.get_weights())
 
@@ -182,23 +196,47 @@ class DQNAgent:
                 vectors = zero_vectors(visuals.shape[0])
         return [visuals, vectors]
 
+    def _unpack_outputs(self, outputs):
+        """Split multi-output model result into (q_values, reason_logits|None)."""
+        if isinstance(outputs, (list, tuple)):
+            q_values = outputs[0]
+            reason_logits = outputs[1] if len(outputs) > 1 else None
+            return q_values, reason_logits
+        return outputs, None
+
     def _predict_q_values(self, state) -> np.ndarray:
         with self.tf.device(self.device_info.inference_device):
             if self._vector_dim > 0:
                 visual, vector = state
-                q_values = self.online(
+                outputs = self.online(
                     [
                         self.tf.convert_to_tensor(visual[None, ...], dtype=self.tf.float32),
                         self.tf.convert_to_tensor(vector[None, ...], dtype=self.tf.float32),
                     ],
                     training=False,
-                )[0].numpy()
+                )
             else:
-                q_values = self.online(
+                outputs = self.online(
                     self.tf.convert_to_tensor(state[None, ...], dtype=self.tf.float32),
                     training=False,
-                )[0].numpy()
-        return q_values
+                )
+            q_values, reason_logits = self._unpack_outputs(outputs)
+            q_np = q_values[0].numpy() if hasattr(q_values, "numpy") else np.asarray(q_values)[0]
+            if reason_logits is not None:
+                logits = reason_logits[0].numpy() if hasattr(reason_logits, "numpy") else np.asarray(reason_logits)[0]
+                self.last_reason_pred = index_to_reason(int(np.argmax(logits)))
+            return q_np
+
+    def _build_batch_predict(self):
+        agent = self
+
+        @self.tf.function(reduce_retracing=True)
+        def batch_predict(states):
+            outputs = agent.online(states, training=False)
+            q_values, _ = agent._unpack_outputs(outputs)
+            return q_values
+
+        return batch_predict
 
     def apply_sim_pretrain_profile(self) -> None:
         training = self.config.training
@@ -213,15 +251,6 @@ class DQNAgent:
         self._epsilon_anneal_start = training.epsilon_start
         self.metrics.epsilon = self.epsilon
         self.progress.epsilon = self.epsilon
-
-    def _build_batch_predict(self):
-        agent = self
-
-        @self.tf.function(reduce_retracing=True)
-        def batch_predict(states):
-            return agent.online(states, training=False)
-
-        return batch_predict
 
     def rule_prior_probability(self) -> float:
         training = self.config.training
@@ -243,17 +272,51 @@ class DQNAgent:
         frame_state: FrameState | None = None,
     ) -> int:
         valid = self._valid_actions(can_boost, boost_level)
+        source = "greedy"
         if training and frame_state is not None:
             prior = self.rule_prior_probability()
             if prior > 0.0 and random.random() < prior:
-                return self.rule_policy.act(frame_state)
+                action = self.rule_policy.act(frame_state)
+                source = "rule"
+                self._set_action_meta(action, frame_state, source)
+                return action
         if training and random.random() < self.epsilon:
-            return random.choice(valid)
+            action = random.choice(valid)
+            source = "explore"
+            self._set_action_meta(action, frame_state, source)
+            return action
         q_values = self._predict_q_values(state)
         masked = np.full(self.config.action_count, -np.inf, dtype=np.float32)
         for action in valid:
             masked[action] = q_values[action]
-        return int(np.argmax(masked))
+        action = int(np.argmax(masked))
+        self._set_action_meta(action, frame_state, source)
+        return action
+
+    def _set_action_meta(
+        self,
+        action: int,
+        frame_state: FrameState | None,
+        source: str,
+    ) -> None:
+        self.last_action_source = source
+        teacher = assign_reason(frame_state, action, source=source)
+        self.last_reason = teacher
+        self.last_reason_index = reason_to_index(teacher)
+        if source != "greedy":
+            # Still refresh predicted reason for logging when not greedily acting.
+            try:
+                # last_reason_pred may be stale; leave previous greedy pred if any
+                pass
+            except Exception:
+                self.last_reason_pred = EXPLORE
+        if source in ("rule", "explore"):
+            # Predicted head not queried; mark pred as teacher for agree stats on explore
+            # only when we actually ran the network (greedy). For explore/rule, pred=explore/rule.
+            if source == "explore":
+                self.last_reason_pred = EXPLORE
+            else:
+                self.last_reason_pred = teacher
 
     def act_batch(
         self,
@@ -299,13 +362,15 @@ class DQNAgent:
             batch_input = self._to_model_batch(batch_states)
             with self.tf.device(self.device_info.inference_device):
                 if self._vector_dim > 0:
-                    q_values = self.online(
+                    outputs = self.online(
                         [
                             self.tf.convert_to_tensor(batch_input[0], dtype=self.tf.float32),
                             self.tf.convert_to_tensor(batch_input[1], dtype=self.tf.float32),
                         ],
                         training=False,
-                    ).numpy()
+                    )
+                    q_values, _ = self._unpack_outputs(outputs)
+                    q_values = q_values.numpy()
                 else:
                     q_values = self._batch_predict(
                         self.tf.convert_to_tensor(batch_input, dtype=self.tf.float32)
@@ -478,8 +543,10 @@ class DQNAgent:
         done: bool,
         *,
         sim: bool = False,
+        reason: int | None = None,
     ) -> None:
         buffer = self.sim_replay if sim else self.replay
+        reason_idx = self.last_reason_index if reason is None else int(reason)
         self._push_n_step(
             self._n_step_queue,
             buffer,
@@ -488,6 +555,7 @@ class DQNAgent:
             reward,
             next_state,
             done,
+            reason=reason_idx,
         )
         self.metrics.replay_size = len(self.replay)
 
@@ -500,9 +568,11 @@ class DQNAgent:
         reward: float,
         next_state,
         done: bool,
+        *,
+        reason: int = -1,
     ) -> None:
         n_step = max(1, self.config.training.n_step)
-        queue.append((state, action, reward, next_state, done))
+        queue.append((state, action, reward, next_state, done, reason))
         while len(queue) >= n_step:
             self._flush_n_step_queue(queue, buffer)
         if done:
@@ -518,14 +588,14 @@ class DQNAgent:
         steps_used = 0
         final_next = queue[-1][3]
         final_done = False
-        for index, (_, _, step_reward, step_next, step_done) in enumerate(queue):
+        for index, (_, _, step_reward, step_next, step_done, _) in enumerate(queue):
             accumulated += (gamma ** index) * step_reward
             final_next = step_next
             final_done = step_done
             steps_used = index + 1
             if step_done:
                 break
-        first_state, first_action, _, _, _ = queue[0]
+        first_state, first_action, _, _, _, first_reason = queue[0]
         buffer.add(
             first_state,
             first_action,
@@ -533,6 +603,7 @@ class DQNAgent:
             final_next,
             final_done,
             discount=gamma ** steps_used,
+            reason=int(first_reason),
         )
         queue.pop(0)
 
@@ -1022,6 +1093,28 @@ class DQNAgent:
         self._last_autosave_steps = progress.total_steps
         self._baseline_samples = []
 
+    def _copy_compatible_weights(self, loaded) -> int:
+        """Copy matching layers by name; skip shape mismatches (vector/reason migrate)."""
+        copied = 0
+        online_layers = {layer.name: layer for layer in self.online.layers}
+        for layer in loaded.layers:
+            dest = online_layers.get(layer.name)
+            if dest is None:
+                continue
+            try:
+                src_w = layer.get_weights()
+                dst_w = dest.get_weights()
+                if not src_w or len(src_w) != len(dst_w):
+                    continue
+                if any(tuple(a.shape) != tuple(b.shape) for a, b in zip(src_w, dst_w)):
+                    continue
+                dest.set_weights(src_w)
+                copied += 1
+            except Exception:
+                continue
+        self.target.set_weights(self.online.get_weights())
+        return copied
+
     def load(self, path: Path | None = None) -> bool:
         target = path or self.config.training.checkpoint_path
         weights_path = self.weights_sidecar_path(target)
@@ -1037,6 +1130,7 @@ class DQNAgent:
                     return True
                 except Exception as exc:
                     errors.append(f"weights load: {exc}")
+                    # Fall through to keras model / partial migrate.
 
             if target.exists():
                 try:
@@ -1048,31 +1142,41 @@ class DQNAgent:
                         custom_objects={"AdvantageCenter": AdvantageCenter},
                         safe_mode=False,
                     )
-                    if self._vector_dim > 0:
-                        if len(loaded.inputs) != 2:
-                            raise ValueError("expected hybrid visual+vector inputs")
-                        visual_shape = tuple(loaded.inputs[0].shape[1:])
-                        vector_shape = tuple(loaded.inputs[1].shape[1:])
-                        if visual_shape != tuple(self.online.inputs[0].shape[1:]):
-                            raise ValueError(
-                                f"visual shape {visual_shape} != "
-                                f"{tuple(self.online.inputs[0].shape[1:])}"
-                            )
-                        if vector_shape != (self._vector_dim,):
-                            raise ValueError(
-                                f"vector shape {vector_shape} != ({self._vector_dim},)"
-                            )
-                    elif tuple(loaded.input_shape[1:]) != tuple(self.online.input_shape[1:]):
-                        raise ValueError("visual-only input shape mismatch")
-                    self.online.set_weights(loaded.get_weights())
-                    self.target.set_weights(loaded.get_weights())
-                    # Migrate legacy checkpoints to weights sidecar for future loads.
+                    migrated = False
+                    try:
+                        if self._vector_dim > 0:
+                            if len(loaded.inputs) != 2:
+                                raise ValueError("expected hybrid visual+vector inputs")
+                            visual_shape = tuple(loaded.inputs[0].shape[1:])
+                            vector_shape = tuple(loaded.inputs[1].shape[1:])
+                            if visual_shape != tuple(self.online.inputs[0].shape[1:]):
+                                raise ValueError(
+                                    f"visual shape {visual_shape} != "
+                                    f"{tuple(self.online.inputs[0].shape[1:])}"
+                                )
+                            if vector_shape != (self._vector_dim,):
+                                raise ValueError(
+                                    f"vector shape {vector_shape} != ({self._vector_dim},)"
+                                )
+                        # Multi-output / reason head: prefer exact set_weights, else partial.
+                        self.online.set_weights(loaded.get_weights())
+                        self.target.set_weights(loaded.get_weights())
+                    except Exception as shape_exc:
+                        copied = self._copy_compatible_weights(loaded)
+                        migrated = True
+                        print(
+                            f"VECTOR_DIM_MIGRATE / REASON_HEAD_INIT: "
+                            f"copied {copied} layers from {target.name} ({shape_exc})",
+                            flush=True,
+                        )
                     try:
                         self.online.save_weights(weights_path)
                     except Exception:
                         pass
                     self._apply_loaded_progress(target)
                     self._last_load_error = None
+                    if migrated:
+                        print("REASON_HEAD_INIT: reason logits randomly initialized", flush=True)
                     return True
                 except Exception as exc:
                     errors.append(f"model load: {exc}")
@@ -1088,6 +1192,10 @@ class DQNAgent:
         rewards = self.tf.convert_to_tensor(batch.rewards, dtype=self.tf.float32)
         dones = self.tf.convert_to_tensor(batch.dones, dtype=self.tf.float32)
         discounts = self.tf.convert_to_tensor(batch.discounts, dtype=self.tf.float32)
+        reasons_t = self.tf.convert_to_tensor(
+            batch.reasons if batch.reasons is not None else np.full(len(batch.actions), -1, dtype=np.int32),
+            dtype=self.tf.int32,
+        )
         weights_t = (
             self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
             if batch.weights is not None
@@ -1104,6 +1212,7 @@ class DQNAgent:
                 dones,
                 discounts,
                 weights_t,
+                reasons_t,
             )
         else:
             dummy = self.tf.zeros((len(batch.actions), 1), dtype=self.tf.float32)
@@ -1117,6 +1226,7 @@ class DQNAgent:
                 dones,
                 discounts,
                 weights_t,
+                reasons_t,
             )
         self._last_td_errors = td_errors
         td_abs = np.abs(td_errors.numpy())
@@ -1194,6 +1304,7 @@ class DQNAgent:
                 dones,
                 discounts,
                 weights,
+                reasons,
             ):
                 if agent._vector_dim > 0:
                     next_states_tensor = [next_visual, next_vector]
@@ -1213,8 +1324,10 @@ class DQNAgent:
                 )
                 mask = tf.cast(allowed, tf.float32)
 
-                online_next_q = agent.online(next_states_tensor, training=False)
-                target_next_q = agent.target(next_states_tensor, training=False)
+                online_next_out = agent.online(next_states_tensor, training=False)
+                target_next_out = agent.target(next_states_tensor, training=False)
+                online_next_q, _ = agent._unpack_outputs(online_next_out)
+                target_next_q, _ = agent._unpack_outputs(target_next_out)
                 masked_online = tf.where(mask > 0.0, online_next_q, neg_inf)
                 masked_target = tf.where(mask > 0.0, target_next_q, neg_inf)
 
@@ -1228,9 +1341,12 @@ class DQNAgent:
                     next_values = tf.reduce_max(masked_target, axis=1)
 
                 targets = rewards + (1.0 - dones) * discounts * next_values
+                aux_weight = float(agent.config.training.reason_aux_weight)
+                reason_count_t = int(agent._reason_count)
 
                 with tf.GradientTape() as tape:
-                    q_values = agent.online(states_tensor, training=True)
+                    online_out = agent.online(states_tensor, training=True)
+                    q_values, reason_logits = agent._unpack_outputs(online_out)
                     action_masks = tf.one_hot(actions, action_count)
                     selected_q = tf.reduce_sum(q_values * action_masks, axis=1)
                     td_errors = targets - selected_q
@@ -1238,6 +1354,18 @@ class DQNAgent:
                     if weights is not None:
                         per_sample = per_sample * weights
                     loss = tf.reduce_mean(per_sample)
+                    if reason_logits is not None and aux_weight > 0.0:
+                        valid = reasons >= 0
+                        # Clip invalid to 0 for one_hot, then mask.
+                        safe_reasons = tf.clip_by_value(reasons, 0, reason_count_t - 1)
+                        ce = tf.keras.losses.sparse_categorical_crossentropy(
+                            safe_reasons,
+                            reason_logits,
+                            from_logits=True,
+                        )
+                        ce = tf.where(valid, ce, tf.zeros_like(ce))
+                        denom = tf.maximum(tf.reduce_sum(tf.cast(valid, tf.float32)), 1.0)
+                        loss = loss + aux_weight * (tf.reduce_sum(ce) / denom)
 
                 agent._last_td_errors = td_errors
 
@@ -1291,7 +1419,8 @@ class DQNAgent:
                 else:
                     model_in = state_visual
                 with tf.GradientTape() as tape:
-                    q_values = agent.online(model_in, training=True)
+                    outputs = agent.online(model_in, training=True)
+                    q_values, _ = agent._unpack_outputs(outputs)
                     loss = tf.keras.losses.SparseCategoricalCrossentropy(
                         from_logits=True
                     )(actions, q_values)

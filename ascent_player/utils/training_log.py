@@ -310,6 +310,15 @@ class TrainingLogger:
       parts.append(f"target={frame_state.target_kind}")
     if frame_state.target_dx is not None:
       parts.append(f"target_dx={frame_state.target_dx:.3f}")
+    reason = getattr(agent, "last_reason", None)
+    if reason:
+      parts.append(f"reason={reason}")
+    reason_pred = getattr(agent, "last_reason_pred", None)
+    if reason_pred:
+      parts.append(f"reason_pred={reason_pred}")
+    source = getattr(agent, "last_action_source", None)
+    if source:
+      parts.append(f"source={source}")
     if frame_state.in_menu:
       parts.append("in_menu=True")
     if context is not None:

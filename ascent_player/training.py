@@ -14,8 +14,10 @@ from ascent_player.env.sim_env import AscentSimEnv, calibrate_sim_physics
 from ascent_player.env.state_detector import FrameState
 from pathlib import Path
 from ascent_player.utils.gpu_session import release_gpu_between_runs
+from ascent_player.utils.decision_log import DecisionLogger
 from ascent_player.utils.training_log import BrowserStepContext, TrainingLogger
 from ascent_player.env.target_detector import TargetDetectionTracker
+from ascent_player.agent.reason import wrong_vs_target
 
 
 from ascent_player.mechanics_curriculum import CurriculumMetrics, mechanics_stage_from_metrics
@@ -610,6 +612,19 @@ async def run_training_no_ui(
         time.perf_counter() + max_seconds if max_seconds and max_seconds > 0 else None
     )
     episode_steps = 0
+    decision_logger: DecisionLogger | None = None
+    if not config.training.sim_mode:
+        every = max(1, int(getattr(config.training, "log_decision_every", 5)))
+        decision_logger = DecisionLogger.create(
+            Path("logs"),
+            every=every,
+            prefix="decisions",
+        )
+        print(
+            f"Decision log: {decision_logger.path} (every={every})",
+            flush=True,
+        )
+        logger.log_note(f"decision_log={decision_logger.path} every={every}")
     try:
         if (
             force_demo_reingest
@@ -707,6 +722,21 @@ async def run_training_no_ui(
                     train_loss=metrics.loss,
                     train_ms=metrics.train_ms,
                 )
+                if decision_logger is not None:
+                    decision_logger.maybe_log(
+                        episode=episode,
+                        step=episode_steps,
+                        action=action,
+                        reason=getattr(agent, "last_reason", ""),
+                        reason_pred=getattr(agent, "last_reason_pred", ""),
+                        source=getattr(agent, "last_action_source", ""),
+                        score=result.frame_state.score,
+                        eps=agent.epsilon,
+                        frame_state=result.frame_state,
+                        wrong_vs_target=wrong_vs_target(
+                            result.frame_state, action
+                        ),
+                    )
             if target_tracker is not None:
                 target_tracker.record(result.frame_state.target_kind)
                 config.training.target_platform_only = target_tracker.use_platform_only
@@ -778,6 +808,8 @@ async def run_training_no_ui(
                 score_velocity = 0.0
                 state = await env.reset()
     finally:
+        if decision_logger is not None:
+            decision_logger.close()
         removed = agent.trim_replay_buffers()
         if removed:
             print(f"Trimmed {removed} replay transitions")

@@ -93,7 +93,9 @@ def main() -> int:
     if args.run_seed is not None:
         config.browser.run_seed = int(args.run_seed)
         config.browser.lock_run_seed = True
+        config.training.log_decision_every = 1
         print(f"FIXED_MAP_SEED {config.browser.run_seed}", flush=True)
+        print("DECISION_LOG every=1 (full step logging)", flush=True)
 
     browser_best = config.training.browser_best_checkpoint_path
     aligned = Path("checkpoints/aligned_sim_best_eval.keras")

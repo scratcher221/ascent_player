@@ -5,10 +5,17 @@ from __future__ import annotations
 import numpy as np
 
 from ascent_player.config import ObservationConfig
+from ascent_player.env.entity_labels import (
+    ANOMALY_TYPE_SLOTS,
+    TARGET_KIND_SLOTS,
+    onehot,
+    target_kind_slot,
+)
 from ascent_player.env.navigation import platform_type_onehot
 from ascent_player.env.state_detector import FrameState
 
-VECTOR_DIM = 43
+# Legacy 43 + target_kind(7) + anomaly(4) + portal_dx/dy + hazard_dx/dy + anomaly_active
+VECTOR_DIM = 59
 
 
 def _norm_velocity(value: float | None, scale: float) -> float:
@@ -59,6 +66,14 @@ def vector_from_frame_state(state: FrameState, *, width: float = 640.0, height: 
     elif state.booster_type == "drag":
         booster_onehot[2] = 1.0
 
+    kind_oh = onehot(target_kind_slot(state.target_kind), TARGET_KIND_SLOTS)
+    anomaly_slot = state.anomaly_type if state.anomaly_type in ANOMALY_TYPE_SLOTS[:-1] else "none"
+    anomaly_oh = onehot(anomaly_slot, ANOMALY_TYPE_SLOTS)
+    portal_dx = state.portal_dx if state.portal_dx is not None else 0.0
+    portal_dy = state.portal_dy if state.portal_dy is not None else 0.0
+    hazard_dx = state.hazard_dx if state.hazard_dx is not None else 0.0
+    hazard_dy = state.hazard_dy if state.hazard_dy is not None else 0.0
+
     vec = np.array(
         [
             orb_x,
@@ -100,10 +115,17 @@ def vector_from_frame_state(state: FrameState, *, width: float = 640.0, height: 
             mult,
             1.0 if state.agent_hook_ok else 0.0,
             float(np.clip(state.tier_index / 9.0, 0.0, 1.0)),
+            *kind_oh,
+            *anomaly_oh,
+            float(np.clip(portal_dx, -1.0, 1.0)),
+            float(np.clip(portal_dy, -1.0, 1.0)),
+            float(np.clip(hazard_dx, -1.0, 1.0)),
+            float(np.clip(hazard_dy, -1.0, 1.0)),
+            1.0 if state.anomaly_type else 0.0,
         ],
         dtype=np.float32,
     )
-    assert vec.shape[0] == VECTOR_DIM
+    assert vec.shape[0] == VECTOR_DIM, f"got {vec.shape[0]} expected {VECTOR_DIM}"
     return vec
 
 

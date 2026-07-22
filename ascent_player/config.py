@@ -68,7 +68,7 @@ class ObservationConfig:
     include_boost_channel: bool = True
     include_platform_channel: bool = True
     include_vector_state: bool = True
-    vector_dim: int = 43
+    vector_dim: int = 59
 
     @property
     def channel_count(self) -> int:
@@ -332,6 +332,10 @@ class TrainingConfig:
     browser_frame_skip_min: int = 2
     browser_frame_skip_max: int = 3
     browser_epsilon_cap_after_gate_a: float = 0.15
+    # Aux CE weight for the action-reason head (0 disables aux gradient).
+    reason_aux_weight: float = 0.1
+    # Log every N browser steps to decisions CSV (1 = every step).
+    log_decision_every: int = 5
 
 
 @dataclass(slots=True)

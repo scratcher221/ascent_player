@@ -19,6 +19,7 @@ class TransitionBatch:
     indices: np.ndarray | None = None
     weights: np.ndarray | None = None
     sim_indices: np.ndarray | None = None
+    reasons: np.ndarray | None = None
 
 
 def _is_hybrid_state(state) -> bool:
@@ -32,6 +33,27 @@ def _pack_hybrid_states(states) -> np.ndarray:
     packed = np.empty(len(states), dtype=object)
     packed[:] = list(states)
     return packed
+
+
+def _normalize_item(item: tuple) -> tuple:
+    """Normalize to (state, action, reward, next, done, discount, reason)."""
+    if len(item) == 5:
+        state, action, reward, next_state, done = item
+        return (state, action, reward, next_state, done, 1.0, -1)
+    if len(item) == 6:
+        state, action, reward, next_state, done, discount = item
+        return (state, action, reward, next_state, done, float(discount), -1)
+    if len(item) >= 7:
+        return (
+            item[0],
+            item[1],
+            item[2],
+            item[3],
+            item[4],
+            float(item[5]),
+            int(item[6]),
+        )
+    raise ValueError(f"unexpected replay item length {len(item)}")
 
 
 class ReplayBuffer:
@@ -71,6 +93,7 @@ class ReplayBuffer:
         *,
         discount: float = 1.0,
         priority: float | None = None,
+        reason: int = -1,
     ) -> None:
         with self._lock:
             self._items.append(
@@ -81,6 +104,7 @@ class ReplayBuffer:
                     self._copy_state(next_state),
                     done,
                     float(discount),
+                    int(reason),
                 )
             )
             if self.prioritized:
@@ -95,10 +119,12 @@ class ReplayBuffer:
         dones: np.ndarray,
         *,
         discounts: np.ndarray | None = None,
+        reasons: np.ndarray | None = None,
     ) -> None:
         with self._lock:
             for idx in range(len(actions)):
                 discount = 1.0 if discounts is None else float(discounts[idx])
+                reason = -1 if reasons is None else int(reasons[idx])
                 self._items.append(
                     (
                         self._copy_state(states[idx]),
@@ -107,6 +133,7 @@ class ReplayBuffer:
                         self._copy_state(next_states[idx]),
                         bool(dones[idx]),
                         discount,
+                        reason,
                     )
                 )
                 if self.prioritized:
@@ -127,27 +154,29 @@ class ReplayBuffer:
                 weights = np.power(len(self._items) * probs[indices], -self.beta)
                 weights = weights / weights.max()
                 weights = weights.astype(np.float32)
-        states, actions, rewards, next_states, dones, discounts = zip(*batch, strict=True)
-        if batch and _is_hybrid_state(states[0]):
-            return TransitionBatch(
-                states=_pack_hybrid_states(states),
-                actions=np.asarray(actions, dtype=np.int32),
-                rewards=np.asarray(rewards, dtype=np.float32),
-                next_states=_pack_hybrid_states(next_states),
-                dones=np.asarray(dones, dtype=np.float32),
-                discounts=np.asarray(discounts, dtype=np.float32),
-                indices=indices,
-                weights=weights,
-            )
-        return TransitionBatch(
-            states=np.asarray(states, dtype=np.float32),
+        normalized = [_normalize_item(item) for item in batch]
+        states, actions, rewards, next_states, dones, discounts, reasons = zip(
+            *normalized, strict=True
+        )
+        common = dict(
             actions=np.asarray(actions, dtype=np.int32),
             rewards=np.asarray(rewards, dtype=np.float32),
-            next_states=np.asarray(next_states, dtype=np.float32),
             dones=np.asarray(dones, dtype=np.float32),
             discounts=np.asarray(discounts, dtype=np.float32),
             indices=indices,
             weights=weights,
+            reasons=np.asarray(reasons, dtype=np.int32),
+        )
+        if batch and _is_hybrid_state(states[0]):
+            return TransitionBatch(
+                states=_pack_hybrid_states(states),
+                next_states=_pack_hybrid_states(next_states),
+                **common,
+            )
+        return TransitionBatch(
+            states=np.asarray(states, dtype=np.float32),
+            next_states=np.asarray(next_states, dtype=np.float32),
+            **common,
         )
 
     def update_priorities(self, indices: np.ndarray, td_errors: np.ndarray) -> None:
@@ -165,12 +194,7 @@ class ReplayBuffer:
             if max_items is not None:
                 items = items[-max_items:]
             for item in items:
-                # Support legacy 5-tuples if any remain in-memory.
-                if len(item) == 5:
-                    state, action, reward, next_state, done = item
-                    self._items.append((state, action, reward, next_state, done, 1.0))
-                else:
-                    self._items.append(item)
+                self._items.append(_normalize_item(item))
                 if self.prioritized:
                     self._priorities.append(self._max_priority)
 
@@ -203,7 +227,7 @@ class ReplayBuffer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            items = list(self._items)
+            items = [_normalize_item(item) for item in self._items]
         if max_items is not None:
             items = items[-max(1, int(max_items)) :]
         with path.open("wb") as handle:
@@ -227,11 +251,7 @@ class ReplayBuffer:
         loaded = 0
         with self._lock:
             for item in items:
-                if len(item) == 5:
-                    state, action, reward, next_state, done = item
-                    self._items.append((state, action, reward, next_state, done, 1.0))
-                else:
-                    self._items.append(item)
+                self._items.append(_normalize_item(item))
                 if self.prioritized:
                     self._priorities.append(self._max_priority)
                 loaded += 1

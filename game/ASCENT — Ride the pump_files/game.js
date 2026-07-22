@@ -3076,6 +3076,32 @@ function exportAgentState() {
       };
     }
   }
+  let anomalyPortal = null;
+  let nearestAnomalyHazard = null;
+  if (activeAnomaly) {
+    const portal = activeAnomaly.portal;
+    if (portal) {
+      anomalyPortal = {
+        dx: (portal.x - orb.x) / Math.max(W, 1),
+        dy: (portal.worldY - orb.worldY) / Math.max(H, 1),
+        kind: "void_portal",
+      };
+    }
+    let hazBest = Infinity;
+    for (const hazard of anomalyHazards) {
+      const dx = hazard.x - orb.x;
+      const dy = hazard.worldY - orb.worldY;
+      const dist = dx * dx + dy * dy;
+      if (dist < hazBest) {
+        hazBest = dist;
+        nearestAnomalyHazard = {
+          dx: dx / Math.max(W, 1),
+          dy: dy / Math.max(H, 1),
+          kind: hazard.kind === "voidShard" ? "void_shard" : "squeeze_spike",
+        };
+      }
+    }
+  }
   window.__ASCENT_AGENT__ = {
     state,
     runSeed,
@@ -3097,7 +3123,14 @@ function exportAgentState() {
     canvasH: H,
     platforms: visiblePlatforms,
     boosters: visibleBoosters,
-    activeAnomaly: activeAnomaly ? { type: activeAnomaly.type, remaining: activeAnomaly.remaining ?? 0 } : null,
+    activeAnomaly: activeAnomaly
+      ? {
+          type: activeAnomaly.type,
+          remaining: activeAnomaly.remaining ?? 0,
+          portal: anomalyPortal,
+          nearestHazard: nearestAnomalyHazard,
+        }
+      : null,
     ultiCharges: [...(ultiCharges || [])],
     tierIndex: activeTier,
     score: currentScore(),

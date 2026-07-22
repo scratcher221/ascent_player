@@ -55,6 +55,13 @@ class FrameState:
     booster_dx: float | None = None
     booster_dy: float | None = None
     booster_type: str | None = None
+    anomaly_type: str | None = None
+    anomaly_remaining: float = 0.0
+    portal_dx: float | None = None
+    portal_dy: float | None = None
+    hazard_dx: float | None = None
+    hazard_dy: float | None = None
+    hazard_kind: str | None = None
     combo: int = 0
     streak: int = 0
     score_multiplier: float = 1.0
@@ -432,6 +439,32 @@ def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameSta
             frame_state.target_dx = frame_state.booster_dx
             frame_state.target_dy = frame_state.booster_dy
             frame_state.target_kind = f"booster_{frame_state.booster_type}"
+
+    anomaly = payload.get("activeAnomaly")
+    if isinstance(anomaly, dict):
+        frame_state.anomaly_type = str(anomaly.get("type") or "") or None
+        frame_state.anomaly_remaining = float(anomaly.get("remaining") or 0.0)
+        portal = anomaly.get("portal")
+        if isinstance(portal, dict):
+            frame_state.portal_dx = float(portal.get("dx", 0.0))
+            frame_state.portal_dy = float(portal.get("dy", 0.0))
+            if not survival_steer and frame_state.anomaly_type == "liquidityVoid":
+                frame_state.target_dx = frame_state.portal_dx
+                frame_state.target_dy = frame_state.portal_dy
+                frame_state.target_kind = "void_portal"
+        hazard = anomaly.get("nearestHazard")
+        if isinstance(hazard, dict):
+            frame_state.hazard_dx = float(hazard.get("dx", 0.0))
+            frame_state.hazard_dy = float(hazard.get("dy", 0.0))
+            frame_state.hazard_kind = str(hazard.get("kind") or "hazard")
+    else:
+        frame_state.anomaly_type = None
+        frame_state.anomaly_remaining = 0.0
+        frame_state.portal_dx = None
+        frame_state.portal_dy = None
+        frame_state.hazard_dx = None
+        frame_state.hazard_dy = None
+        frame_state.hazard_kind = None
 
     return enrich_navigation(frame_state)
 
