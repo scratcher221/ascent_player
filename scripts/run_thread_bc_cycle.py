@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -28,6 +29,10 @@ sys.path.insert(0, str(ROOT))
 
 from ascent_player.agent.checkpoint import checkpoint_exists
 from ascent_player.agent.dqn import DQNAgent
+from ascent_player.agent.seed_curriculum import (
+    FineTuneReadiness,
+    confirmed_promotion,
+)
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.evaluation import (
     evaluate_seed_thread_baseline,
@@ -40,7 +45,11 @@ SEED_MEAN = Path("logs/seed_map_best_mean.txt")
 LATEST = Path("checkpoints/dqn_latest.keras")
 THREAD_BC = Path("checkpoints/dqn_thread_bc.keras")
 ELITE_REPLAY = Path("checkpoints/elite_thread_replay.pkl")
+ELITE_META = Path("checkpoints/elite_thread_replay.json")
 BROWSER_REPLAY = Path("checkpoints/browser_replay.pkl")
+MIN_ELITE_SCORE = 1600.0
+MAX_ELITE_EPISODES = 8
+MAX_TRANSITIONS_PER_ELITE = 128
 
 
 def offline_bc_train(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
@@ -105,7 +114,9 @@ def _build_config(run_seed: int, *, elite_gate: float) -> AppConfig:
     config.training.mixed_sim_replay_ratio = 0.0
     config.training.log_decision_every = 1
     config.training.reason_aux_weight = 0.12
-    config.training.replay_min_episode_score = float(elite_gate)
+    config.training.replay_min_episode_score = max(
+        MIN_ELITE_SCORE, float(elite_gate)
+    )
     config.training.thread_bc_checkpoint_path = THREAD_BC
     config.browser.run_seed = int(run_seed)
     config.browser.lock_run_seed = True
@@ -148,12 +159,42 @@ def _promote_seed_best(agent: DQNAgent, mean: float) -> None:
     print(f"SEED_BEST_UPDATE mean={mean:.1f} -> {SEED_BEST.name}", flush=True)
 
 
+def _elite_store_compatible(min_score: float) -> bool:
+    if not ELITE_REPLAY.exists() or not ELITE_META.exists():
+        return False
+    try:
+        meta = json.loads(ELITE_META.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return float(meta.get("min_episode_score", 0.0)) >= float(min_score)
+
+
+def _reset_incompatible_elite_store(min_score: float) -> None:
+    """Discard legacy/mixed-gate replay rather than silently training on it."""
+    if not ELITE_REPLAY.exists():
+        return
+    if _elite_store_compatible(min_score):
+        return
+    size = ELITE_REPLAY.stat().st_size
+    ELITE_REPLAY.unlink()
+    ELITE_META.unlink(missing_ok=True)
+    print(
+        f"ELITE_REPLAY_REBUILD removed_incompatible_bytes={size} "
+        f"required_score>={min_score:.0f}",
+        flush=True,
+    )
+
+
 def _persist_elite_replay(config: AppConfig) -> int:
-    """Merge gated browser replay into the durable elite pickle."""
+    """Merge and compact replay collected at the current ≥1600 score gate."""
+    min_score = max(
+        MIN_ELITE_SCORE,
+        float(config.training.replay_min_episode_score or 0.0),
+    )
+    _reset_incompatible_elite_store(min_score)
     if not BROWSER_REPLAY.exists():
         if not ELITE_REPLAY.exists():
             return 0
-        # Report existing elite size without merging.
         probe = DQNAgent(config)
         probe.replay.clear()
         n = probe.replay.load_pickle(
@@ -181,13 +222,32 @@ def _persist_elite_replay(config: AppConfig) -> int:
     )
     if browser_n > 0:
         merged.replay.extend_from(fresh.replay)
+    compact = merged.replay.compact_diverse_episodes(
+        max_episodes=MAX_ELITE_EPISODES,
+        max_transitions_per_episode=MAX_TRANSITIONS_PER_ELITE,
+    )
     saved = merged.replay.save_pickle(
         ELITE_REPLAY,
-        max_items=config.training.browser_replay_max_items,
+        max_items=MAX_ELITE_EPISODES * MAX_TRANSITIONS_PER_ELITE,
+    )
+    ELITE_META.write_text(
+        json.dumps(
+            {
+                "min_episode_score": min_score,
+                "max_episodes": MAX_ELITE_EPISODES,
+                "max_transitions_per_episode": MAX_TRANSITIONS_PER_ELITE,
+                **compact,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
     )
     print(
         f"ELITE_REPLAY merge before={before} browser={browser_n} "
-        f"saved={saved} -> {ELITE_REPLAY.name}",
+        f"episodes={compact['selected_episodes']} saved={saved} "
+        f"gate>={min_score:.0f} -> {ELITE_REPLAY.name}",
         flush=True,
     )
     return int(saved)
@@ -219,6 +279,50 @@ async def phase_ceiling(config: AppConfig, *, episodes: int) -> dict[str, float]
         "min": float(metrics.min_score),
         "max": float(metrics.max_score),
     }
+
+
+async def confirm_greedy_promotion(
+    config: AppConfig,
+    *,
+    floor: float,
+    target_min: float,
+    episodes: int = 16,
+    label: str,
+) -> dict[str, float]:
+    """Run the only eval allowed to promote a checkpoint."""
+    if checkpoint_exists(THREAD_BC):
+        agent = DQNAgent(config)
+        assert agent.load(THREAD_BC)
+        agent.save(LATEST)
+    config.training.seed_thread_enabled = True
+    config.training.seed_thread_watch_prior = 0.0
+    config.training.watch_rule_prior = 0.0
+    config.training.force_save_browser_replay = False
+    config.training.skip_browser_replay_load = True
+    stats = await run_eval_watch(config, max_episodes=max(12, int(episodes)))
+    result = {
+        "mean": float(stats.get("recent_avg", 0.0)),
+        "min": float(stats.get("recent_min", 0.0)),
+        "max": float(stats.get("recent_max", 0.0)),
+    }
+    passed = confirmed_promotion(
+        mean_score=result["mean"],
+        min_score=result["min"],
+        floor_mean=floor,
+        target_min=target_min,
+    )
+    print(
+        f"GREEDY_CONFIRM label={label} episodes={max(12, int(episodes))} "
+        f"mean={result['mean']:.1f} min={result['min']:.1f} "
+        f"max={result['max']:.1f} floor={floor:.1f} pass={int(passed)}",
+        flush=True,
+    )
+    if passed:
+        agent = DQNAgent(config)
+        assert agent.load(THREAD_BC if checkpoint_exists(THREAD_BC) else LATEST)
+        _promote_seed_best(agent, result["mean"])
+        print(f"PROMOTE_VIA greedy_confirm:{label}", flush=True)
+    return {**result, "passed": float(passed)}
 
 
 async def phase_collect(
@@ -267,6 +371,7 @@ async def phase_bc(
     lr: float,
     prefer_thread_bc: bool,
     eval_probe_episodes: int = 4,
+    target_min: float = 900.0,
 ) -> float | None:
     """BC from elite demos onto a *copy* of seed/side weights; revert if greedy collapses."""
     # Always BC from the frozen floor so thin elites can't compound destruction.
@@ -285,8 +390,8 @@ async def phase_bc(
     loaded = len(agent.replay)
     print(f"PHASE_BC load replay={loaded}", flush=True)
     # Need a meaningful elite buffer — one lucky episode is not enough.
-    if loaded < 1500:
-        print("PHASE_BC_SKIP need >=1500 elite transitions", flush=True)
+    if loaded < 512:
+        print("PHASE_BC_SKIP need >=512 compact elite transitions", flush=True)
         return None
 
     pre_path = Path("checkpoints/dqn_thread_bc_pre_bc.keras")
@@ -315,25 +420,15 @@ async def phase_bc(
             flush=True,
         )
         return None
-    # If the probe clears the floor, immediately run a longer greedy Watch for
-    # promotion — short probes have beaten the floor then failed an 8-ep eval.
+    # A short probe may request a promotion check, but cannot promote itself.
     if mean > floor:
-        confirm = await run_eval_watch(config, max_episodes=12)
-        cmean = float(confirm.get("recent_avg", 0.0))
-        cmin = float(confirm.get("recent_min", 0.0))
-        cmax = float(confirm.get("recent_max", 0.0))
-        print(
-            f"BC_CONFIRM_GREEDY mean={cmean:.1f} min={cmin:.1f} max={cmax:.1f}",
-            flush=True,
+        await confirm_greedy_promotion(
+            config,
+            floor=floor,
+            target_min=target_min,
+            episodes=16,
+            label="bc_probe",
         )
-        if cmean > floor and cmin >= 0.35 * 900.0:
-            agent = DQNAgent(config)
-            assert agent.load(THREAD_BC if checkpoint_exists(THREAD_BC) else LATEST)
-            _promote_seed_best(agent, cmean)
-            print(
-                f"PROMOTE_VIA bc_confirm mean={cmean:.1f}",
-                flush=True,
-            )
     return loss
 
 
@@ -453,12 +548,13 @@ async def phase_finetune(
 async def main_async(args: argparse.Namespace) -> int:
     deadline = time.time() + max(600.0, float(args.hours) * 3600.0)
     run_seed = int(args.run_seed)
-    elite_gate = float(args.elite_gate)
+    elite_gate = max(MIN_ELITE_SCORE, float(args.elite_gate))
     floor = _read_best_mean()
     target_mean = float(args.target_mean)
     target_min = float(args.target_min)
 
     config = _build_config(run_seed, elite_gate=elite_gate)
+    _reset_incompatible_elite_store(elite_gate)
     # Bootstrap side ckpt from seed best if missing.
     if not checkpoint_exists(THREAD_BC) and checkpoint_exists(SEED_BEST):
         agent = DQNAgent(config)
@@ -492,7 +588,7 @@ async def main_async(args: argparse.Namespace) -> int:
     bc_lr = float(args.bc_lr)
     collect_eps = float(args.collect_eps)
     prefer_thread_bc = checkpoint_exists(THREAD_BC)
-    first_collect = True
+    finetune_readiness = FineTuneReadiness(floor_ratio=0.95, required_rounds=2)
 
     while time.time() < deadline:
         round_id += 1
@@ -532,7 +628,6 @@ async def main_async(args: argparse.Namespace) -> int:
             # the only durable demo store for this cycle.
             skip_replay_load=True,
         )
-        first_collect = False
         print(
             f"COLLECT_DONE recent_avg={collect_stats.get('recent_avg', 0):.0f} "
             f"replay={collect_stats.get('replay_size', 0)}",
@@ -541,12 +636,10 @@ async def main_async(args: argparse.Namespace) -> int:
         elite_n = _persist_elite_replay(config)
         collect_replay = int(collect_stats.get("replay_size", 0) or 0)
         if collect_replay < 200 and (elite_n < 200):
-            old = config.training.replay_min_episode_score
-            config.training.replay_min_episode_score = max(1200.0, old - 100.0)
             thread_prior = min(0.85, thread_prior + 0.05)
             collect_eps = min(0.08, collect_eps + 0.01)
             print(
-                f"STARVE_ADJUST gate {old:.0f}->{config.training.replay_min_episode_score:.0f} "
+                f"STARVE_ADJUST gate={config.training.replay_min_episode_score:.0f} "
                 f"thread_prior={thread_prior:.2f} eps={collect_eps:.3f}",
                 flush=True,
             )
@@ -558,13 +651,11 @@ async def main_async(args: argparse.Namespace) -> int:
             lr=bc_lr,
             prefer_thread_bc=prefer_thread_bc,
             eval_probe_episodes=6,
+            target_min=target_min,
         )
         prefer_thread_bc = True
         if loss is None:
-            # Accumulate more diverse elites; gently loosen gate toward 1400.
-            config.training.replay_min_episode_score = max(
-                1400.0, config.training.replay_min_episode_score - 25.0
-            )
+            # Accumulate more diverse ≥1600 episodes; never dilute the buffer.
             continue
 
         remaining = deadline - time.time()
@@ -580,36 +671,26 @@ async def main_async(args: argparse.Namespace) -> int:
         greedy = evals["greedy"]
         floor = _read_best_mean()
 
-        # Promote on the stronger of greedy / aligned, but never if both lag the floor.
-        # Pure thread ceiling is often < floor; forcing a high watch_prior can *hurt*
-        # a partially BC'd net (round-1: greedy 1035 > aligned 876).
-        best_mean = max(aligned["mean"], greedy["mean"])
-        best_min = (
-            aligned["min"] if aligned["mean"] >= greedy["mean"] else greedy["min"]
-        )
-        promote_src = "aligned" if aligned["mean"] >= greedy["mean"] else "greedy"
-        improved = best_mean > floor and best_min >= target_min * 0.35
-        # If greedy collapsed far below floor while aligned looks good, require
-        # greedy not to be catastrophic before promoting a hybrid policy.
-        if promote_src == "aligned" and greedy["mean"] < floor * 0.70:
-            improved = False
-        if improved:
-            agent = DQNAgent(config)
-            assert agent.load(THREAD_BC if checkpoint_exists(THREAD_BC) else LATEST)
-            _promote_seed_best(agent, best_mean)
-            floor = best_mean
-            print(
-                f"PROMOTE_VIA {promote_src} mean={best_mean:.1f} "
-                f"greedy={greedy['mean']:.1f} aligned={aligned['mean']:.1f}",
-                flush=True,
+        # Aligned Watch remains diagnostic. Only a long pure-greedy confirm may
+        # update the deployable seed floor.
+        best_mean = greedy["mean"]
+        best_min = greedy["min"]
+        ft_ready = finetune_readiness.observe(best_mean, floor)
+        promoted = False
+        if greedy["mean"] > floor:
+            confirmation = await confirm_greedy_promotion(
+                config,
+                floor=floor,
+                target_min=target_min,
+                episodes=16,
+                label=f"round_{round_id}",
             )
+            promoted = bool(confirmation["passed"])
+        if promoted:
+            floor = _read_best_mean()
             bc_steps = min(900, bc_steps + 50)
             collect_eps = max(0.03, collect_eps * 0.97)
-            # Tighten gate after a win.
-            config.training.replay_min_episode_score = min(
-                1500.0, config.training.replay_min_episode_score + 50.0
-            )
-            # Anneal watch prior toward greedy skill as BC sticks.
+            finetune_readiness.consecutive_rounds = 0
             thread_watch = max(0.25, thread_watch * 0.9)
         else:
             print(
@@ -617,36 +698,27 @@ async def main_async(args: argparse.Namespace) -> int:
                 f"floor={floor:.1f} — keep side ckpt + elite replay",
                 flush=True,
             )
-            # Do NOT clear elite replay. Prefer more elites + milder watch prior.
+            # Do not clear elite replay and never lower its 1600 score floor.
             if best_mean < floor * 0.90:
                 thread_prior = min(0.85, thread_prior + 0.03)
                 collect_eps = min(0.08, collect_eps + 0.01)
                 thread_watch = max(0.30, thread_watch * 0.92)
-                # Loosen gate slightly when starving for ≥1500 elites.
-                config.training.replay_min_episode_score = max(
-                    1300.0, config.training.replay_min_episode_score - 50.0
-                )
             else:
-                # Near miss: prefer rarer elites; keep watch prior moderate.
-                config.training.replay_min_episode_score = min(
-                    1500.0, config.training.replay_min_episode_score + 25.0
-                )
                 thread_watch = max(0.35, min(thread_watch, 0.45))
 
-        if best_mean >= target_mean and best_min >= target_min:
+        if promoted and floor >= target_mean:
             print(
-                f"TARGET_MET mean={best_mean:.1f} min={best_min:.1f}",
+                f"TARGET_MET confirmed_mean={floor:.1f}",
                 flush=True,
             )
             return 0
 
-        # Light fine-tune only when BC/eval is already near the floor — otherwise
-        # online TD has repeatedly collapsed greedy Watch (seen: 1035 → 732).
+        # Online TD has repeatedly collapsed greedy Watch. Open this gate only
+        # after two consecutive greedy rounds reach at least 95% of the floor.
         remaining = deadline - time.time()
-        near_floor = best_mean >= floor * 0.85
         if (
             remaining >= 45 * 60
-            and near_floor
+            and ft_ready
             and float(args.finetune_minutes) > 0
         ):
             # Snapshot side ckpt before FT; restore if FT regresses greedy.
@@ -662,7 +734,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 lr=float(args.ft_lr),
                 eps=max(0.04, collect_eps),
                 thread_prior=max(0.35, thread_prior * 0.85),
-                gate=max(1200.0, config.training.replay_min_episode_score - 100.0),
+                gate=max(MIN_ELITE_SCORE, config.training.replay_min_episode_score),
             )
             # Re-eval after FT (aligned only if time is short).
             remaining = deadline - time.time()
@@ -675,28 +747,17 @@ async def main_async(args: argparse.Namespace) -> int:
                 aligned = evals["aligned"]
                 greedy = evals["greedy"]
                 floor = _read_best_mean()
-                best_mean = max(aligned["mean"], greedy["mean"])
-                best_min = (
-                    aligned["min"]
-                    if aligned["mean"] >= greedy["mean"]
-                    else greedy["min"]
-                )
-                improved = best_mean > floor and best_min >= target_min * 0.35
-                if aligned["mean"] >= greedy["mean"] and greedy["mean"] < floor * 0.70:
-                    improved = False
-                if improved:
-                    agent = DQNAgent(config)
-                    assert agent.load(
-                        THREAD_BC if checkpoint_exists(THREAD_BC) else LATEST
+                if greedy["mean"] > floor:
+                    confirmation = await confirm_greedy_promotion(
+                        config,
+                        floor=floor,
+                        target_min=target_min,
+                        episodes=16,
+                        label=f"post_ft_round_{round_id}",
                     )
-                    _promote_seed_best(agent, best_mean)
-                    floor = best_mean
-                    print(
-                        f"PROMOTE_VIA post_ft mean={best_mean:.1f} "
-                        f"greedy={greedy['mean']:.1f} aligned={aligned['mean']:.1f}",
-                        flush=True,
-                    )
-                elif pre_ft.exists() and greedy["mean"] < floor * 0.85:
+                    if confirmation["passed"]:
+                        floor = _read_best_mean()
+                if pre_ft.exists() and greedy["mean"] < floor * 0.95:
                     agent = DQNAgent(config)
                     assert agent.load(pre_ft)
                     _save_thread_bc(agent)
@@ -704,10 +765,12 @@ async def main_async(args: argparse.Namespace) -> int:
                         f"FT_REVERT greedy={greedy['mean']:.1f} — restored pre-FT side ckpt",
                         flush=True,
                     )
-        elif remaining >= 45 * 60 and not near_floor:
+        elif remaining >= 45 * 60 and not ft_ready:
             print(
-                f"FT_SKIP best_mean={best_mean:.1f} < 0.90*floor={floor*0.90:.1f} "
-                f"— more elite BC first",
+                f"FT_SKIP greedy={best_mean:.1f} streak="
+                f"{finetune_readiness.consecutive_rounds}/"
+                f"{finetune_readiness.required_rounds} at >=0.95*floor "
+                f"({floor*0.95:.1f}) — more elite BC first",
                 flush=True,
             )
 
@@ -726,7 +789,12 @@ def main() -> int:
     parser.add_argument("--run-seed", type=int, default=424242)
     parser.add_argument("--target-mean", type=float, default=2000.0)
     parser.add_argument("--target-min", type=float, default=900.0)
-    parser.add_argument("--elite-gate", type=float, default=1500.0)
+    parser.add_argument(
+        "--elite-gate",
+        type=float,
+        default=MIN_ELITE_SCORE,
+        help="Episode score gate for elite BC (values below 1600 are clamped).",
+    )
     parser.add_argument("--thread-prior", type=float, default=0.75)
     parser.add_argument("--thread-watch-prior", type=float, default=0.55)
     parser.add_argument("--collect-minutes", type=float, default=18.0)

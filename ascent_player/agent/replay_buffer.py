@@ -254,6 +254,95 @@ class ReplayBuffer:
                 removed += 1
         return removed
 
+    def compact_diverse_episodes(
+        self,
+        *,
+        max_episodes: int = 8,
+        max_transitions_per_episode: int = 128,
+        signature_bins: int = 24,
+    ) -> dict[str, int]:
+        """Keep a compact, action-diverse sample of complete episodes.
+
+        Browser frame transitions are large (~hundreds of KiB each), so keeping
+        every frame from every accepted climb quickly creates multi-GB replay
+        files.  BC only needs representative state/action pairs.  This method:
+
+        * splits replay at terminal transitions,
+        * prefers episodes with distinct coarse action traces,
+        * uniformly samples each selected episode while retaining its terminal,
+        * caps both episode count and transitions per episode.
+
+        The replay must already have been score-gated by the collector; score is
+        intentionally not inferred from observation-vector layout here.
+        """
+        max_episodes = max(1, int(max_episodes))
+        max_per = max(2, int(max_transitions_per_episode))
+        bins = max(4, int(signature_bins))
+
+        with self._lock:
+            items = [_normalize_item(item) for item in self._items]
+
+        episodes: list[list[tuple]] = []
+        current: list[tuple] = []
+        for item in items:
+            current.append(item)
+            if bool(item[4]):
+                episodes.append(current)
+                current = []
+        # A saved gated episode should be terminal, but retain a trailing chunk
+        # defensively rather than silently losing valid collected transitions.
+        if current:
+            episodes.append(current)
+
+        def signature(episode: list[tuple]) -> tuple[int, ...]:
+            if len(episode) <= bins:
+                sampled = episode
+            else:
+                indices = np.linspace(0, len(episode) - 1, bins, dtype=np.int32)
+                sampled = [episode[int(index)] for index in indices]
+            length_bucket = min(31, len(episode) // 64)
+            return (length_bucket, *(int(item[1]) for item in sampled))
+
+        selected: list[list[tuple]] = []
+        seen: set[tuple[int, ...]] = set()
+        # Prefer recent episodes because they reflect the current policy/rule.
+        for episode in reversed(episodes):
+            key = signature(episode)
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(episode)
+            if len(selected) >= max_episodes:
+                break
+        selected.reverse()
+
+        compacted: list[tuple] = []
+        for episode in selected:
+            if len(episode) <= max_per:
+                sampled = list(episode)
+            else:
+                indices = np.linspace(0, len(episode) - 1, max_per, dtype=np.int32)
+                # Preserve order and avoid duplicate rounded indices.
+                sampled = [episode[index] for index in dict.fromkeys(map(int, indices))]
+                if bool(episode[-1][4]) and sampled[-1] is not episode[-1]:
+                    sampled[-1] = episode[-1]
+            compacted.extend(sampled)
+
+        with self._lock:
+            self._items.clear()
+            self._priorities.clear()
+            for item in compacted:
+                self._items.append(item)
+                if self.prioritized:
+                    self._priorities.append(self._max_priority)
+
+        return {
+            "input_episodes": len(episodes),
+            "selected_episodes": len(selected),
+            "input_transitions": len(items),
+            "output_transitions": len(compacted),
+        }
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._items)

@@ -129,6 +129,15 @@ class SeedThreadPolicy(RulePolicy):
     landings_locked: int = 0
     _prev_bounces: int = field(default=-1, repr=False)
 
+    @staticmethod
+    def _safe_climb_target(state: FrameState) -> tuple[float | None, float | None]:
+        """Climb through the vertically next pad; scored targets may be below."""
+        if state.nearest_platform_above_dx is not None:
+            return state.nearest_platform_above_dx, state.nearest_platform_above_dy
+        if state.target_kind == "platform" and state.target_dx is not None:
+            return state.target_dx, state.target_dy
+        return None, None
+
     def reset(self) -> None:
         self.thread_x = None
         self.landings_locked = 0
@@ -139,8 +148,8 @@ class SeedThreadPolicy(RulePolicy):
         if not self.lock_on_land:
             return
         bounces = int(state.bounces or 0)
-        landed = bool(state.platform_landed) or (
-            self._prev_bounces >= 0 and bounces > self._prev_bounces
+        landed = bounces > self._prev_bounces and (
+            bool(state.platform_landed) or self._prev_bounces >= 0
         )
         self._prev_bounces = bounces
         if not landed:
@@ -184,24 +193,18 @@ class SeedThreadPolicy(RulePolicy):
             tdx = self.thread_dx(state)
             if tdx is None:
                 return pad
-            # If the nearest pad is roughly on-thread, fine; else still take it.
-            # Soft blend only when pad is already near the corridor (don't yank away).
-            pad_abs = abs(pad)
-            if pad_abs < self.thread_corridor and abs(tdx) > 0.04:
+            if abs(pad) < self.thread_corridor and abs(tdx) > 0.04:
                 return (1.0 - self.thread_blend) * pad + self.thread_blend * tdx
             return pad
 
-        above = state.nearest_platform_above_dx
+        above, _ = self._safe_climb_target(state)
         tdx = self.thread_dx(state)
         if state.rising and above is not None:
             if tdx is None:
                 return above
-            # Prefer next pad above; gently pull toward locked corridor when useful.
             if abs(above) < 0.10 and abs(tdx) > 0.06:
                 return (1.0 - self.thread_blend) * above + self.thread_blend * tdx
             if abs(tdx) > self.thread_corridor and abs(above) > 0.12:
-                # Pad is sideways AND we're off-thread — bias toward thread first
-                # so we don't zig-zag every bounce.
                 return 0.55 * above + 0.45 * tdx
             return above
 
@@ -217,7 +220,14 @@ class SeedThreadPolicy(RulePolicy):
     def act(self, state: FrameState) -> int:
         self.observe(state)
         dx = self.target_dx(state)
-        dy = self.target_dy(state)
+        _, climb_dy = self._safe_climb_target(state)
+        dy = (
+            state.nearest_platform_dy
+            if state.falling or state.landing_window or state.miss_risk
+            else climb_dy
+        )
+        if dy is None:
+            dy = self.target_dy(state)
         vy = state.orb_vy or 0.0
         if abs(vy) > 1.5:
             vy = vy / 1500.0
@@ -244,8 +254,8 @@ class SeedThreadPolicy(RulePolicy):
             and (
                 state.boost_useful is True
                 or (
-                    vy < self.fall_vy_threshold
-                    and (dy is None or dy > self.gap_threshold)
+                vy < self.fall_vy_threshold
+                and (dy is None or dy > self.gap_threshold)
                 )
                 or (
                     state.rising
