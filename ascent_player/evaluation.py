@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ascent_player.agent.dqn import DQNAgent
-from ascent_player.agent.teacher import RulePolicy
+from ascent_player.agent.teacher import RulePolicy, SeedThreadPolicy
 from ascent_player.config import AppConfig
 from ascent_player.env.game_env import AscentGameEnv
 from ascent_player.env.sim_env import AscentSimEnv
@@ -60,6 +60,24 @@ async def evaluate_rule_baseline(
         use_sim=use_sim,
         agent=None,
         rule_only=True,
+        thread_only=False,
+    )
+
+
+async def evaluate_seed_thread_baseline(
+    config: AppConfig,
+    *,
+    episodes: int = 10,
+    use_sim: bool = False,
+) -> SkillMetrics:
+    """Pure SeedThreadPolicy ceiling — no DQN involvement."""
+    return await _evaluate_policy(
+        config,
+        episodes=episodes,
+        use_sim=use_sim,
+        agent=None,
+        rule_only=False,
+        thread_only=True,
     )
 
 
@@ -84,6 +102,7 @@ async def evaluate_learned_policy(
         use_sim=use_sim,
         agent=agent,
         rule_only=False,
+        thread_only=False,
     )
 
 
@@ -94,8 +113,14 @@ async def _evaluate_policy(
     use_sim: bool,
     agent: DQNAgent | None,
     rule_only: bool,
+    thread_only: bool = False,
 ) -> SkillMetrics:
     rule = RulePolicy()
+    thread = SeedThreadPolicy(
+        thread_corridor=float(
+            getattr(config.training, "seed_thread_corridor", 0.18) or 0.18
+        )
+    )
     if use_sim:
         env = AscentSimEnv(config, fast_mode=True)
         backend = None
@@ -112,6 +137,8 @@ async def _evaluate_policy(
     try:
         for _ in range(episodes):
             state = await env.reset()
+            if thread_only:
+                thread.reset()
             steps = 0
             bounces = 0
             prev_bounces = 0
@@ -126,7 +153,9 @@ async def _evaluate_policy(
                 frame_state = env._last_frame_state
                 if frame_state is None:
                     break
-                if rule_only:
+                if thread_only:
+                    action = thread.act(frame_state)
+                elif rule_only:
                     action = rule.act(frame_state)
                 else:
                     assert agent is not None

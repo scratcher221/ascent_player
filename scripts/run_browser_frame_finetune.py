@@ -75,6 +75,11 @@ def main() -> int:
         default=None,
         help="Fixed game map seed (platforms/boosters). Omit for random layouts.",
     )
+    parser.add_argument(
+        "--continue-latest",
+        action="store_true",
+        help="Resume from dqn_latest instead of re-seeding from --from checkpoint.",
+    )
     args = parser.parse_args()
 
     transfer = _load_transfer_mod()
@@ -94,37 +99,116 @@ def main() -> int:
         config.browser.run_seed = int(args.run_seed)
         config.browser.lock_run_seed = True
         config.training.log_decision_every = 1
+        # Slightly stronger reason aux while we are reading decision logs.
+        config.training.reason_aux_weight = 0.15
         print(f"FIXED_MAP_SEED {config.browser.run_seed}", flush=True)
         print("DECISION_LOG every=1 (full step logging)", flush=True)
 
     browser_best = config.training.browser_best_checkpoint_path
     aligned = Path("checkpoints/aligned_sim_best_eval.keras")
     start_from_browser_best = args.seed_from == "browser_best"
+    latest = config.training.checkpoint_path
 
-    if start_from_browser_best:
-        if not checkpoint_exists(browser_best):
-            print("MISSING_BROWSER_BEST", flush=True)
-            return 1
+    def _apply_seed_curriculum_hyperparams(*, continue_mode: bool = False) -> None:
         config.training.transfer_from_sim = False
-        # Stronger learning on a fixed map; FS=1 for tighter steer timing.
         config.training.frame_skip = 1
         config.training.transfer_frame_skip = 1
-        config.training.transfer_learning_rate = 4e-5
-        config.training.transfer_epsilon_start = 0.18
-        config.training.transfer_epsilon_restart = 0.15
-        config.training.browser_epsilon_cap = 0.18
-        config.training.browser_epsilon_floor = 0.10
-        config.training.browser_epsilon_cap_after_gate_a = 0.18
-        config.training.learning_rate = 4e-5
-        # Mature checkpoint: keep some rule prior so corrected below-steer teaches fast.
-        config.training.rule_prior_start = 0.25
-        config.training.rule_prior_end = 0.12
-        config.training.rule_prior_steps = 40_000
+        if continue_mode:
+            # Accelerate learning without abandoning the seed floor:
+            # Prior continue (lr=1e-5, train_every=10, min_replay=4000, gate=950)
+            # spent most of each 10min round with loss=None after Watch reload
+            # (replay cleared) while ~70% of ~890-mean episodes were gated out.
+            config.training.transfer_learning_rate = 2.0e-5
+            config.training.transfer_epsilon_start = 0.07
+            config.training.transfer_epsilon_restart = 0.07
+            config.training.browser_epsilon_cap = 0.09
+            config.training.browser_epsilon_floor = 0.05
+            config.training.browser_epsilon_cap_after_gate_a = 0.09
+            config.training.learning_rate = 2.0e-5
+            # Light generic rule prior; seed-thread carries the path bias.
+            config.training.rule_prior_start = 0.06
+            config.training.rule_prior_end = 0.02
+            config.training.rule_prior_steps = 40_000
+            config.training.min_replay_size = 1_000
+            config.training.train_every_gpu = 4
+            config.training.train_every_cpu = 4
+            config.training.mixed_sim_replay_ratio = 0.0
+            config.training.replay_min_episode_score = 800.0
+            config.training.sim_warmstart_teacher = False
+            config.training.sim_warmstart_demos = False
+            # Stronger thread + watch prior: peaks hit 2k but Watch mean stuck <1000.
+            config.training.seed_thread_enabled = True
+            config.training.seed_thread_prior_start = 0.55
+            config.training.seed_thread_prior_end = 0.35
+            config.training.seed_thread_prior_steps = 150_000
+            config.training.seed_thread_only_when_landing = True
+            config.training.seed_thread_corridor = 0.16
+            config.training.seed_thread_watch_prior = 0.45
+            config.mechanics_reward.direction_flip_penalty = -0.06
+            config.mechanics_reward.direction_persistence_steps = 3
+            config.mechanics_reward.direction_persistence_bonus = 0.03
+            print(
+                "CONTINUE_GUARD min_replay=1000 train_every=4 "
+                "eps=0.07 rule_prior=0.06 replay_min_score=800 "
+                f"lr={config.training.learning_rate:.2e} "
+                "seed_thread=on prior=0.55→0.35 watch_prior=0.45 "
+                "anti_oscillation=on no_teacher_warmstart",
+                flush=True,
+            )
+        else:
+            config.training.transfer_learning_rate = 4e-5
+            config.training.transfer_epsilon_start = 0.18
+            config.training.transfer_epsilon_restart = 0.15
+            config.training.browser_epsilon_cap = 0.18
+            config.training.browser_epsilon_floor = 0.10
+            config.training.browser_epsilon_cap_after_gate_a = 0.18
+            config.training.learning_rate = 4e-5
+            config.training.rule_prior_start = 0.25
+            config.training.rule_prior_end = 0.12
+            config.training.rule_prior_steps = 40_000
         config.demo.use_demos_on_start = False
-        # Stronger horizontal steering pressure.
         config.mechanics_reward.steer_gain = 0.22
         config.mechanics_reward.wrong_way_penalty = -0.28
         config.mechanics_reward.aligned_bonus = 0.04
+
+    if args.continue_latest:
+        if not checkpoint_exists(latest):
+            print("MISSING_DQN_LATEST", flush=True)
+            return 1
+        _apply_seed_curriculum_hyperparams(continue_mode=True)
+        # Longer train blocks / fewer Watch reloads so replay can stay warm.
+        if float(args.session_minutes) <= 10.0:
+            args.session_minutes = 20.0
+        if int(args.eval_episodes) >= 10:
+            args.eval_episodes = 6
+        print(
+            f"CONTINUE_SESSION session_min={args.session_minutes:g} "
+            f"eval_eps={args.eval_episodes}",
+            flush=True,
+        )
+        agent = DQNAgent(config)
+        assert agent.load(latest)
+        agent.set_learning_rate(config.training.learning_rate)
+        agent.epsilon = config.training.transfer_epsilon_start
+        agent.metrics.epsilon = agent.epsilon
+        agent.progress.epsilon = agent.epsilon
+        agent.reset_prior_anneal_origin()
+        agent.save(latest)
+        print(
+            f"BROWSER_FRAME_FINETUNE_CONTINUE {latest} "
+            f"best={agent.progress.best_score} steps={agent.progress.total_steps} "
+            f"eps={agent.epsilon} lr={config.training.learning_rate} "
+            f"rule_prior={config.training.rule_prior_start} "
+            f"seed_thread_prior={config.training.seed_thread_prior_start} "
+            f"anneal_origin={agent._prior_anneal_origin}",
+            flush=True,
+        )
+        start_from_browser_best = True  # keep browser finetune path; reseed skipped via keep_weights
+    elif start_from_browser_best:
+        if not checkpoint_exists(browser_best):
+            print("MISSING_BROWSER_BEST", flush=True)
+            return 1
+        _apply_seed_curriculum_hyperparams(continue_mode=False)
         agent = DQNAgent(config)
         assert agent.load(browser_best)
         agent.set_learning_rate(config.training.learning_rate)

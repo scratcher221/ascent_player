@@ -181,6 +181,7 @@ async def run_eval_watch(
     eval_config.observation = config.observation
     eval_config.reward = config.reward
     eval_config.demo = config.demo
+    eval_config.mechanics_reward = config.mechanics_reward
     eval_config.training = replace(
         config.training,
         sim_mode=False,
@@ -189,6 +190,26 @@ async def run_eval_watch(
         epsilon_start=0.0,
         epsilon_end=0.0,
         frame_skip=max(1, min(config.training.transfer_frame_skip, config.training.frame_skip)),
+        watch_rule_prior=float(
+            getattr(config.training, "watch_rule_prior", 0.0) or 0.0
+        ),
+        watch_safety_override=bool(
+            getattr(config.training, "watch_safety_override", False)
+        ),
+        skip_browser_replay_load=True,
+        # Preserve seed-thread Watch prior so aligned evals match training skill.
+        seed_thread_enabled=bool(
+            getattr(config.training, "seed_thread_enabled", False)
+        ),
+        seed_thread_watch_prior=float(
+            getattr(config.training, "seed_thread_watch_prior", 0.0) or 0.0
+        ),
+        seed_thread_corridor=float(
+            getattr(config.training, "seed_thread_corridor", 0.18) or 0.18
+        ),
+        seed_thread_only_when_landing=bool(
+            getattr(config.training, "seed_thread_only_when_landing", True)
+        ),
     )
     return await run_training_no_ui(
         eval_config,
@@ -566,18 +587,27 @@ async def run_training_no_ui(
     print(load_result.message)
     if not config.training.sim_mode:
         replay_path = config.training.browser_replay_path
-        loaded = agent.replay.load_pickle(
-            replay_path,
-            max_items=config.training.browser_replay_max_items,
-        )
+        if getattr(config.training, "skip_browser_replay_load", False):
+            print("SKIP_REPLAY_LOAD (fresh collect buffer)", flush=True)
+            loaded = 0
+        else:
+            loaded = agent.replay.load_pickle(
+                replay_path,
+                max_items=config.training.browser_replay_max_items,
+                vector_dim=config.observation.vector_dim
+                if config.observation.include_vector_state
+                else None,
+            )
         if loaded:
             print(f"Loaded {loaded} browser replay transitions from {replay_path.name}")
             # Decay mixed sim replay as browser experience accumulates.
             fill = min(1.0, loaded / max(1, config.training.browser_replay_max_items))
-            config.training.mixed_sim_replay_ratio = max(
-                0.05,
-                float(config.training.mixed_sim_replay_ratio) * (1.0 - 0.6 * fill),
-            )
+            # Do not raise a caller-requested 0.0 floor back to 0.05.
+            if float(config.training.mixed_sim_replay_ratio) > 0:
+                config.training.mixed_sim_replay_ratio = max(
+                    0.05,
+                    float(config.training.mixed_sim_replay_ratio) * (1.0 - 0.6 * fill),
+                )
             print(
                 f"mixed_sim_replay_ratio→{config.training.mixed_sim_replay_ratio:.3f} "
                 f"(browser_replay fill={fill:.2f})"
@@ -646,11 +676,18 @@ async def run_training_no_ui(
                 return _empty_training_stats(logger.path, error="browser_connect_failed")
         state = await env.reset()
         apply_curriculum(config, agent, env)
-        if len(agent.replay) == 0:
+        if (
+            len(agent.replay) == 0
+            and config.training.sim_warmstart_teacher
+            and not config.training.watch_mode
+        ):
+            print("TEACHER_WARMSTART begin (can take a while)...", flush=True)
             teacher_added = await warmstart_from_teacher(agent, config)
             if teacher_added:
                 print(f"Teacher warm-start added {teacher_added} sim transitions")
                 logger.log_note(f"teacher_warmstart={teacher_added}")
+            print("TEACHER_WARMSTART done", flush=True)
+        print("TRAIN_LOOP begin", flush=True)
         episode = agent.progress.episodes_completed
         episodes_run = 0
         episode_reward = 0.0
@@ -658,12 +695,18 @@ async def run_training_no_ui(
         prev_step_score = 0.0
         score_velocity = 0.0
         loop_hz = 0.0
+        episode_buffer: list[tuple] = []
+        replay_score_gate = float(
+            getattr(config.training, "replay_min_episode_score", 0.0) or 0.0
+        )
         while max_episodes is None or episodes_run < max_episodes:
             if deadline is not None and time.perf_counter() >= deadline:
                 print(f"Finetune time limit reached ({max_seconds}s)")
                 logger.log_note(f"finetune_timeout={max_seconds}s")
                 break
             step_started = time.perf_counter()
+            if episodes_run == 0 and episode_steps == 0:
+                print("TRAIN_LOOP first_act", flush=True)
             action = agent.act(
                 state,
                 training=not config.training.watch_mode,
@@ -671,20 +714,37 @@ async def run_training_no_ui(
                 boost_level=env.boost_level,
                 frame_state=env._last_frame_state,
             )
+            if episodes_run == 0 and episode_steps == 0:
+                print(f"TRAIN_LOOP first_step action={action}", flush=True)
             result = await env.step(action)
+            if episodes_run == 0 and episode_steps == 0:
+                print(
+                    f"TRAIN_LOOP first_step_done score={result.frame_state.score}",
+                    flush=True,
+                )
             step_ms = (time.perf_counter() - step_started) * 1000.0
             if step_ms > 0:
                 instant_hz = 1000.0 / step_ms
                 loop_hz = (0.85 * loop_hz) + (0.15 * instant_hz)
-            agent.remember(
-                state,
-                action,
-                result.reward,
-                result.state,
-                result.done,
-                sim=config.training.sim_mode,
-            )
-            metrics = agent.maybe_train()
+            if (
+                not config.training.sim_mode
+                and replay_score_gate > 0
+                and not config.training.watch_mode
+            ):
+                episode_buffer.append(
+                    (state, action, result.reward, result.state, result.done)
+                )
+                metrics = agent.maybe_train() if len(agent.replay) >= config.training.min_replay_size else agent.metrics
+            else:
+                agent.remember(
+                    state,
+                    action,
+                    result.reward,
+                    result.state,
+                    result.done,
+                    sim=config.training.sim_mode,
+                )
+                metrics = agent.maybe_train()
             episode_reward += result.reward
             episode_steps += 1
             if result.frame_state.score is not None:
@@ -757,7 +817,52 @@ async def run_training_no_ui(
                     f"score={episode_max_score:.0f} replay={metrics.replay_size} "
                     f"loss={metrics.loss}"
                 )
+            if (
+                not config.training.sim_mode
+                and metrics.total_steps > 0
+                and metrics.total_steps % 500 == 0
+            ):
+                try:
+                    lr_now = float(agent.online.optimizer.learning_rate.numpy())
+                except Exception:
+                    lr_now = float(config.training.learning_rate)
+                print(
+                    f"LR_CHECK step={metrics.total_steps} "
+                    f"optimizer_lr={lr_now:.3e} "
+                    f"config_lr={config.training.learning_rate:.3e} "
+                    f"eps={agent.epsilon:.3f} loss={metrics.loss}",
+                    flush=True,
+                )
+                try:
+                    await env.backend.browser_heartbeat()
+                except Exception as exc:
+                    print(f"BROWSER_HEARTBEAT_FAIL {exc}", flush=True)
             if result.done:
+                if episode_buffer:
+                    if episode_max_score >= replay_score_gate:
+                        for (
+                            buf_state,
+                            buf_action,
+                            buf_reward,
+                            buf_next,
+                            buf_done,
+                        ) in episode_buffer:
+                            agent.remember(
+                                buf_state,
+                                buf_action,
+                                buf_reward,
+                                buf_next,
+                                buf_done,
+                                sim=False,
+                            )
+                    else:
+                        print(
+                            f"REPLAY_GATE skip episode score={episode_max_score:.0f} "
+                            f"< {replay_score_gate:.0f} "
+                            f"(held={len(episode_buffer)})",
+                            flush=True,
+                        )
+                    episode_buffer.clear()
                 agent.record_episode(episode_reward, episode_max_score)
                 apply_curriculum(
                     config,
@@ -814,14 +919,36 @@ async def run_training_no_ui(
         if removed:
             print(f"Trimmed {removed} replay transitions")
         if not config.training.sim_mode:
-            saved = agent.replay.save_pickle(
-                config.training.browser_replay_path,
-                max_items=config.training.browser_replay_max_items,
+            recent = agent.progress.recent_scores[-10:]
+            recent_avg = float(sum(recent) / len(recent)) if recent else 0.0
+            force_save = bool(
+                getattr(config.training, "force_save_browser_replay", False)
             )
-            if saved:
+            # Never let Watch/eval overwrite a curated collect buffer.
+            if config.training.watch_mode and not force_save:
                 print(
-                    f"Saved {saved} browser replay transitions -> "
-                    f"{config.training.browser_replay_path}"
+                    f"SKIP_REPLAY_SAVE watch_mode (recent_avg={recent_avg:.0f})",
+                    flush=True,
+                )
+            # Don't persist collapsed sessions — they poison the next continue.
+            elif force_save or recent_avg >= 850.0:
+                saved = agent.replay.save_pickle(
+                    config.training.browser_replay_path,
+                    max_items=config.training.browser_replay_max_items,
+                )
+                if saved:
+                    print(
+                        f"Saved {saved} browser replay transitions -> "
+                        f"{config.training.browser_replay_path} "
+                        f"(recent_avg={recent_avg:.0f}"
+                        f"{', forced' if force_save else ''})",
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"SKIP_REPLAY_SAVE recent_avg={recent_avg:.0f} < 850 "
+                    f"(avoid poisoning seed continue)",
+                    flush=True,
                 )
         release_gpu_between_runs()
         agent.save()

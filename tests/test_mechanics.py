@@ -41,6 +41,187 @@ class MechanicsRewardTests(unittest.TestCase):
         reward = tracker.compute(curr, action=1)
         self.assertGreater(reward, 0.0)
 
+    def test_direction_flip_penalty_and_persistence_bonus(self) -> None:
+        cfg = MechanicsRewardConfig(
+            direction_flip_penalty=-0.06,
+            direction_persistence_steps=3,
+            direction_persistence_bonus=0.03,
+            steer_gain=0.0,
+            wrong_way_penalty=0.0,
+            aligned_bonus=0.0,
+            survival=0.0,
+        )
+        tracker = MechanicsRewardTracker(cfg)
+        base = FrameState(
+            height=100,
+            rising=True,
+            target_dx=0.05,
+            agent_hook_ok=True,
+        )
+        tracker.last_state = base
+        # Hold right twice (build streak), third step pays persistence.
+        r1 = tracker.compute(base, action=2)
+        r2 = tracker.compute(base, action=2)
+        r3 = tracker.compute(base, action=2)
+        self.assertEqual(r1, 0.0)
+        self.assertEqual(r2, 0.0)
+        self.assertAlmostEqual(r3, 0.03)
+        # Flip to left while rising (not exempt) → flip penalty.
+        r_flip = tracker.compute(base, action=1)
+        self.assertAlmostEqual(r_flip, -0.06)
+        # Same flip while falling is exempt.
+        falling = FrameState(
+            height=90,
+            falling=True,
+            nearest_platform_dx=0.05,
+            agent_hook_ok=True,
+        )
+        tracker.last_steer_dir = -1
+        tracker.persist_steer_dir = -1
+        tracker.persist_steer_steps = 2
+        tracker.last_state = falling
+        r_exempt = tracker.compute(falling, action=2)
+        self.assertGreaterEqual(r_exempt, 0.0)
+
+    def test_early_boost_dump_scaled_before_first_landing(self) -> None:
+        cfg = MechanicsRewardConfig(
+            early_boost_dump_penalty=-0.45,
+            early_boost_dump_steps=100,
+            early_boost_dump_min_drop=0.08,
+            boost_spam_penalty=0.0,
+            wasted_boost_penalty=0.0,
+            boost_spent=0.0,
+            timed_boost_bonus=0.0,
+            survival=0.0,
+            steer_gain=0.0,
+            wrong_way_penalty=0.0,
+            aligned_bonus=0.0,
+            height_gain=0.0,
+            score_gain=0.0,
+            falling_penalty=0.0,
+        )
+        tracker = MechanicsRewardTracker(cfg)
+        prev = FrameState(
+            height=50,
+            bounces=0,
+            rising=True,
+            can_boost=True,
+            boost_level=1.0,
+            boost_useful=False,
+            agent_hook_ok=True,
+        )
+        curr = FrameState(
+            height=50,
+            bounces=0,
+            rising=True,
+            can_boost=True,
+            boost_level=0.5,
+            boost_useful=False,
+            agent_hook_ok=True,
+        )
+        tracker.last_state = prev
+        reward = tracker.compute(curr, action=3)  # jump
+        # 0.5 drop / 0.08 → scale capped at 3 → -0.45 * 3
+        self.assertAlmostEqual(reward, -1.35, places=5)
+        # After a landing, same dump must not apply.
+        tracker.episode_steps = 10
+        landed_prev = FrameState(
+            height=100,
+            bounces=1,
+            rising=True,
+            can_boost=True,
+            boost_level=1.0,
+            boost_useful=False,
+            agent_hook_ok=True,
+        )
+        landed_curr = FrameState(
+            height=130,
+            bounces=1,
+            rising=True,
+            can_boost=True,
+            boost_level=0.5,
+            boost_useful=False,
+            agent_hook_ok=True,
+        )
+        tracker.last_state = landed_prev
+        after = tracker.compute(landed_curr, action=3)
+        self.assertGreater(after, -1.0)
+
+    def test_landing_beats_height_only_climb(self) -> None:
+        """Platform hit must dominate a pure height/score rocket tick."""
+        cfg = MechanicsRewardConfig()
+        land = MechanicsRewardTracker(cfg)
+        land.last_state = FrameState(
+            height=200,
+            bounces=1,
+            combo=2,
+            score=100,
+            agent_hook_ok=True,
+        )
+        land_r = land.compute(
+            FrameState(
+                height=210,
+                bounces=2,
+                combo=3,
+                score=110,
+                agent_hook_ok=True,
+            ),
+            action=0,
+        )
+
+        climb = MechanicsRewardTracker(cfg)
+        climb.last_state = FrameState(
+            height=200,
+            bounces=0,
+            combo=0,
+            score=100,
+            rising=True,
+            orb_vy=0.5,
+            can_boost=True,
+            boost_level=0.9,
+            agent_hook_ok=True,
+        )
+        climb_r = climb.compute(
+            FrameState(
+                height=400,
+                bounces=0,
+                combo=0,
+                score=140,
+                rising=True,
+                orb_vy=0.6,
+                can_boost=True,
+                boost_level=0.5,
+                agent_hook_ok=True,
+            ),
+            action=3,  # jump spam while rising
+        )
+        self.assertGreater(land_r, climb_r)
+        self.assertGreater(land_r, 1.0)
+
+    def test_rising_boost_spam_penalized(self) -> None:
+        tracker = MechanicsRewardTracker(MechanicsRewardConfig())
+        tracker.last_state = FrameState(
+            rising=True,
+            orb_vy=0.4,
+            can_boost=True,
+            boost_level=0.8,
+            bounces=0,
+            agent_hook_ok=True,
+        )
+        reward = tracker.compute(
+            FrameState(
+                rising=True,
+                orb_vy=0.5,
+                can_boost=True,
+                boost_level=0.5,
+                bounces=0,
+                boost_useful=False,
+                agent_hook_ok=True,
+            ),
+            action=3,
+        )
+        self.assertLess(reward, tracker.config.survival)
+
     def test_death_penalty(self) -> None:
         tracker = MechanicsRewardTracker(MechanicsRewardConfig())
         tracker.last_state = FrameState(height=10, agent_hook_ok=True)
@@ -54,12 +235,14 @@ class MechanicsRewardTests(unittest.TestCase):
             can_boost=True,
             boost_level=0.8,
             orb_vy=200.0,
+            rising=True,
             agent_hook_ok=True,
         )
         curr = FrameState(
             can_boost=False,
             boost_level=0.0,
             orb_vy=250.0,
+            rising=True,
             agent_hook_ok=True,
         )
         tracker.last_state = prev
@@ -74,6 +257,7 @@ class MechanicsRewardTests(unittest.TestCase):
             boost_level=0.8,
             nearest_platform_dy=0.25,
             orb_vy=-0.3,
+            falling=True,
             agent_hook_ok=True,
         )
         curr = FrameState(
@@ -81,6 +265,7 @@ class MechanicsRewardTests(unittest.TestCase):
             boost_level=0.2,
             nearest_platform_dy=0.25,
             orb_vy=-0.5,
+            falling=True,
             boost_useful=True,
             agent_hook_ok=True,
         )

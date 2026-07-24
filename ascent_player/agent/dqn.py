@@ -25,7 +25,7 @@ from ascent_player.agent.reason import (
     reason_count,
     reason_to_index,
 )
-from ascent_player.agent.teacher import RulePolicy
+from ascent_player.agent.teacher import RulePolicy, SeedThreadPolicy
 from ascent_player.config import AppConfig
 from ascent_player.env.state_detector import FrameState
 from ascent_player.utils.device import (
@@ -72,7 +72,17 @@ class DQNAgent:
             prioritized=config.training.use_prioritized_replay,
         )
         self.rule_policy = RulePolicy()
+        self.seed_thread = SeedThreadPolicy(
+            thread_corridor=float(
+                getattr(config.training, "seed_thread_corridor", 0.18) or 0.18
+            ),
+        )
         self._n_step_queue: list[tuple] = []
+        self._thread_log_every = 25
+        self._thread_acts = 0
+        # Priors anneal from this origin so continue runs aren't stuck at end
+        # just because checkpoint total_steps is already huge.
+        self._prior_anneal_origin = 0
         self._n_step_queues: list[list[tuple]] = []
         self._last_load_error: str | None = None
         self._epsilon_anneal_start: float = config.training.epsilon_start
@@ -256,12 +266,32 @@ class DQNAgent:
         training = self.config.training
         if training.rule_prior_steps <= 0:
             return 0.0
-        progress = min(1.0, self.metrics.total_steps / training.rule_prior_steps)
+        origin = int(getattr(self, "_prior_anneal_origin", 0) or 0)
+        local = max(0, int(self.metrics.total_steps) - origin)
+        progress = min(1.0, local / training.rule_prior_steps)
         return max(
             training.rule_prior_end,
             training.rule_prior_start
             - (training.rule_prior_start - training.rule_prior_end) * progress,
         )
+
+    def seed_thread_prior_probability(self) -> float:
+        training = self.config.training
+        if not getattr(training, "seed_thread_enabled", False):
+            return 0.0
+        steps = int(getattr(training, "seed_thread_prior_steps", 0) or 0)
+        start = float(getattr(training, "seed_thread_prior_start", 0.0) or 0.0)
+        end = float(getattr(training, "seed_thread_prior_end", 0.0) or 0.0)
+        if steps <= 0:
+            return max(0.0, end)
+        origin = int(getattr(self, "_prior_anneal_origin", 0) or 0)
+        local = max(0, int(self.metrics.total_steps) - origin)
+        progress = min(1.0, local / steps)
+        return max(end, start - (start - end) * progress)
+
+    def reset_prior_anneal_origin(self) -> None:
+        """Call after loading a continue checkpoint so priors start strong again."""
+        self._prior_anneal_origin = int(self.metrics.total_steps)
 
     def act(
         self,
@@ -273,8 +303,69 @@ class DQNAgent:
     ) -> int:
         valid = self._valid_actions(can_boost, boost_level)
         source = "greedy"
-        if training and frame_state is not None:
-            prior = self.rule_prior_probability()
+        prior = 0.0
+        if frame_state is not None:
+            safety = bool(
+                getattr(self.config.training, "watch_safety_override", False)
+            )
+            if (
+                (not training)
+                and safety
+                and (
+                    frame_state.miss_risk
+                    or (
+                        frame_state.falling
+                        and (frame_state.nearest_platform_dy or 0.0) > 0.18
+                        and frame_state.can_boost
+                        and frame_state.boost_level >= 0.12
+                    )
+                )
+            ):
+                action = self.rule_policy.act(frame_state)
+                source = "rule"
+                self._set_action_meta(action, frame_state, source)
+                return action
+
+            # Always observe landings so the thread lock tracks the episode.
+            if getattr(self.config.training, "seed_thread_enabled", False):
+                self.seed_thread.observe(frame_state)
+
+            if training:
+                prior = self.rule_prior_probability()
+                thread_prior = self.seed_thread_prior_probability()
+            else:
+                prior = float(
+                    getattr(self.config.training, "watch_rule_prior", 0.0) or 0.0
+                )
+                thread_prior = float(
+                    getattr(self.config.training, "seed_thread_watch_prior", 0.0) or 0.0
+                )
+
+            # Seed-thread first: strong path bias when a landing/climb target exists.
+            if thread_prior > 0.0:
+                only_landing = bool(
+                    getattr(self.config.training, "seed_thread_only_when_landing", True)
+                )
+                available = self.seed_thread.landing_available(frame_state)
+                locked = self.seed_thread.thread_x is not None
+                if (available or locked) and (
+                    (not only_landing) or available or locked
+                ):
+                    if random.random() < thread_prior:
+                        action = self.seed_thread.act(frame_state)
+                        source = "thread"
+                        self._thread_acts += 1
+                        if self._thread_acts % self._thread_log_every == 1:
+                            print(
+                                f"SEED_THREAD act={action} "
+                                f"lock_x={self.seed_thread.thread_x} "
+                                f"lands={self.seed_thread.landings_locked} "
+                                f"prior={thread_prior:.3f}",
+                                flush=True,
+                            )
+                        self._set_action_meta(action, frame_state, source)
+                        return action
+
             if prior > 0.0 and random.random() < prior:
                 action = self.rule_policy.act(frame_state)
                 source = "rule"
@@ -310,7 +401,7 @@ class DQNAgent:
                 pass
             except Exception:
                 self.last_reason_pred = EXPLORE
-        if source in ("rule", "explore"):
+        if source in ("rule", "explore", "thread"):
             # Predicted head not queried; mark pred as teacher for agree stats on explore
             # only when we actually ran the network (greedy). For explore/rule, pred=explore/rule.
             if source == "explore":
@@ -339,15 +430,32 @@ class DQNAgent:
         actions = np.zeros(batch_size, dtype=np.int32)
         decided = np.zeros(batch_size, dtype=bool)
 
-        # Phase 3: rule prior in vectorized pretrain.
+        # Phase 3: seed-thread + rule prior in vectorized pretrain.
         if training and frame_states is not None:
+            thread_prior = self.seed_thread_prior_probability()
             prior = self.rule_prior_probability()
-            if prior > 0.0:
-                for index in range(batch_size):
-                    fs = frame_states[index]
-                    if fs is not None and random.random() < prior:
-                        actions[index] = self.rule_policy.act(fs)
+            only_landing = bool(
+                getattr(self.config.training, "seed_thread_only_when_landing", True)
+            )
+            for index in range(batch_size):
+                fs = frame_states[index]
+                if fs is None:
+                    continue
+                if thread_prior > 0.0:
+                    self.seed_thread.observe(fs)
+                    available = self.seed_thread.landing_available(fs)
+                    locked = self.seed_thread.thread_x is not None
+                    if (
+                        (available or locked)
+                        and ((not only_landing) or available or locked)
+                        and random.random() < thread_prior
+                    ):
+                        actions[index] = self.seed_thread.act(fs)
                         decided[index] = True
+                        continue
+                if prior > 0.0 and random.random() < prior:
+                    actions[index] = self.rule_policy.act(fs)
+                    decided[index] = True
 
         explore_mask = np.zeros(batch_size, dtype=bool)
         if training and self.epsilon > 0.0:
@@ -737,6 +845,8 @@ class DQNAgent:
         )
 
     def end_episode(self, *, sim_pretrain: bool | None = None) -> None:
+        if getattr(self, "seed_thread", None) is not None:
+            self.seed_thread.reset()
         sim_mode = (
             self._sim_pretrain_mode if sim_pretrain is None else sim_pretrain
         )
@@ -1092,46 +1202,102 @@ class DQNAgent:
         self.metrics.total_steps = progress.total_steps
         self._last_autosave_steps = progress.total_steps
         self._baseline_samples = []
+        # Continue / seed-thread sessions: anneal priors from load time, not lifetime steps.
+        if getattr(self.config.training, "seed_thread_enabled", False) or (
+            float(getattr(self.config.training, "rule_prior_start", 0.0) or 0.0) > 0
+            and not self.config.training.sim_mode
+        ):
+            self.reset_prior_anneal_origin()
+
+    def _merge_weight_arrays(self, src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+        """Copy overlapping slices when shapes differ (channel/vector migrate)."""
+        if tuple(src.shape) == tuple(dst.shape):
+            return src
+        if src.ndim != dst.ndim:
+            return None
+        merged = np.array(dst, copy=True, dtype=np.float32)
+        src = np.asarray(src, dtype=np.float32)
+        if src.ndim == 1:
+            n = min(src.shape[0], dst.shape[0])
+            merged[:n] = src[:n]
+            return merged
+        if src.ndim == 2:
+            r = min(src.shape[0], dst.shape[0])
+            c = min(src.shape[1], dst.shape[1])
+            merged[:r, :c] = src[:r, :c]
+            return merged
+        if src.ndim == 4:
+            # Conv2D kernel: H, W, in_channels, out_channels
+            h = min(src.shape[0], dst.shape[0])
+            w = min(src.shape[1], dst.shape[1])
+            cin = min(src.shape[2], dst.shape[2])
+            cout = min(src.shape[3], dst.shape[3])
+            merged[:h, :w, :cin, :cout] = src[:h, :w, :cin, :cout]
+            return merged
+        return None
+
+    def _try_set_layer_weights(self, dest, src_weights) -> bool:
+        dst_weights = dest.get_weights()
+        if not src_weights or not dst_weights or len(src_weights) != len(dst_weights):
+            return False
+        merged: list[np.ndarray] = []
+        for src, dst in zip(src_weights, dst_weights, strict=True):
+            piece = self._merge_weight_arrays(np.asarray(src), np.asarray(dst))
+            if piece is None:
+                return False
+            merged.append(piece)
+        try:
+            dest.set_weights(merged)
+            return True
+        except Exception:
+            return False
 
     def _copy_compatible_weights(self, loaded) -> int:
-        """Copy matching layers by name; skip shape mismatches (vector/reason migrate)."""
+        """Copy layers by name, then by Conv2D/Dense order (legacy auto-names)."""
         copied = 0
-        online_layers = {layer.name: layer for layer in self.online.layers}
+        online_by_name = {layer.name: layer for layer in self.online.layers}
+        used_dest: set[int] = set()
+
         for layer in loaded.layers:
-            dest = online_layers.get(layer.name)
+            dest = online_by_name.get(layer.name)
             if dest is None:
                 continue
-            try:
-                src_w = layer.get_weights()
-                dst_w = dest.get_weights()
-                if not src_w or len(src_w) != len(dst_w):
-                    continue
-                if any(tuple(a.shape) != tuple(b.shape) for a, b in zip(src_w, dst_w)):
-                    continue
-                dest.set_weights(src_w)
-                copied += 1
-            except Exception:
+            src_w = layer.get_weights()
+            if not src_w:
                 continue
+            if self._try_set_layer_weights(dest, src_w):
+                copied += 1
+                used_dest.add(id(dest))
+
+        def _ordered(model, cls_name: str) -> list:
+            return [
+                layer
+                for layer in model.layers
+                if layer.__class__.__name__ == cls_name and layer.get_weights()
+            ]
+
+        for cls_name in ("Conv2D", "Dense"):
+            src_layers = _ordered(loaded, cls_name)
+            dst_layers = _ordered(self.online, cls_name)
+            for src, dest in zip(src_layers, dst_layers):
+                if id(dest) in used_dest:
+                    continue
+                if self._try_set_layer_weights(dest, src.get_weights()):
+                    copied += 1
+                    used_dest.add(id(dest))
+
         self.target.set_weights(self.online.get_weights())
         return copied
 
     def load(self, path: Path | None = None) -> bool:
-        target = path or self.config.training.checkpoint_path
+        target = Path(path) if path is not None else self.config.training.checkpoint_path
         weights_path = self.weights_sidecar_path(target)
         errors: list[str] = []
 
         with self.tf.device(self.device_info.training_device):
-            if weights_path.exists():
-                try:
-                    self.online.load_weights(weights_path)
-                    self.target.set_weights(self.online.get_weights())
-                    self._apply_loaded_progress(target)
-                    self._last_load_error = None
-                    return True
-                except Exception as exc:
-                    errors.append(f"weights load: {exc}")
-                    # Fall through to keras model / partial migrate.
-
+            # Prefer the full .keras model so architecture migrations (vector dim /
+            # reason head) always re-run against the real checkpoint, not a stale
+            # same-arch weights sidecar written after a partial migrate.
             if target.exists():
                 try:
                     from ascent_player.agent.model import _advantage_center_layer
@@ -1158,7 +1324,8 @@ class DQNAgent:
                                 raise ValueError(
                                     f"vector shape {vector_shape} != ({self._vector_dim},)"
                                 )
-                        # Multi-output / reason head: prefer exact set_weights, else partial.
+                            if len(loaded.outputs) < 2 and self._reason_count > 0:
+                                raise ValueError("missing reason head")
                         self.online.set_weights(loaded.get_weights())
                         self.target.set_weights(loaded.get_weights())
                     except Exception as shape_exc:
@@ -1176,10 +1343,23 @@ class DQNAgent:
                     self._apply_loaded_progress(target)
                     self._last_load_error = None
                     if migrated:
-                        print("REASON_HEAD_INIT: reason logits randomly initialized", flush=True)
+                        print(
+                            "REASON_HEAD_INIT: reason logits randomly initialized",
+                            flush=True,
+                        )
                     return True
                 except Exception as exc:
                     errors.append(f"model load: {exc}")
+
+            if weights_path.exists():
+                try:
+                    self.online.load_weights(weights_path)
+                    self.target.set_weights(self.online.get_weights())
+                    self._apply_loaded_progress(target)
+                    self._last_load_error = None
+                    return True
+                except Exception as exc:
+                    errors.append(f"weights load: {exc}")
 
         self._last_load_error = "; ".join(errors) if errors else "checkpoint missing"
         print(f"Checkpoint load failed: {self._last_load_error}")

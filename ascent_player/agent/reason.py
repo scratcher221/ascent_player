@@ -97,7 +97,8 @@ def assign_reason(
     """Return a discrete reason ID for (state, action, decision source)."""
     if source == "explore":
         return EXPLORE
-    if source == "rule":
+    # Thread prior shares the rule-prior aux class so checkpoint heads stay sized.
+    if source in ("rule", "thread"):
         return RULE_PRIOR
     if frame_state is None:
         return EXPLORE

@@ -18,6 +18,7 @@ import asyncio
 import os
 import sys
 import time
+from pathlib import Path
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -137,9 +138,16 @@ async def _transfer_loop(
         if prior:
             best_eval_mean = float(prior)
         else:
-            # Floor from the first successful transfer eval (~770) so weaker
-            # restarts cannot clobber browser_best.
-            best_eval_mean = 750.0 if start_from_browser_best else best_eval_mean
+            seed_meta = Path("logs/seed_map_best_mean.txt")
+            if keep_weights_on_regress and seed_meta.exists():
+                try:
+                    best_eval_mean = float(seed_meta.read_text(encoding="utf-8").strip())
+                except ValueError:
+                    best_eval_mean = 750.0 if start_from_browser_best else best_eval_mean
+            else:
+                # Floor from the first successful transfer eval (~770) so weaker
+                # restarts cannot clobber browser_best.
+                best_eval_mean = 750.0 if start_from_browser_best else best_eval_mean
         print(f"TRANSFER_BEST_FLOOR mean>={best_eval_mean:.1f}", flush=True)
 
     while time.time() < deadline:
@@ -156,7 +164,15 @@ async def _transfer_loop(
         )
 
         # Round 1: either fresh sim transfer or continue from browser_best.
-        if round_id == 1 and start_from_browser_best:
+        # Seeded curriculum: caller already prepared dqn_latest — do not wipe it.
+        if round_id == 1 and start_from_browser_best and keep_weights_on_regress:
+            config.training.transfer_from_sim = False
+            config.training.prefer_best_checkpoint = True
+            print(
+                "SEED_CONTINUE using existing dqn_latest (no browser_best reseed)",
+                flush=True,
+            )
+        elif round_id == 1 and start_from_browser_best:
             config.training.transfer_from_sim = False
             config.training.prefer_best_checkpoint = True
             # Force load browser_best into dqn_latest before the session.
@@ -234,30 +250,42 @@ async def _transfer_loop(
                     flush=True,
                 )
         elif keep_weights_on_regress:
-            # Fixed-seed / curriculum: keep dqn_latest so map learning compounds.
-            # Do NOT write browser_best (protects the random-map elite).
+            # Fixed-seed / curriculum: compound on this map without touching browser_best.
+            # Save a seed-best snapshot and restore it on regress (unlike "no restore").
+            seed_best_path = Path("checkpoints/seed_map_best.keras")
+            seed_best_meta = Path("logs/seed_map_best_mean.txt")
             if mean > best_eval_mean:
                 best_eval_mean = mean
-                # Persist working weights only.
                 agent = DQNAgent(config)
                 if agent.load(config.training.checkpoint_path):
                     agent.save(config.training.checkpoint_path)
+                    agent.save(seed_best_path)
+                seed_best_meta.parent.mkdir(parents=True, exist_ok=True)
+                seed_best_meta.write_text(f"{best_eval_mean:.4f}\n", encoding="utf-8")
                 print(
                     f"TRANSFER_SEED_BEST mean={mean:.1f} min={emin:.1f} "
-                    f"(kept weights, no browser_best write)",
+                    f"-> {seed_best_path.name} (no browser_best write)",
                     flush=True,
                 )
-                # Reward progress: hold LR/ε so learning stays aggressive.
                 print(f"TRANSFER_HOLD lr={lr:.2e} eps={eps:.3f}", flush=True)
             else:
                 print(
-                    f"TRANSFER_KEEP mean={mean:.1f} min={emin:.1f} "
-                    f"seed_best={best_eval_mean:.1f} (no restore)",
+                    f"TRANSFER_SEED_REGRESS mean={mean:.1f} min={emin:.1f} "
+                    f"< seed_best={best_eval_mean:.1f} — restoring seed_map_best",
                     flush=True,
                 )
-                # Only cool after a flat/worse eval.
-                lr = max(2e-5, lr * 0.95)
-                eps = max(0.10, eps * 0.97)
+                restore = DQNAgent(config)
+                restore_path = (
+                    seed_best_path
+                    if seed_best_path.exists()
+                    else config.training.checkpoint_path
+                )
+                if restore.load(restore_path):
+                    restore.save(config.training.checkpoint_path)
+                # Keep cool mild; continue-mode already uses a small LR.
+                # Don't ratchet LR down forever across seed-thread sessions.
+                lr = max(3.0e-5, lr * 0.98)
+                eps = max(0.08, eps * 0.99)
                 print(f"TRANSFER_COOL lr={lr:.2e} eps={eps:.3f}", flush=True)
         else:
             # Regression: roll back to browser_best and cool exploration/LR.

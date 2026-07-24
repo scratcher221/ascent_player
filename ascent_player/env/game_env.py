@@ -85,6 +85,7 @@ class AscentGameEnv:
         await self.backend.connect_auto()
 
     async def reset(self):
+        print("BROWSER_RESET begin", flush=True)
         self.reward_tracker.reset()
         self.frame_stack.clear()
         self.recent_states.clear()
@@ -111,6 +112,11 @@ class AscentGameEnv:
             self.config.observation,
             frame_state.boost_level,
             platform_mask_from_state(frame_state, frame),
+        )
+        print(
+            f"BROWSER_RESET done score={frame_state.score} "
+            f"menu={frame_state.in_menu} over={frame_state.game_over}",
+            flush=True,
         )
         return self._finalize_observation(visual, frame_state)
 
@@ -228,8 +234,15 @@ class AscentGameEnv:
                     await self.backend.press("Space")
             await self.backend.wait_ms(800)
 
+        # If still on the menu, force startGame() via JS (clicks can hang / miss).
+        body = (await self.backend.text_content()).upper()
+        if "START THE ASCENT" in body or "PICK 1 ULTI" in body or not body:
+            await self.backend.force_start_game()
+            await self.backend.wait_ms(500)
+
         if not await self.backend.has_canvas():
             await self.backend.force_open_game()
+        await self.backend.browser_heartbeat()
 
     async def _apply_action(self, action: int) -> None:
         target_keys: set[str] = set()

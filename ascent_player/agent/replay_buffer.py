@@ -56,6 +56,33 @@ def _normalize_item(item: tuple) -> tuple:
     raise ValueError(f"unexpected replay item length {len(item)}")
 
 
+def _adapt_vector(state, vector_dim: int):
+    """Pad/truncate hybrid vector to ``vector_dim``; pass through non-hybrid."""
+    if not _is_hybrid_state(state):
+        return state
+    visual, vector = state
+    vec = np.asarray(vector, dtype=np.float32).reshape(-1)
+    if vec.shape[0] == vector_dim:
+        return (visual, vec)
+    out = np.zeros(vector_dim, dtype=np.float32)
+    n = min(vec.shape[0], vector_dim)
+    out[:n] = vec[:n]
+    return (visual, out)
+
+
+def _adapt_item_vector_dim(item: tuple, vector_dim: int) -> tuple:
+    state, action, reward, next_state, done, discount, reason = _normalize_item(item)
+    return (
+        _adapt_vector(state, vector_dim),
+        action,
+        reward,
+        _adapt_vector(next_state, vector_dim),
+        done,
+        discount,
+        reason,
+    )
+
+
 class ReplayBuffer:
     def __init__(
         self,
@@ -155,6 +182,18 @@ class ReplayBuffer:
                 weights = weights / weights.max()
                 weights = weights.astype(np.float32)
         normalized = [_normalize_item(item) for item in batch]
+        # Defensive: pad/truncate hybrid vectors if buffer has mixed dims.
+        if batch and _is_hybrid_state(normalized[0][0]):
+            dims = {
+                int(np.asarray(item[0][1]).reshape(-1).shape[0])
+                for item in normalized
+                if _is_hybrid_state(item[0])
+            }
+            if len(dims) > 1:
+                target_dim = max(dims)
+                normalized = [
+                    _adapt_item_vector_dim(item, target_dim) for item in normalized
+                ]
         states, actions, rewards, next_states, dones, discounts, reasons = zip(
             *normalized, strict=True
         )
@@ -234,8 +273,18 @@ class ReplayBuffer:
             pickle.dump(items, handle, protocol=pickle.HIGHEST_PROTOCOL)
         return len(items)
 
-    def load_pickle(self, path, *, max_items: int | None = None) -> int:
-        """Reload transitions saved by save_pickle. Returns count loaded."""
+    def load_pickle(
+        self,
+        path,
+        *,
+        max_items: int | None = None,
+        vector_dim: int | None = None,
+    ) -> int:
+        """Reload transitions saved by save_pickle. Returns count loaded.
+
+        If ``vector_dim`` is set, hybrid vectors are padded/truncated to match
+        (legacy 43-dim replay → current 59-dim).
+        """
         import pickle
         from pathlib import Path
 
@@ -249,10 +298,25 @@ class ReplayBuffer:
         if max_items is not None:
             items = items[-max(1, int(max_items)) :]
         loaded = 0
+        adapted = 0
         with self._lock:
             for item in items:
-                self._items.append(_normalize_item(item))
+                if vector_dim is not None:
+                    before = _normalize_item(item)
+                    item = _adapt_item_vector_dim(item, vector_dim)
+                    if _is_hybrid_state(before[0]):
+                        old_n = int(np.asarray(before[0][1]).reshape(-1).shape[0])
+                        if old_n != vector_dim:
+                            adapted += 1
+                else:
+                    item = _normalize_item(item)
+                self._items.append(item)
                 if self.prioritized:
                     self._priorities.append(self._max_priority)
                 loaded += 1
+        if adapted:
+            print(
+                f"REPLAY_VECTOR_ADAPT adapted={adapted}/{loaded} → dim={vector_dim}",
+                flush=True,
+            )
         return loaded

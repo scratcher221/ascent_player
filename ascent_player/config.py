@@ -40,8 +40,16 @@ class BrowserConfig:
     manual_cdp_url: str | None = None
     auto_launch_on_miss: bool = True
     chromium_path: str | None = None
-    viewport_width: int = 1280
-    viewport_height: int = 720
+    # Content viewport (Playwright / CSS layout). ASCENT scales sprites with
+    # canvas height via gs=H/700, so keep this near ~720–900 — not full monitor.
+    viewport_width: int = 1440
+    viewport_height: int = 850
+    # Outer Chromium window is viewport + frame pad (title bar / borders).
+    # Without this, --window-size≈viewport makes the client area shorter and
+    # clips bottom HUD (fuel bar / Link wallet) while sprites still look large.
+    window_frame_pad_x: int = 0
+    window_frame_pad_y: int = 80
+    device_scale_factor: float = 1.0
     rescan_seconds: int = 5
     canvas_selector: str = "#gameCanvas"
     # Read canvas pixels via JS instead of Playwright element screenshots.
@@ -54,6 +62,11 @@ class BrowserConfig:
     capture_max_height: int = 360
     capture_jpeg_quality: float = 0.82
     chromium_args: tuple[str, ...] = field(default_factory=default_chromium_args)
+    # Pin launched Chromium onto a named monitor (EDID / kscreen name substring).
+    # Empty = no pin. Default keeps the game off the main/dev screens.
+    window_monitor_match: str = "ZOWIE"
+    # Explicit override (x, y). When set, skips monitor name lookup.
+    window_position: tuple[int, int] | None = None
     # Fixed map seed for curriculum. None = game picks a fresh seed each run.
     # Applied via CHART_TRIAL_CONFIG / __ASCENT_SET_RUN_SEED__ before play.
     run_seed: int | None = None
@@ -122,24 +135,40 @@ class RewardConfig:
 @dataclass(slots=True)
 class MechanicsRewardConfig:
     survival: float = 0.004
-    height_gain: float = 0.07
-    platform_land: float = 0.70
+    # Raw height/score are weak — game score rises from rocket height alone.
+    # Skill is platform hits (combo → multiplier); those dominate the shaping.
+    height_gain: float = 0.02
+    platform_land: float = 1.55
     falling_penalty: float = -0.08
     steer_gain: float = 0.05
     wrong_way_penalty: float = -0.10
     aligned_bonus: float = 0.015
-    boost_spent: float = -0.015
-    wasted_boost_penalty: float = -0.15
+    # Mild anti-jitter: punish L↔R flips; reward holding a steer briefly.
+    # Exempt miss_risk / falling recovery / near-hazard / drag escape.
+    direction_flip_penalty: float = -0.06
+    direction_persistence_steps: int = 3
+    direction_persistence_bonus: float = 0.03
+    boost_spent: float = -0.02
+    wasted_boost_penalty: float = -0.18
     empty_boost_penalty: float = -0.25
-    timed_boost_bonus: float = 0.45
-    combo_gain: float = 0.10
-    combo_break_penalty: float = -0.30
+    timed_boost_bonus: float = 0.60
+    # Mild rocket-spam penalties — strong *global* values killed all jumping.
+    # Early dump (pre-first-landing) can be much harsher: that is the fake-height farm.
+    boost_spam_penalty: float = -0.12
+    early_boost_dump_penalty: float = -0.45
+    early_boost_dump_steps: int = 100
+    early_boost_dump_min_drop: float = 0.08
+    combo_gain: float = 0.40
+    combo_break_penalty: float = -0.50
     booster_collect: float = 0.25
     drag_penalty: float = -0.30
-    score_gain: float = 0.018
-    death: float = -1.5
-    early_death_penalty: float = -1.0
-    early_death_steps: int = 500
+    # Score delta: pay more once combo is active (platform skill).
+    score_gain: float = 0.014
+    score_no_combo_scale: float = 0.08
+    height_no_combo_scale: float = 0.15
+    death: float = -1.2
+    early_death_penalty: float = -0.6
+    early_death_steps: int = 200
     milestone_scores: tuple[int, ...] = (
         500,
         1000,
@@ -160,7 +189,7 @@ class MechanicsRewardConfig:
         25000,
         50000,
     )
-    height_milestone_bonus: float = 0.30
+    height_milestone_bonus: float = 0.10
     reward_clip: float = 3.5
     boost_min_energy: float = 14.0
 
@@ -274,6 +303,10 @@ class TrainingConfig:
     target_score: int = 10000
     device_mode: DeviceMode = DeviceMode.GPU
     watch_mode: bool = False
+    # Blend RulePolicy into Watch/ε=0 play (applies even when training=False).
+    watch_rule_prior: float = 0.0
+    # When True, force RulePolicy on miss_risk / deep fall (Watch safety net).
+    watch_safety_override: bool = False
     # Headless pretrain: parallel envs, batched inference.
     # Prefer rendered obs (False) for browser transfer; set True only for speed.
     sim_pretrain_envs: int = 0
@@ -317,6 +350,17 @@ class TrainingConfig:
     rule_prior_start: float = 0.45
     rule_prior_end: float = 0.08
     rule_prior_steps: int = 150_000
+    # Seed-thread prior: prefer a stable climb corridor after successful landings.
+    # Anneals separately from rule_prior; gated on landing/climb availability.
+    seed_thread_enabled: bool = False
+    seed_thread_prior_start: float = 0.40
+    seed_thread_prior_end: float = 0.10
+    seed_thread_prior_steps: int = 80_000
+    seed_thread_only_when_landing: bool = True
+    seed_thread_corridor: float = 0.18
+    seed_thread_watch_prior: float = 0.0
+    # Side checkpoint for thread-BC work that survives Watch regress restores.
+    thread_bc_checkpoint_path: Path = Path("checkpoints/dqn_thread_bc.keras")
     smart_explore_boost_bias: float = 0.55
     dueling_dqn: bool = True
     # Gated ε=0 eval during sim pretrain / overnight.
@@ -336,6 +380,12 @@ class TrainingConfig:
     reason_aux_weight: float = 0.1
     # Log every N browser steps to decisions CSV (1 = every step).
     log_decision_every: int = 5
+    # If > 0, only commit browser transitions from episodes reaching this score.
+    replay_min_episode_score: float = 0.0
+    # When True, always persist browser_replay.pkl at session end.
+    force_save_browser_replay: bool = False
+    # When True, do not load checkpoints/browser_replay.pkl at browser session start.
+    skip_browser_replay_load: bool = False
 
 
 @dataclass(slots=True)
