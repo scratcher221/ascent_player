@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ASCENT_URL = (
-    "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
+    "http://127.0.0.1:8765/index.html"
 )
 ASCENT_HOST = "127.0.0.1"
 

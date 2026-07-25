@@ -6,26 +6,23 @@ import asyncio
 import json
 import sys
 
-URL = (
-    "http://127.0.0.1:8765/ASCENT%20%E2%80%94%20Ride%20the%20pump.html"
-    "?runSeed=424242&devUnlockTiers"
-)
+URL = "http://127.0.0.1:8765/index.html?runSeed=424242&devUnlockTiers"
 
 
 async def click_through_menus(page) -> None:
-    for _ in range(12):
+    await page.evaluate(
+        """() => {
+            try {
+              localStorage.setItem('ascent-cosmetics-reveal-dismissed-v4', '1');
+            } catch (e) {}
+            document.getElementById('cosmeticsRevealOverlay')?.classList.add('hidden');
+            document.querySelector('.mode-btn[data-ghost="0"]')?.click();
+        }"""
+    )
+    for _ in range(20):
         agent = await page.evaluate("() => window.__ASCENT_AGENT__ || null")
         if isinstance(agent, dict) and agent.get("state") == "playing":
             return
-
-        has_play = await page.evaluate(
-            """() => !!document.getElementById("playBtn")
-                && !document.getElementById("startOverlay")?.classList.contains("hidden")"""
-        )
-        if has_play:
-            await page.click("#playBtn")
-            await asyncio.sleep(0.2)
-            continue
 
         has_ulti = await page.evaluate(
             """() => !!document.getElementById("ultiSelectConfirm")
@@ -36,20 +33,44 @@ async def click_through_menus(page) -> None:
                 """() => {
                     const card = document.querySelector("#ultiSelectGrid .ulti-card");
                     if (card) card.click();
-                    const confirm = document.getElementById("ultiSelectConfirm");
-                    if (confirm && !confirm.disabled) confirm.click();
-                    else if (confirm) confirm.click();
+                    document.getElementById("ultiSelectConfirm")?.click();
                 }"""
             )
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(1.0)
+            continue
+
+        has_play = await page.evaluate(
+            """() => {
+                const overlay = document.getElementById('startOverlay');
+                return !!document.getElementById('playBtn')
+                    && overlay && !overlay.classList.contains('hidden');
+            }"""
+        )
+        if has_play:
+            await page.click("#playBtn")
+            await asyncio.sleep(0.35)
             continue
 
         await asyncio.sleep(0.1)
+    # Last resort: same JS path as BrowserBackend.force_start_game().
+    await page.evaluate(
+        """() => {
+            const play = document.getElementById('playBtn');
+            play?.click();
+            const card = document.querySelector('#ultiSelectGrid .ulti-card');
+            card?.click();
+            document.getElementById('ultiSelectConfirm')?.click();
+        }"""
+    )
+    await asyncio.sleep(1.0)
+    agent = await page.evaluate("() => window.__ASCENT_AGENT__ || null")
+    if isinstance(agent, dict) and agent.get("state") == "playing":
+        return
     raise RuntimeError("Could not start game through menus")
 
 
 async def layout_snapshot(page) -> dict:
-    await page.goto(URL, wait_until="domcontentloaded")
+    await page.goto(URL, wait_until="networkidle")
     await page.wait_for_selector("#gameCanvas", timeout=15_000)
     await page.wait_for_function(
         "() => typeof window.__ASCENT_SET_RUN_SEED__ === 'function'",

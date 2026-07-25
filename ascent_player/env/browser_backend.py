@@ -143,12 +143,16 @@ _SET_RUN_SEED_JS = """
     window.CHART_TRIAL_CONFIG = window.CHART_TRIAL_CONFIG || {};
     if (seed == null) {
         window.CHART_TRIAL_CONFIG.runSeed = null;
+        window.__ASCENT_RUN_SEED__ = undefined;
         return null;
     }
     window.CHART_TRIAL_CONFIG.runSeed = seed;
     window.CHART_TRIAL_CONFIG.lockRunSeed = Boolean(lock);
     if (typeof window.__ASCENT_SET_RUN_SEED__ === "function") {
         window.__ASCENT_SET_RUN_SEED__(seed);
+    } else {
+        const n = Number(seed);
+        if (Number.isFinite(n)) window.__ASCENT_RUN_SEED__ = n >>> 0;
     }
     return seed;
 }
@@ -282,6 +286,9 @@ class BrowserBackend:
             args.append(f"--force-device-scale-factor={dpr:g}")
         if args:
             kwargs["args"] = args
+        # Playwright 1.4x defaults to --no-startup-window; on some setups the
+        # game window never becomes visible on the target monitor.
+        kwargs["ignore_default_args"] = ["--no-startup-window"]
         self.browser = await self.playwright.chromium.launch(**kwargs)
         self.launched_browser = True
         # Content viewport stays at design size so gs=H/700 does not balloon.
@@ -295,8 +302,19 @@ class BrowserBackend:
             window.CHART_TRIAL_CONFIG = Object.assign(
               {},
               window.CHART_TRIAL_CONFIG || {},
-              { agentMode: true }
+              {
+                offlineMode: true,
+                agentMode: true,
+                devUnlockTiers: true,
+                trainingTierIndex: 0,
+                calendarApiBaseUrl: "https://ascent.xrd.workers.dev",
+                runSeed: null,
+                lockRunSeed: true,
+              }
             );
+            try {
+              localStorage.setItem("ascent-cosmetics-reveal-dismissed-v4", "1");
+            } catch (e) {}
             """
         )
         self.page = await self.context.new_page()
@@ -317,6 +335,8 @@ class BrowserBackend:
             )
         await self._ensure_client_fits_viewport()
         await self._log_viewport_metrics()
+        if getattr(self.config, "raise_on_launch", True):
+            await self._raise_game_window()
         self.status = await self._make_status(True, "launched", None)
         print(f"BROWSER_LAUNCHED url={self.page.url!r}", flush=True)
         return self.status
@@ -559,6 +579,27 @@ class BrowserBackend:
                 self.page.evaluate(
                     """() => {
                         try {
+                          document.getElementById('cosmeticsRevealOverlay')
+                            ?.classList.add('hidden');
+                          const mode = document.querySelector(
+                            '.mode-btn[data-ghost="0"]'
+                          );
+                          mode?.click();
+                          const play = document.getElementById('playBtn');
+                          const overlay = document.getElementById('startOverlay');
+                          if (play && overlay && !overlay.classList.contains('hidden')) {
+                            play.click();
+                            return 'playBtn';
+                          }
+                          const grid = document.getElementById('ultiSelectGrid');
+                          const confirm = document.getElementById('ultiSelectConfirm');
+                          if (grid && confirm) {
+                            const card = grid.querySelector('.ulti-card');
+                            card?.click();
+                            if (!confirm.disabled) confirm.click();
+                            else confirm.click();
+                            return 'ultiSelectConfirm';
+                          }
                           if (typeof startGame === 'function') {
                             startGame();
                             return 'startGame';
@@ -593,7 +634,8 @@ class BrowserBackend:
                           url: location.href,
                           score: digits ? parseInt(digits, 10) : null,
                           inMenu: body.includes('START THE ASCENT')
-                            || body.includes('PICK 1 ULTI'),
+                            || body.includes('PICK 1 ULTI')
+                            || body.includes('PREPARE FOR THE ASCENT'),
                           fell: body.includes('FELL')
                             || body.includes('BACK TO EARTH'),
                           hasCanvas: !!document.querySelector('#gameCanvas'),
@@ -658,6 +700,53 @@ class BrowserBackend:
             )
         except Exception as exc:
             print(f"CHROMIUM_PIN_CDP_FAIL {exc}", flush=True)
+
+    async def _raise_game_window(self) -> None:
+        """Bring Chromium to the foreground on the pinned monitor."""
+        if self.page is None or self.context is None:
+            return
+        origin = getattr(self, "_pinned_origin", None)
+        if origin is not None:
+            await self._pin_window_bounds(int(origin[0]), int(origin[1]))
+        try:
+            await self.page.bring_to_front()
+        except Exception as exc:
+            print(f"BROWSER_RAISE bring_to_front: {exc}", flush=True)
+        try:
+            session = await asyncio.wait_for(
+                self.context.new_cdp_session(self.page),
+                timeout=5.0,
+            )
+            await asyncio.wait_for(session.send("Page.bringToFront"), timeout=5.0)
+            target = await asyncio.wait_for(
+                session.send("Browser.getWindowForTarget"),
+                timeout=5.0,
+            )
+            window_id = target.get("windowId")
+            if window_id is not None:
+                await asyncio.wait_for(
+                    session.send(
+                        "Browser.setWindowBounds",
+                        {
+                            "windowId": window_id,
+                            "bounds": {"windowState": "normal"},
+                        },
+                    ),
+                    timeout=5.0,
+                )
+        except Exception as exc:
+            print(f"BROWSER_RAISE cdp: {exc}", flush=True)
+        try:
+            await self.page.evaluate("() => { try { window.focus(); } catch (e) {} }")
+        except Exception:
+            pass
+        if origin is not None:
+            print(
+                f"BROWSER_RAISE done look_at_monitor x={origin[0]} y={origin[1]}",
+                flush=True,
+            )
+        else:
+            print("BROWSER_RAISE done", flush=True)
 
     async def ensure_agent_mode(self) -> None:
         self._require_page()

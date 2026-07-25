@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#000000" />
+    <title>ASCENT : Climb the chart</title>
+    <link rel="icon" type="image/webp" href="ASCENT_token_1024_GREEN.webp" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Silkscreen:wght@400;700&family=VT323&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="colors_and_type.473222a7.css" />
+    <link rel="stylesheet" href="styles.f382e52a.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+
+      <!-- Main canvas area -->
+      <section class="game-wrap">
+        <canvas id="gameCanvas" aria-label="ASCENT — luminous orb climbing the crypto chart"></canvas>
+        <div class="crt-overlay" id="crtOverlay"></div>
+
+        <!-- HUD: score (top-left) -->
+        <div class="hud-score">
+          <span class="hud-lbl">SCORE</span>
+          <em id="heightScore">000000</em>
+          <span class="best-row"><span id="bestScoreLabel">BEST</span> <span id="bestScore">000000</span></span>
+          <div class="mult-chip" id="multChip">×1</div>
+        </div>
+
+        <!-- HUD: price (top-right) -->
+        <div class="hud-price">
+          <span id="tickerSymbol">ASTR</span>
+          <strong id="tickerPrice">---</strong>
+          <span id="tickerDelta" class="delta-neutral">24H ---</span>
+          <span class="hud-chart-timeframe">TIMEFRAME</span>
+          <div id="tf-selector">
+            <button class="tf-btn active" data-tf="1d">1D</button>
+            <button class="tf-btn" data-tf="4h">4H</button>
+            <button class="tf-btn" data-tf="1h">1H</button>
+            <button class="tf-btn" data-tf="30m">30M</button>
+            <button class="tf-btn" data-tf="5m">5M</button>
+            <button class="tf-btn" data-tf="1m">1M</button>
+          </div>
+        </div>
+
+        <!-- Energy + reserve bars (bottom-left, vertical, side by side) -->
+        <div class="energy-hud">
+          <div class="energy-wrap">
+            <span class="hud-lbl">⚡</span>
+            <div class="energy-bar"><span id="energyFill"></span></div>
+          </div>
+          <div class="reserve-wrap" id="reserveWrap">
+            <div class="reserve-bar"><span id="reserveFill"></span></div>
+          </div>
+        </div>
+
+        <!-- Ulti buttons (top center, in-game) -->
+        <div id="ultiButtons" class="ulti-buttons hidden"></div>
+
+        <!-- Test-only anomaly triggers -->
+        <div id="anomalyTestPanel" class="anomaly-test-panel hidden" aria-label="Test anomaly triggers">
+          <button type="button" data-anomaly-trigger="orderBookLadder">BOOK</button>
+          <button type="button" data-anomaly-trigger="highVolatility">CHOP</button>
+          <button type="button" data-anomaly-trigger="fomoGreenRush">FOMO</button>
+          <button type="button" data-anomaly-trigger="pumpAndDump">P&amp;D</button>
+          <button type="button" data-anomaly-trigger="circuitBreaker">BREAK</button>
+        </div>
+
+        <!-- Active anomaly banner -->
+        <div id="anomalyHudBanner" class="anomaly-hud-banner hidden" aria-live="polite"></div>
+
+        <!-- Combo badge -->
+        <div class="combo-badge hidden" id="comboBadge">x1 STREAK</div>
+
+        <!-- Market impact flash -->
+        <div class="impact-flash hidden" id="impactFlash">
+          <span class="impact-label" id="impactLabel">BUY SURGE</span>
+          <strong id="impactValue">+0.0%</strong>
+        </div>
+
+        <!-- Tier-up toast -->
+        <div class="tier-toast" id="tierToast" role="status" aria-live="polite" aria-atomic="true">
+          <div class="tt-kick">TIER UNLOCKED</div>
+          <div class="tt-name" id="ttName">PULSE</div>
+          <div class="tt-perk" id="ttPerk"></div>
+        </div>
+
+        <div class="tier-toast achievement-toast" id="achievementToast" role="status" aria-live="polite" aria-atomic="true">
+          <div class="tt-kick">BADGE UNLOCKED</div>
+          <div class="tt-name" id="atName">—</div>
+          <div class="tt-perk">Open ✦ BADGES to claim it</div>
+        </div>
+
+        <!-- Maintenance overlay (global server pause) -->
+        <div class="overlay hidden" id="maintenanceOverlay" style="z-index:100;background:rgba(3,7,6,.95)">
+          <div class="overlay-card">
+            <div class="overlay-kicker"><span></span>SERVER</div>
+            <h2>MAINTENANCE</h2>
+            <p id="maintenanceSince" style="opacity:.7;font-size:14px">The game is temporarily paused.</p>
+          </div>
+        </div>
+
+        <!-- Pause overlay -->
+        <div class="pause-overlay hidden" id="pauseOverlay">
+          <div class="pause-card">
+            <div class="overlay-kicker"><span></span>RUN SUSPENDED</div>
+            <h2>PAUSED</h2>
+            <button class="play-btn" id="resumeBtn" type="button"><span>▶</span> RESUME</button>
+            <button class="play-btn play-btn-secondary" id="pauseMenuBtn" type="button"><span>↩</span> MAIN MENU</button>
+            <small>ESC TO RESUME</small>
+          </div>
+        </div>
+
+        <!-- Start overlay -->
+        <div class="overlay" id="startOverlay">
+          <div class="overlay-card">
+            <h1>ASCENT</h1>
+            <p>A luminous orb climbs the chart.</p>
+            <div class="preview-row">
+              <div><small>MARKET</small><b id="previewPair">---</b></div>
+              <div><small>STATUS</small><b id="previewStatus">LOADING</b></div>
+            </div>
+            <div class="tier-panel">
+              <div class="tier-select">
+                <div class="tier-select-head"><span>SELECT TIER</span><b id="tierSelectName">1 · GENESIS</b></div>
+                <div id="tierPath" class="tier-path" role="group" aria-label="Select tier"></div>
+              </div>
+              <div class="tier-unlock-meter" aria-live="polite">
+                <div class="tier-unlock-head">
+                  <span id="tierUnlockLabel">NEXT TIER</span>
+                  <strong id="tierUnlockStatus">LOADING</strong>
+                </div>
+                <div class="tier-unlock-bar"><span id="tierUnlockFill"></span></div>
+              </div>
+            </div>
+            <div class="start-best-score hidden" id="startBestScore">
+              <small>PERSONAL BEST</small><b id="startBestScoreVal">—</b><span class="start-best-rank hidden" id="startBestRank">RANK <b id="startBestRankVal">—</b></span>
+            </div>
+            <label class="player-name-field">
+              <span>PLAYER NAME</span>
+              <div class="name-input-wrap">
+                <input id="playerNameInput" type="text" maxlength="8" autocomplete="off" placeholder="PLAYER" />
+                <span class="name-full-msg" id="nameFullMsg">SLOT FULL</span>
+              </div>
+            </label>
+            <div class="mode-toggle" id="ghostModeToggle" role="group" aria-label="Select game mode">
+              <button type="button" class="mode-btn active" data-ghost="0">ASCENT</button>
+              <button type="button" class="mode-btn mode-btn-beacon" data-ghost="1">Beacon Mode ✦</button>
+              <div class="menu-thermo hidden" id="menuThermo" aria-hidden="true">
+                <span class="mt-tube"><span class="mt-mercury"></span></span>
+                <span class="mt-bulb"></span>
+              </div>
+            </div>
+            <span class="mode-badge" id="beaconModeBadge">EVENT · MOBILE</span>
+            <button class="play-btn" id="playBtn">
+              <span>▶</span> PREPARE FOR THE ASCENT
+            </button>
+            <button class="wallet-start-cta" id="startWalletCta" type="button"><span class="wcta-main"><svg class="radix-logo" viewBox="0 0 16 12" aria-hidden="true"><path d="M5.76371 11.7183C5.51434 11.7183 5.27726 11.5986 5.12862 11.3925L2.02442 7.07097H0V5.49758H2.42488C2.67671 5.49758 2.91256 5.61852 3.05997 5.82337L5.59664 9.35391L9.46737 0.471398C9.59266 0.185104 9.87397 0 10.1848 0H15.0235V1.57338H10.697L6.4811 11.2469C6.36809 11.5061 6.12609 11.6838 5.84601 11.7134C5.82021 11.7171 5.79196 11.7183 5.76371 11.7183Z" fill="currentColor"/></svg> LINK WALLET</span><span class="wcta-sub">unlock shop &amp; badges</span></button>
+          </div>
+        </div>
+
+        <!-- Preparation overlay (ultimate + cosmetic) -->
+        <div class="overlay hidden" id="ultiSelectScreen">
+          <div class="overlay-card ulti-select-card prep-card">
+            <div class="overlay-kicker"><span></span><span id="ultiSelectKicker">PREPARE FOR THE ASCENT</span></div>
+            <!-- THERMAL PROTOCOL — community boss briefing (Slice 9). Shown only in thermal mode; the shared
+                 gauge + the ASCENT reward pool the admin set are surfaced on the prep screen before launch. -->
+            <div class="thermal-prep-info hidden" id="thermalPrepInfo">
+              <h1 class="thermal-title">THERMAL PROTOCOL</h1>
+              <div class="thermal-card">
+                <div class="overlay-kicker"><span></span>LIVE OPERATION</div>
+                <div class="tpi-gauge">
+                  <div class="tpi-row"><span class="tpi-label" id="thermalPrepHpLabel">THE RED GIANT · CORE</span><span class="tpi-hp" id="thermalPrepHp">—</span></div>
+                  <div class="tpi-bar"><span class="tpi-bar-fill" id="thermalPrepBar"></span></div>
+                </div>
+                <div class="tpi-row"><span class="tpi-label">TIME LEFT</span><span class="tpi-time" id="thermalPrepTime">—</span></div>
+                <div class="tpi-row"><span class="tpi-label">REWARD POOL</span><span class="tpi-pool" id="thermalPrepPool">—</span></div>
+                <div class="tpi-row"><span class="tpi-label">CONTRIBUTORS</span><span class="tpi-contrib" id="thermalPrepContrib">—</span></div>
+                <div class="tpi-row"><span class="tpi-label">YOUR SCORE</span><span class="tpi-score" id="thermalPrepYourScore">—</span></div>
+                <p class="tpi-note" id="thermalPrepNote"></p>
+                <div class="thermal-victory-stats hidden" id="thermalVictoryStats">
+                  <strong>COMMUNITY SUPERNOVA</strong>
+                  <span id="thermalVictorySummary">—</span>
+                  <span id="thermalVictoryFinalAttacker">—</span>
+                </div>
+              </div>
+              <button class="beacon-how-btn thermal-how-btn" id="thermalHowItWorks" type="button">HOW IT WORKS</button>
+              <button class="play-btn thermal-replay-btn hidden" id="thermalVictoryReplayBtn" type="button"><span>▶</span> REPLAY COMMUNITY SUPERNOVA</button>
+            </div>
+            <div class="prep-body">
+              <div class="cos-equipper">
+                <div class="cos-orb-stage">
+                  <canvas class="cos-orb-canvas" width="260" height="200"></canvas>
+                </div>
+                <div class="cos-tiles"></div>
+                <div class="cos-dropdowns">
+                  <label class="cos-dd"><span>AURA</span>
+                    <select class="cos-select" data-cos-axis="AuraSkin"><option value="">NONE</option></select></label>
+                  <label class="cos-dd"><span>SATELLITE</span>
+                    <select class="cos-select" data-cos-axis="SatelliteSkin"><option value="">NONE</option></select></label>
+                  <label class="cos-dd"><span>TRAIL</span>
+                    <select class="cos-select" data-cos-axis="TrailSkin"><option value="">NONE</option></select></label>
+                </div>
+                <p class="cos-hint hidden">◇ LINK WALLET to change cosmetic</p>
+              </div>
+              <h2 id="ultiSelectTitle">PICK 1 ULTI</h2>
+              <div id="ultiSelectGrid"></div>
+              <button class="ulti-select-hint ulti-hint-btn" id="ultiHintBtn">ULTIMATE DETAILS <span class="hint-key">?</span></button>
+            </div>
+            <div class="prep-footer">
+              <button class="play-btn play-btn-secondary" id="ultiSelectBack" type="button"><span>↩</span> BACK</button>
+              <button class="play-btn" id="ultiSelectConfirm" disabled><span>▶</span> START THE ASCENT</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Beacon Mode preparation overlay -->
+        <div class="overlay hidden" id="beaconPrepScreen">
+          <div class="overlay-card prep-card beacon-prep-card">
+            <div class="prep-body">
+            <h1 class="beacon-title">BEACON MODE</h1>
+            <p class="beacon-slogan">Beat the Beacon. Become the Beacon.</p>
+            <div class="beacon-card" id="beaconCard">
+              <div class="overlay-kicker"><span></span>CURRENT BEACON</div>
+              <dl class="beacon-stats">
+                <div class="beacon-row"><dt>BEACON</dt><dd class="beacon-name" id="beaconName">—</dd></div>
+                <div class="beacon-row"><dt>TIME</dt><dd class="beacon-time" id="beaconTime">—</dd></div>
+                <div class="beacon-row"><dt>SCORE</dt><dd class="beacon-score" id="beaconScore">—</dd></div>
+                <div class="beacon-row"><dt>RADIANCE</dt><dd class="beacon-pot" id="beaconPot">—</dd></div>
+              </dl>
+              <p class="beacon-attempts" id="beaconAttempts"></p>
+              <p class="beacon-phase hidden"></p>
+              <p class="beacon-empty hidden" id="beaconEmpty">No Beacon yet — be the first light.</p>
+            </div>
+            <p class="beacon-live-status" id="beaconLiveStatus"></p>
+            <button class="beacon-how-btn" id="beaconHowItWorks" type="button">HOW IT WORKS</button>
+            </div>
+            <div class="prep-footer">
+              <button class="play-btn" id="beaconStartLive" type="button"><span>⚡</span> ENTER LIVE — <span class="beacon-entry-price" id="beaconEntryPrice">50</span> XRD</button>
+              <button class="play-btn play-btn-secondary" id="beaconStartPractice" type="button"><span>▶</span> FREE PRACTICE <span class="beacon-cap-tag">max 17k px</span></button>
+              <button class="play-btn play-btn-secondary" id="beaconBack" type="button"><span>↩</span> BACK</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Finish overlay -->
+        <div class="overlay hidden" id="finishOverlay">
+          <div class="overlay-card">
+            <div class="overlay-kicker" id="finishKicker">FELL</div>
+            <h2 id="finishTitle">BACK TO EARTH.</h2>
+            <!-- BEACON finish: one-line score + current Beacon standings (no leaderboard / max combo) -->
+            <div class="beacon-finish hidden" id="beaconFinishBlock">
+              <p class="beacon-finish-score">SCORE&nbsp;:&nbsp;<span id="beaconFinishScore">0000000</span></p>
+              <div class="ghost-finish-result hidden" id="ghostFinishResult"></div>
+              <div class="beacon-card" id="beaconCardFinish">
+                <div class="overlay-kicker"><span></span>CURRENT BEACON</div>
+                <dl class="beacon-stats">
+                  <div class="beacon-row"><dt>BEACON</dt><dd class="beacon-name">—</dd></div>
+                  <div class="beacon-row"><dt>TIME</dt><dd class="beacon-time">—</dd></div>
+                  <div class="beacon-row"><dt>SCORE</dt><dd class="beacon-score">—</dd></div>
+                  <div class="beacon-row"><dt>RADIANCE</dt><dd class="beacon-pot">—</dd></div>
+                </dl>
+                <p class="beacon-attempts"></p>
+                <p class="beacon-phase hidden"></p>
+                <p class="beacon-empty hidden">No Beacon yet — be the first light.</p>
+              </div>
+            </div>
+            <div class="finish-stats">
+              <div><small>SCORE</small><strong id="finalHeight">000000</strong></div>
+              <div><small>MAX COMBO</small><strong id="finalCombo">x0</strong></div>
+              <div class="hidden" id="finishRankStat"><small>RANK</small><strong id="finalRank">—</strong></div>
+            </div>
+            <div class="lb-tabs lb-tabs--compact">
+              <button class="lb-tab lb-tab--active" id="finishLbTabTemporary">CONTEST</button>
+              <button class="lb-tab" id="finishLbTabAllTime">ALL-TIME</button>
+            </div>
+            <div class="leaderboard" id="leaderboard"></div>
+            <button class="play-btn" id="replayBtn"><span>↻</span> ASCEND AGAIN</button>
+            <button class="play-btn play-btn-secondary" id="finishMenuBtn" type="button"><span>↩</span> CHANGE MODE</button>
+            <button class="wallet-start-cta" id="finishWalletCta" type="button"><span class="wcta-main"><svg class="radix-logo" viewBox="0 0 16 12" aria-hidden="true"><path d="M5.76371 11.7183C5.51434 11.7183 5.27726 11.5986 5.12862 11.3925L2.02442 7.07097H0V5.49758H2.42488C2.67671 5.49758 2.91256 5.61852 3.05997 5.82337L5.59664 9.35391L9.46737 0.471398C9.59266 0.185104 9.87397 0 10.1848 0H15.0235V1.57338H10.697L6.4811 11.2469C6.36809 11.5061 6.12609 11.6838 5.84601 11.7134C5.82021 11.7171 5.79196 11.7183 5.76371 11.7183Z" fill="currentColor"/></svg> LINK WALLET</span><span class="wcta-sub">save your score</span></button>
+          </div>
+        </div>
+
+        <!-- BOSS co-op mode finish overlay (special game mode). VALIDATE commits this run's damage to the
+             community gauge (idempotent, saved on this device). REDO restarts a boss run. -->
+        <div class="overlay hidden" id="bossFinishOverlay">
+          <div class="overlay-card">
+            <div class="overlay-kicker" id="bossFinishKicker">THERMAL PROTOCOL</div>
+            <h2 id="bossFinishTitle">RUN OVER.</h2>
+            <div class="finish-stats">
+              <div><small>HEIGHT</small><strong id="bossFinishHeight">000000</strong></div>
+              <div><small>YOUR CORE HP</small><strong id="bossFinishHp">0</strong></div>
+            </div>
+            <div class="finish-stats">
+              <div><small>DAMAGE DEALT</small><strong id="bossFinishFinal">0</strong></div>
+            </div>
+            <!-- Community boss HP: shared gauge, this run's projected contribution -->
+            <div style="margin:10px 0 4px;">
+              <small id="bossFinishGaugeLabel" style="opacity:.7;letter-spacing:.04em;">COMMUNITY BOSS HP</small>
+              <div style="height:10px;background:rgba(8,12,16,.6);border:1px solid rgba(255,255,255,.18);border-radius:3px;overflow:hidden;margin-top:4px;">
+                <div id="bossFinishGaugeFill" style="height:100%;width:100%;background:#ff7a1e;transition:width .5s ease;"></div>
+              </div>
+              <small id="bossFinishGaugeText" style="opacity:.7;">0 / 0</small>
+            </div>
+            <p id="bossFinishResult" style="font-size:12px;opacity:.85;margin:8px 0 10px;">SUBMITTING RUN…</p>
+            <div class="thermal-victory-stats hidden" id="bossVictoryStats">
+              <strong>COMMUNITY SUPERNOVA</strong>
+              <span id="bossVictorySummary">—</span>
+            </div>
+            <button class="play-btn hidden" id="bossVictoryReplayBtn" type="button"><span>▶</span> REPLAY THE EXPLOSION</button>
+            <button class="play-btn" id="bossRedoBtn"><span>↻</span> REDO</button>
+            <button class="play-btn play-btn-secondary" id="bossMenuBtn" type="button"><span>↩</span> MENU</button>
+          </div>
+        </div>
+
+        <!-- All tiers leaderboard overlay -->
+        <div class="overlay hidden" id="leaderboardOverlay">
+          <div class="overlay-card leaderboard-card">
+            <button class="overlay-close-btn" data-close-overlay="leaderboardOverlay" aria-label="Close">×</button>
+            <h2 id="leaderboardTitle">ASCENT<br>LEADERBOARD</h2>
+            <div class="lb-tabs">
+              <button class="lb-tab lb-tab--active" id="lbTabTemporary">CONTEST</button>
+              <button class="lb-tab" id="lbTabAllTime">ALL-TIME</button>
+            </div>
+            <div class="leaderboard-all" id="leaderboardAll"></div>
+          </div>
+        </div>
+
+        <!-- Profile overlay -->
+        <div class="overlay hidden" id="profileOverlay">
+          <div class="overlay-card profile-card">
+            <button class="overlay-close-btn" id="profileCloseBtn" aria-label="Close">×</button>
+
+            <!-- Hero header -->
+            <div class="profile-hero">
+              <div class="profile-avatar-wrap"><canvas id="profileAvatar" width="96" height="96"></canvas></div>
+              <div class="profile-id">
+                <div class="profile-name" id="profileName">PLAYER</div>
+                <div class="profile-address" id="profileAddress">—</div>
+                <a href="/admin" target="_blank" class="profile-admin-link hidden" id="profileAdminBtn">⚙ ADMIN PANEL</a>
+              </div>
+            </div>
+
+            <!-- Tabs -->
+            <nav class="profile-tabs" aria-label="Profile sections">
+              <button class="profile-tab active" type="button" data-prof-tab="overview">OVERVIEW</button>
+              <button class="profile-tab" type="button" data-prof-tab="career">CAREER</button>
+              <button class="profile-tab" type="button" data-prof-tab="inventory">INVENTORY</button>
+            </nav>
+
+            <!-- Scrollable body -->
+            <div class="profile-scroll" id="profileScroll">
+              <section class="profile-pane active" data-prof-pane="overview">
+                <div class="profile-stat profile-stat--featured">
+                  <span class="profile-stat-label">PERSONAL BEST</span>
+                  <span class="profile-stat-val" id="profileBestScore">—</span>
+                </div>
+                <div class="profile-stats">
+                  <div class="profile-stat hidden" id="profileRankStat"><span class="profile-stat-label">ALL-TIME RANK</span><span class="profile-stat-val" id="profileRank">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">ASCENT</span><span class="profile-stat-val"><img class="ascent-token-logo" src="ASCENT_token_1024.webp" alt="" width="14" height="14" decoding="async"><span id="profileAscentBal">—</span></span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">RUNS</span><span class="profile-stat-val" id="profileRuns">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">DAY STREAK</span><span class="profile-stat-val" id="profileStreak">—</span></div>
+                </div>
+              </section>
+
+              <section class="profile-pane" data-prof-pane="career">
+                <div class="profile-stats profile-stats--grid">
+                  <div class="profile-stat"><span class="profile-stat-label">TOTAL PLAYTIME</span><span class="profile-stat-val" id="profilePlaytime">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">BEST HEIGHT</span><span class="profile-stat-val" id="profileBestHeight">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">BOUNCES</span><span class="profile-stat-val" id="profileBounces">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">ULTIMATES</span><span class="profile-stat-val" id="profileUltimates">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">MAX RUNS / DAY</span><span class="profile-stat-val" id="profileMaxRunsDay">—</span></div>
+                  <div class="profile-stat"><span class="profile-stat-label">BEST IMPROVE STREAK</span><span class="profile-stat-val" id="profileBestStreak">—</span></div>
+                  <div class="profile-stat profile-stat--wide"><span class="profile-stat-label">LAST RUN</span><span class="profile-stat-val" id="profileLastRun">—</span></div>
+                </div>
+                <div class="profile-stat profile-stat--wide" style="margin-top:12px"><span class="profile-stat-label">SPECIAL EVENTS · BEACON / THERMAL</span><span class="profile-stat-val" id="profileSpecialRuns">—</span></div>
+                <div id="profileSpecialRecent" style="font-size:11px;color:var(--muted);margin-top:8px"></div>
+              </section>
+
+              <section class="profile-pane" data-prof-pane="inventory">
+                <div class="cos-equipper">
+                  <div class="cos-orb-stage">
+                    <canvas class="cos-orb-canvas" width="260" height="200"></canvas>
+                  </div>
+                  <div class="cos-tiles"></div>
+                  <div class="cos-dropdowns">
+                    <label class="cos-dd"><span>AURA</span>
+                      <select class="cos-select" data-cos-axis="AuraSkin"><option value="">NONE</option></select></label>
+                    <label class="cos-dd"><span>SATELLITE</span>
+                      <select class="cos-select" data-cos-axis="SatelliteSkin"><option value="">NONE</option></select></label>
+                    <label class="cos-dd"><span>TRAIL</span>
+                      <select class="cos-select" data-cos-axis="TrailSkin"><option value="">NONE</option></select></label>
+                  </div>
+                  <p class="cos-hint hidden">◇ LINK WALLET to change cosmetic</p>
+                </div>
+                <div class="inv-badges hidden" id="profileBadges"></div>
+              </section>
+            </div>
+          </div>
+        </div>
+
+        <!-- Shop overlay -->
+        <div class="overlay hidden" id="shopOverlay">
+          <div class="overlay-card shop-card">
+            <button class="overlay-close-btn" data-close-overlay="shopOverlay" aria-label="Close">×</button>
+            <div class="shop-balance" id="shopBalance" hidden>
+              <img class="shop-balance-logo" src="ASCENT_token_1024.webp" alt="ASCENT" width="16" height="16" decoding="async">
+              <span class="shop-balance-val" id="shopBalanceVal">—</span>
+            </div>
+            <h2 class="shop-title">◈ SHOP</h2>
+            <nav class="shop-tabs" aria-label="Shop sections">
+              <button class="shop-tab active" type="button" data-shop-tab="materials">◈ COSMETICS</button>
+              <button class="shop-tab" type="button" data-shop-tab="buy-ascent">◈ BUY ASCENT</button>
+            </nav>
+            <div class="shop-card-body">
+              <!-- Materials pane (cosmetics) -->
+              <section class="shop-pane active" data-shop-pane="materials">
+                <h2>◈ COSMETICS</h2>
+                <!-- Locked state -->
+                <div class="shop-locked" id="shopLockedState">
+                  <p class="shop-locked-msg">Loading shop…</p>
+                  <div class="graduation-bar-wrap hidden">
+                    <div class="graduation-bar" id="graduationBar" style="width:0%"></div>
+                  </div>
+                  <div class="graduation-pct hidden" id="graduationPct">0%</div>
+                </div>
+                <!-- Unlocked state -->
+                <div class="shop-unlocked hidden" id="shopUnlockedState">
+                  <div class="shop-filter" id="shopFilterBar" role="tablist">
+                    <button class="shop-filter-btn active" type="button" data-shop-filter="ALL">◆ SETS</button>
+                    <button class="shop-filter-btn" type="button" data-shop-filter="ORBS">ORBS</button>
+                    <button class="shop-filter-btn" type="button" data-shop-filter="AURAS">AURAS</button>
+                    <button class="shop-filter-btn" type="button" data-shop-filter="SATELLITES">SAT</button>
+                    <button class="shop-filter-btn" type="button" data-shop-filter="TRAILS">TRAILS</button>
+                  </div>
+                  <div class="shop-item-grid" id="shopItemGrid"><!-- injected by JS --></div>
+                </div>
+                <p class="shop-no-wallet hidden" id="shopNoWallet"><a id="shopConnectLink" class="shop-connect-link">Connect your Radix wallet to buy cosmetics</a></p>
+                <p class="shop-burn-notice">SALES : ▲ 70% burned <br class="burn-br"> ◈ 30% reward vault</p>
+              </section>
+
+              <!-- Buy Ascent pane (integrated XRD→ASCENT swap) -->
+              <section class="shop-pane" data-shop-pane="buy-ascent">
+                <h2>◈ BUY ASCENT</h2>
+                <p class="swap-closed-notice hidden" id="swapClosedNotice">In-app swap isn't open yet.<br>Use the external swap below to buy ASCENT.</p>
+                <p class="shop-no-wallet hidden" id="swapNoWallet"><a id="swapConnectLink" class="shop-connect-link"></a></p>
+                <div class="swap-form hidden" id="swapForm">
+                  <label class="swap-field">
+                    <span class="swap-field-label">YOU PAY</span>
+                    <span class="swap-input-wrap">
+                      <input id="swapXrdInput" class="swap-input" type="text" inputmode="decimal" placeholder="0" autocomplete="off" spellcheck="false">
+                      <button type="button" class="swap-token-select" id="swapTokenSelect" aria-haspopup="listbox" aria-expanded="false">
+                        <span class="swap-token-logo-slot" id="swapTokenLogo"><svg class="swap-token-logo" viewBox="0 0 16 12" aria-hidden="true"><path d="M5.76371 11.7183C5.51434 11.7183 5.27726 11.5986 5.12862 11.3925L2.02442 7.07097H0V5.49758H2.42488C2.67671 5.49758 2.91256 5.61852 3.05997 5.82337L5.59664 9.35391L9.46737 0.471398C9.59266 0.185104 9.87397 0 10.1848 0H15.0235V1.57338H10.697L6.4811 11.2469C6.36809 11.5061 6.12609 11.6838 5.84601 11.7134C5.82021 11.7171 5.79196 11.7183 5.76371 11.7183Z" fill="currentColor"/></svg></span>
+                        <span class="swap-token-sym" id="swapTokenSym">XRD</span>
+                        <span class="swap-token-caret" aria-hidden="true">▾</span>
+                      </button>
+                      <div class="swap-token-menu hidden" id="swapTokenMenu" role="listbox"></div>
+                    </span>
+                  </label>
+                  <div class="swap-balance" id="swapBalance">
+                    <div class="swap-balance-line">You have <span id="swapBalanceAmount">—</span> <span id="swapBalanceUnit">XRD</span> available</div>
+                    <input id="swapPctSlider" class="swap-pct-slider" type="range" min="0" max="100" step="1" value="0" aria-label="Percentage of balance to swap" disabled>
+                    <div class="swap-pct-marks">
+                      <button type="button" class="swap-pct-mark" data-pct="25">25%</button>
+                      <button type="button" class="swap-pct-mark" data-pct="50">50%</button>
+                      <button type="button" class="swap-pct-mark" data-pct="75">75%</button>
+                      <button type="button" class="swap-pct-mark" data-pct="100">MAX</button>
+                    </div>
+                  </div>
+                  <label class="swap-field">
+                    <span class="swap-field-label">YOU RECEIVE</span>
+                    <span class="swap-input-wrap swap-receive-wrap">
+                      <span class="swap-input swap-receive-amount" id="swapReceive">—</span>
+                      <span class="swap-token-static">
+                        <img class="swap-token-logo" src="ASCENT_token_1024.webp" alt="" width="16" height="16" decoding="async">
+                        <span class="swap-token-sym">ASCENT</span>
+                      </span>
+                    </span>
+                  </label>
+                  <div class="swap-quote">
+                    <div class="swap-quote-row"><span>Price impact</span><span id="swapImpact">—</span></div>
+                    <div class="swap-quote-row"><span>Fee</span><span id="swapFee">—</span></div>
+                  </div>
+                  <button class="shop-buy-btn swap-btn" id="swapBtn" type="button" disabled>SWAP</button>
+                  <p class="swap-msg hidden" id="swapMsg"></p>
+                </div>
+                <div class="swap-foot">
+                  <a class="swap-external-link buy-ascent-btn" href="https://astrolescent.com/swap?from=resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd&to=resource_rdx1t46jpmzf97s7q5h4tv42hcjyalhq84znevngtsul5wcumxfdprnlp3" target="_blank" rel="noopener noreferrer">Open external swap ↗</a>
+                  <a class="swap-attribution" href="https://astrolescent.com/swap?from=resource_rdx1tknxxxxxxxxxradxrdxxxxxxxxx009923554798xxxxxxxxxradxrd&to=resource_rdx1t46jpmzf97s7q5h4tv42hcjyalhq84znevngtsul5wcumxfdprnlp3" target="_blank" rel="noopener noreferrer">Powered by Astrolescent</a>
+                </div>
+              </section>
+            </div>
+          </div>
+        </div>
+
+        <!-- THERMAL event trailer overlay (shown once on launch; baked-down video, not the old
+             heavy JS/canvas bundle). Shows the ASCENT card poster with a ▶ PLAY button; tapping
+             PLAY plays the trailer with sound (a real gesture, so audio is allowed). -->
+        <div class="overlay hidden" id="cosmeticsRevealOverlay">
+          <div class="reveal-frame">
+            <div class="reveal-video-wrap">
+              <video id="beaconTrailerVideo" class="reveal-video" playsinline preload="none"
+                     poster="/reveal/thermal-trailer-poster.jpg" title="ASCENT — THERMAL Event Trailer">
+                <source src="/reveal/thermal-trailer.mp4" type="video/mp4">
+                <source src="/reveal/thermal-trailer.webm" type="video/webm">
+              </video>
+              <button type="button" class="reveal-close-btn" data-close-reveal aria-label="Close trailer">×</button>
+              <button type="button" id="beaconTrailerPlay" class="reveal-play-btn" aria-label="Play trailer"></button>
+            </div>
+            <div class="reveal-controls">
+              <label class="reveal-dontshow">
+                <input type="checkbox" id="cosmeticsRevealDontShow"> Don't show again
+              </label>
+              <button class="play-btn" type="button" id="cosmeticsRevealShopBtn">PLAY THERMAL ▶</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Achievements overlay -->
+        <div class="overlay hidden" id="achievementsOverlay">
+          <div class="overlay-card achievements-card">
+            <button class="overlay-close-btn" data-close-overlay="achievementsOverlay" aria-label="Close">×</button>
+            <h2>✦ BADGES</h2>
+            <div class="ach-body" id="achievementsGrid">
+              <p class="ach-loading">Loading badges…</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- How to play overlay -->
+        <div class="overlay hidden" id="howToPlayOverlay">
+          <div class="overlay-card how-to-card">
+            <button class="overlay-close-btn" data-close-overlay="howToPlayOverlay" aria-label="Close">×</button>
+            <div class="how-to-head">
+              <h2>HOW TO PLAY</h2>
+              <p>Climb the live chart. Chain your bounces. Push the orb higher.</p>
+            </div>
+            <nav class="how-to-tabs" aria-label="How to play sections">
+              <div class="how-to-tabs-main">
+                <button class="how-to-tab active" type="button" data-guide-tab="chart">CLIMB THE CHART</button>
+                <button class="how-to-tab" type="button" data-guide-tab="unlocks">UNLOCK MECHANICS</button>
+                <button class="how-to-tab" type="button" data-guide-tab="beacon">BEACON MODE</button>
+                <button class="how-to-tab hidden" type="button" data-guide-tab="thermal">THERMAL PROTOCOL</button>
+              </div>
+              <div class="how-to-tabs-sub">
+                <button class="how-to-tab" type="button" data-guide-tab="ultimates">ULTIMATES</button>
+                <button class="how-to-tab" type="button" data-guide-tab="anomalies">ANOMALIES</button>
+                <button class="how-to-tab" type="button" data-guide-tab="tiers">TIER</button>
+              </div>
+            </nav>
+            <div class="how-to-scroll" id="howToPlayContent"></div>
+          </div>
+        </div>
+
+        <!-- Options overlay -->
+        <div class="overlay hidden" id="mixerPanel">
+          <div class="overlay-card options-card">
+            <button class="overlay-close-btn" id="optionsCloseX" aria-label="Close">×</button>
+            <h2>SETTINGS</h2>
+            <div class="mixer-row">
+              <button class="mix-mute-btn" id="muteMusicBtn" aria-label="Mute music">
+                <svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path class="sw" d="M14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54Z"/></svg>
+              </button>
+              <span class="mix-label">MUSIC</span>
+              <input type="range" class="mix-slider" id="musicVolumeSlider" min="0" max="1" step="0.01" value="0.25" aria-label="Music volume">
+            </div>
+            <div class="mixer-row">
+              <button class="mix-mute-btn" id="muteSfxBtn" aria-label="Mute SFX">
+                <svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Z"/><path class="sw" d="M14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54Z"/></svg>
+              </button>
+              <span class="mix-label">SFX</span>
+              <input type="range" class="mix-slider" id="sfxVolumeSlider" min="0" max="1" step="0.02" value="1" aria-label="SFX volume">
+            </div>
+            <div class="options-divider"></div>
+            <div class="options-row">
+              <span>VIBRATION</span>
+              <button class="options-toggle" id="vibrationToggle" type="button" aria-pressed="true">ON</button>
+            </div>
+            <div class="options-row">
+              <span>QUALITY</span>
+              <button class="options-toggle" id="qualityToggle" type="button">AUTO</button>
+            </div>
+            <div class="options-row">
+              <span>ULTIMATE POSITION</span>
+              <button class="options-toggle on" id="ultiPosToggle" type="button">BOTTOM</button>
+            </div>
+            <div class="desktop-key-options">
+              <div class="options-divider"></div>
+              <div class="options-subtitle">ULTI KEYS</div>
+              <div class="ulti-key-row">
+                <span>SLOT 1</span><button class="ulti-key-btn" type="button" data-ulti-key-slot="0">Q</button>
+                <span>SLOT 2</span><button class="ulti-key-btn" type="button" data-ulti-key-slot="1">E</button>
+                <span>SLOT 3</span><button class="ulti-key-btn" type="button" data-ulti-key-slot="2">Z</button>
+              </div>
+              <div class="options-divider"></div>
+              <div class="options-subtitle">CONTROLS</div>
+              <div class="ulti-key-row">
+                <span>PAUSE</span><button class="ulti-key-btn" type="button" data-ctrl-key="pause">ESC</button>
+                <span>JUMP</span><button class="ulti-key-btn" type="button" data-ctrl-key="boost">SPC</button>
+                <span>LEFT</span><button class="ulti-key-btn" type="button" data-ctrl-key="left">A</button>
+                <span>RIGHT</span><button class="ulti-key-btn" type="button" data-ctrl-key="right">D</button>
+              </div>
+            </div>
+            <div class="gamepad-options">
+              <div class="options-divider"></div>
+              <div class="options-row">
+                <span>GAMEPAD</span>
+                <button class="options-toggle" id="gamepadStatus" type="button" disabled>NOT DETECTED</button>
+              </div>
+              <div class="gamepad-map hidden" id="gamepadMap">
+                <div class="options-subtitle">GAMEPAD MAP</div>
+                <div class="gamepad-map-row">
+                  <span>LEFT</span><button class="ulti-key-btn" type="button" data-gamepad-action="left">A0-</button>
+                  <span>RIGHT</span><button class="ulti-key-btn" type="button" data-gamepad-action="right">A0+</button>
+                  <span>JUMP</span><button class="ulti-key-btn" type="button" data-gamepad-action="boost">A/×</button>
+                  <span>PAUSE</span><button class="ulti-key-btn" type="button" data-gamepad-action="pause">START</button>
+                  <span>ULTI 1</span><button class="ulti-key-btn" type="button" data-gamepad-action="ulti1">LB/L1</button>
+                  <span>ULTI 2</span><button class="ulti-key-btn" type="button" data-gamepad-action="ulti2">RB/R1</button>
+                  <span>ULTI 3</span><button class="ulti-key-btn" type="button" data-gamepad-action="ulti3">Y/△</button>
+                </div>
+                <div class="options-message gamepad-message">STICK / D-PAD / BUTTON SUPPORTED</div>
+              </div>
+            </div>
+            <div class="options-message" id="optionsMessage" role="status" aria-live="polite"></div>
+            <button class="options-reset" id="optionsResetBtn" type="button">RESET DEFAULTS</button>
+          </div>
+        </div>
+
+        <!-- Bottom bar -->
+        <div class="bottom-bar">
+          <!-- Tracklist popup (anchored inside bottom-bar, floats above it) -->
+          <div class="tracklist-panel hidden" id="tracklistPanel">
+            <div class="tracklist-head">
+              <button class="icon-btn player-btn" id="prevTrackBtn" aria-label="Restart track" title="Restart current track">⏮</button>
+              <div class="track-info">
+                <span id="trackTitle" class="track-title">—</span>
+              </div>
+              <button class="icon-btn player-btn" id="nextTrackBtn" aria-label="Next track">⏭</button>
+            </div>
+            <div id="tracklistItems"></div>
+          </div>
+
+          <div class="bar-row" aria-label="Game bar">
+            <!-- Run + audio controls (in-run only): always on the left -->
+            <button class="icon-btn run-only bar-run" id="pauseBtn" type="button" aria-label="Pause game" disabled>
+              <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5h4v14H6Zm8 0h4v14h-4Z"/></svg>
+              <svg class="resume-icon hidden" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 4 13 8-13 8Z"/></svg>
+            </button>
+            <button class="icon-btn bar-track-select bar-run" id="trackListBtn" type="button" aria-label="Pick a track" title="Music — pick a track">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12 13c0 1.105-1.12 2-2.5 2S7 14.105 7 13s1.12-2 2.5-2 2.5.895 2.5 2z"/><path fill-rule="evenodd" d="M12 3v10h-1V3h1z"/><path d="M11 2.82a1 1 0 0 1 .804-.98l3-.6A1 1 0 0 1 16 2.22V4l-5 1V2.82z"/><path fill-rule="evenodd" d="M0 11.5a.5.5 0 0 1 .5-.5H4a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5zm0-3A.5.5 0 0 1 .5 8H7a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5zm0-3A.5.5 0 0 1 .5 5H7a.5.5 0 0 1 0 1H.5a.5.5 0 0 1-.5-.5z"/></svg>
+            </button>
+            <!-- Meta menus: left on the home screen, right during a run -->
+            <button class="bar-action-btn bar-action-leaderboard bar-meta" id="leaderboardBtn" type="button" aria-label="Open leaderboard" title="Leaderboard">
+              <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4zm-5 4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V8zm10 2a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1v-4z"/></svg>
+              <span class="btn-label">LEADERBOARD</span>
+            </button>
+            <button class="bar-action-btn bar-action-achieve bar-meta" id="achievementsBtn" type="button" aria-label="Open badges" title="Badges — coming soon" disabled>
+              <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5.5A.5.5 0 0 1 3 0h10a.5.5 0 0 1 .5.5c0 .538-.012 1.05-.034 1.536a3 3 0 1 1-1.133 5.89c-.79 1.865-1.878 2.777-2.833 3.011v2.173l1.425.356c.194.048.377.135.537.255L13.3 15H2.7l.833-.688c.16-.12.343-.207.537-.255L5.5 13.73V11.54c-.955-.234-2.043-1.146-2.833-3.012a3 3 0 1 1-1.132-5.89A33.076 33.076 0 0 1 1.5.5zm.099 2.54a2 2 0 0 0 .72 3.935c-.333-1.05-.588-2.346-.72-3.935zm10.083 3.935a2 2 0 0 0 .72-3.935c-.133 1.59-.388 2.885-.72 3.935z"/></svg>
+              <span class="btn-label">BADGES</span>
+            </button>
+            <button class="bar-action-btn bar-action-shop bar-meta" id="shopBtn" type="button" aria-label="Open shop" title="Shop">
+              <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M0 1.5A.5.5 0 0 1 .5 1H2a.5.5 0 0 1 .485.379L2.89 3H14.5a.5.5 0 0 1 .491.592l-1.5 8A.5.5 0 0 1 13 12H4a.5.5 0 0 1-.491-.408L2.01 3.607 1.61 2H.5a.5.5 0 0 1-.5-.5zm3.5 7a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm7 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/></svg>
+              <span class="btn-label">SHOP</span>
+            </button>
+            <!-- Flexible gap splits the left and right groups -->
+            <div class="bar-spacer" aria-hidden="true"></div>
+            <!-- Utilities + audio mute + wallet: always on the right -->
+            <button class="bar-action-btn bar-action-profile bar-util" id="profileBtn" type="button" aria-label="Open profile" title="Profile — connect wallet first" disabled>
+              <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0 1-1 1-1 1H3s-1 0-1-1 1-4 6-4 6 3 6 4zm-1-.004c-.001-.246-.154-.986-.832-1.664C11.516 10.68 10.289 10 8 10c-2.29 0-3.516.68-4.168 1.332-.678.678-.83 1.418-.832 1.664h10z"/></svg>
+              <span class="btn-label">PROFILE</span>
+            </button>
+            <button class="bar-action-btn bar-action-options bar-util" id="mixerBtn" type="button" aria-label="Settings" title="Settings">
+              <svg class="btn-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M19.43 12.98c.04-.32.07-.65.07-.98s-.03-.66-.08-.98l2.11-1.65-2-3.46-2.49 1a7.4 7.4 0 0 0-1.69-.98L14.96 3h-4l-.38 2.93c-.61.25-1.18.58-1.69.98l-2.49-1-2 3.46 2.11 1.65c-.05.32-.08.65-.08.98s.03.66.08.98L4.4 14.63l2 3.46 2.49-1c.51.4 1.08.73 1.69.98l.38 2.93h4l.39-2.93c.61-.25 1.18-.58 1.69-.98l2.49 1 2-3.46-2.1-1.65ZM12.96 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></svg>
+              <span class="btn-label">SETTINGS</span>
+            </button>
+            <button class="bar-action-btn bar-action-help bar-util" id="howToPlayBtn" type="button" aria-label="How to play" title="How to play">
+              <span class="btn-glyph" aria-hidden="true">?</span>
+              <span class="btn-label">HELP</span>
+            </button>
+            <button class="icon-btn bar-util-icon" id="muteBtn" type="button" aria-label="Mute audio" title="Mute audio">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 9v6h4l5 4V5L8 9H4Z"/>
+                <path class="sw" d="M14 3.23v2.06a7 7 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54Z"/>
+              </svg>
+            </button>
+            <!-- ASCENT-skinned wallet button: mirrors the Radix connect widget but in our
+                 type/colors/frames. Toggles #walletMenu (portaled to <body> by game.js);
+                 drives the real RDT walletApi underneath. -->
+            <button class="wallet-link-btn bar-util-icon" id="walletLinkBtn" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Radix Wallet" title="Radix Wallet">
+              <span class="wallet-mark" aria-hidden="true"><svg class="radix-logo" viewBox="0 0 16 12"><path d="M5.76371 11.7183C5.51434 11.7183 5.27726 11.5986 5.12862 11.3925L2.02442 7.07097H0V5.49758H2.42488C2.67671 5.49758 2.91256 5.61852 3.05997 5.82337L5.59664 9.35391L9.46737 0.471398C9.59266 0.185104 9.87397 0 10.1848 0H15.0235V1.57338H10.697L6.4811 11.2469C6.36809 11.5061 6.12609 11.6838 5.84601 11.7134C5.82021 11.7171 5.79196 11.7183 5.76371 11.7183Z" fill="currentColor"/></svg></span>
+              <span class="wallet-label">CONNECT</span>
+            </button>
+          </div>
+        </div>
+      </section>
+    </main>
+    <!-- Radix dApp Toolkit — self-hosted single bundle (built by
+         scripts/build-assets.mjs from scripts/radix-dapp-toolkit-entry.js),
+         exposes window._RDT. Replaces an inline esm.sh import that fanned out
+         to ~200 cross-origin sub-requests on every cold load. -->
+    <script type="module" src="radix-dapp-toolkit.bundle.cce1f94d.js"></script>
+    <!-- All classic deps are `defer`: they download in parallel but still
+         execute in document order (Tone before config, etc.), before the
+         deferred game.js module — same execution order as blocking scripts,
+         without stalling the parser or serializing the downloads. -->
+    <script defer src="https://cdn.jsdelivr.net/npm/tone@14.8.49/build/Tone.js" integrity="sha384-c6Uo4N9c3SOEigMVzP6IshUG1wQ5uMp3xeoQFiHWAQ86joWdgyajkvopySyKy/Z6" crossorigin="anonymous"></script>
+    <script defer src="config.46df51cf.js"></script>
+    <script defer src="ascent-player-local.js"></script>
+    <script defer src="ascent-nft.js"></script>
+    <script defer src="cosmetics-data.js"></script>
+    <script defer src="cosmetics-render.d5f4ab6c.js"></script>
+    <script defer src="skins-data.js"></script>
+    <script defer src="skins-render.js"></script>
+    <!-- Capsule 04 cosmetics (auras / satellites). In-game these draw over the
+         player's real orb via the root cosmetics-render.js (drawOrbAt/hexA) —
+         do NOT load pairings-host-render.js here (it would redefine them). -->
+    <script defer src="aura-render.js"></script>
+    <script defer src="pairings-nft.js"></script>
+    <script defer src="ascent-seals.js"></script>
+    <script defer src="special-event-nft.js"></script>
+    <script defer src="achievement-orbs-render.9b2f436e.js"></script>
+    <script defer src="achievement-orbs-data.18fdb70f.js"></script>
+    <script defer src="preview-scheduler.9724b59d.js"></script>
+    <script defer src="achievements-ui.aeddf556.js"></script>
+    <script defer src="ursa-boss.b9f3cec4.js"></script><!-- BOSS co-op mode renderer (window.drawUrsaBoss + .thermal LUT) -->
+    <script type="module" src="game.12480497.js"></script>
+    <!-- DEV capture tool: localhost + ?capture only. Never requested in prod (host-gated). -->
+    <script>
+      if (/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) &&
+          new URLSearchParams(location.search).has("capture")) {
+        var _cap = document.createElement("script");
+        _cap.src = "capture.js";
+        document.body.appendChild(_cap);
+      }
+    </script>
+  </body>
+</html>

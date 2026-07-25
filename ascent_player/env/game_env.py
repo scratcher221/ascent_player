@@ -219,6 +219,13 @@ class AscentGameEnv:
                 await self.backend.wait_ms(500)
 
         body = (await self.backend.text_content()).upper()
+        if "PREPARE FOR THE ASCENT" in body:
+            clicked = await self.backend.click_text("PREPARE FOR THE ASCENT", timeout=2_000)
+            if not clicked:
+                await self.backend.click_selector("#playBtn", timeout=2_000)
+            await self.backend.wait_ms(600)
+
+        body = (await self.backend.text_content()).upper()
         if "START THE ASCENT" in body:
             clicked = await self.backend.click_text("START THE ASCENT", timeout=2_000)
             if not clicked:
@@ -226,17 +233,20 @@ class AscentGameEnv:
             await self.backend.wait_ms(800)
 
         body = (await self.backend.text_content()).upper()
-        if "PICK 1 ULTI" in body:
-            clicked = await self.backend.click_text("LAUNCH", timeout=2_000)
+        if "PICK 1 ULTI" in body or "PREPARE FOR THE ASCENT" in body:
+            clicked = await self.backend.click_text("START THE ASCENT", timeout=2_000)
             if not clicked:
-                card = await self.backend.click_selector(".ulti-card", timeout=1_500)
-                if not card:
-                    await self.backend.press("Space")
+                await self.backend.click_selector("#ultiSelectConfirm", timeout=2_000)
             await self.backend.wait_ms(800)
 
-        # If still on the menu, force startGame() via JS (clicks can hang / miss).
+        # If still on the menu, force start via JS (clicks can hang / miss).
         body = (await self.backend.text_content()).upper()
-        if "START THE ASCENT" in body or "PICK 1 ULTI" in body or not body:
+        if (
+            "START THE ASCENT" in body
+            or "PICK 1 ULTI" in body
+            or "PREPARE FOR THE ASCENT" in body
+            or not body
+        ):
             await self.backend.force_start_game()
             await self.backend.wait_ms(500)
 
@@ -273,6 +283,14 @@ class AscentGameEnv:
     def _frame_ms(self) -> int:
         fps = max(30.0, float(self.config.training.game_fps))
         return max(8, int(round(1000.0 / fps)))
+
+    def step_wait_ms(self) -> int:
+        return self._frame_ms()
+
+    def _step_ms(self) -> int:
+        # Compatibility shim for older recording entrypoints that still call
+        # the pre-refactor timing helper name.
+        return self.step_wait_ms()
 
 
 def build_platform_mask_fallback(frame: np.ndarray, state: FrameState) -> np.ndarray:

@@ -1,0 +1,23 @@
+/*! det-math.js — fdlibm ports (see provenance above). License notices, preserved
+ * verbatim in the distributed build as the grants below require (the `/*!`
+ * marker is what keeps this block through esbuild --minify).
+ *
+ * s_sin.c, s_cos.c, k_sin.c, k_cos.c, e_rem_pio2.c:
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunSoft, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ *
+ * e_exp.c (1.6 04/04/22):
+ * ====================================================
+ * Copyright (C) 2004 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */const k=new ArrayBuffer(8),a=new DataView(k);function l(t){return a.setFloat64(0,t,!0),a.getUint32(4,!0)}function v(t){return a.setFloat64(0,t,!0),a.getUint32(0,!0)}function N(t,n){return a.setFloat64(0,t,!0),a.setUint32(4,n>>>0,!0),a.getFloat64(0,!0)}function m(t,n){return a.setUint32(4,t>>>0,!0),a.setUint32(0,n>>>0,!0),a.getFloat64(0,!0)}const b=1,H=.5,M=-.5,w=1e300,C=9332636185032189e-317,W=709.782712893384,D=-745.1332191019411,P=.6931471803691238,I=-.6931471803691238,g=19082149292705877e-26,O=-19082149292705877e-26,j=1.4426950408889634,q=.16666666666666602,y=-.0027777777777015593,A=6613756321437934e-20,B=-16533902205465252e-22,E=41381367970572385e-24;export function detExp(t){t=+t;let n,u=0,f=0,s,o,r=0,c=l(t);const i=c>>>31&1;if(c&=2147483647,c>=1082535490){if(c>=2146435072)return(c&1048575|v(t))!==0?t+t:i===0?t:0;if(t>W)return w*w;if(t<D)return C*C}if(c>1071001154)c<1072734898?(u=t-(i===0?P:I),f=i===0?g:O,r=1-i-i):(r=Math.trunc(j*t+(i===0?H:M)),o=r,u=t-o*P,f=o*g),t=u-f;else if(c<1043333120){if(w+t>b)return b+t}else r=0;return o=t*t,s=t-o*(q+o*(y+o*(A+o*(B+o*E)))),r===0?b-(t*s/(s-2)-t):(n=b-(f-t*s/(2-s)-u),r>=-1021?N(n,l(n)+(r<<20)>>>0):N(n,l(n)+(r+1e3<<20)>>>0)*C)}const z=.5,L=-.16666666666666632,V=.00833333333332249,G=-.0001984126982985795,J=27557313707070068e-22,K=-25050760253406863e-24,Q=158969099521155e-24;function x(t,n,u){if((l(t)&2147483647)<1044381696&&(t|0)===0)return t;const s=t*t,o=s*t,r=V+s*(G+s*(J+s*(K+s*Q)));return u===0?t+o*(L+s*r):t-(s*(z*n-o*r)-n-o*L)}const R=.0416666666666666,T=-.001388888888887411,X=2480158728947673e-20,Y=-27557314351390663e-23,Z=2087572321298175e-24,$=-11359647557788195e-27;function d(t,n){const u=l(t)&2147483647;if(u<1044381696&&(t|0)===0)return b;const f=t*t,s=f*(R+f*(T+f*(X+f*(Y+f*(Z+f*$)))));if(u<1070805811)return b-(.5*f-(f*s-t*n));let o;u>1072234496?o=.28125:o=m(u-2097152,0);const r=.5*f-o;return b-o-(r-(f*s-t*n))}const t0=.6366197723675814,S=1.5707963267341256,h=6077100506506192e-26,F=6077100506303966e-26,p=20222662487959506e-37,e0=20222662487111665e-37,n0=84784276603689e-45,f0=[1073291771,1074340347,1074977148,1075388923,1075800698,1076025724,1076231611,1076437499,1076643386,1076849274,1076971356,1077074300,1077177244,1077280187,1077383131,1077486075,1077589019,1077691962,1077794906,1077897850,1077968460,1078019932,1078071404,1078122876,1078174348,1078225820,1078277292,1078328763,1078380235,1078431707,1078483179,1078534651],e=[0,0];function U(t){const n=l(t),u=n&2147483647;if(u<=1072243195)return e[0]=t,e[1]=0,0;if(u<1073928572){if(!(n>>>31)){let i=t-S;return u!==1073291771?(e[0]=i-h,e[1]=i-e[0]-h):(i-=F,e[0]=i-p,e[1]=i-e[0]-p),1}{let i=t+S;return u!==1073291771?(e[0]=i+h,e[1]=i-e[0]+h):(i+=F,e[0]=i+p,e[1]=i-e[0]+p),-1}}let f=Math.abs(t);const s=Math.trunc(f*t0+z),o=s;let r=f-o*S,c=o*h;if(s<32&&u!==f0[s-1])e[0]=r-c;else{const i=u>>>20;e[0]=r-c;let _=i-(l(e[0])>>>20&2047);_>16&&(f=r,c=o*F,r=f-c,c=o*p-(f-r-c),e[0]=r-c,_=i-(l(e[0])>>>20&2047),_>49&&(f=r,c=o*e0,r=f-c,c=o*n0-(f-r-c),e[0]=r-c))}return e[1]=r-e[0]-c,n>>>31===1?(e[0]=-e[0],e[1]=-e[1],-s):s}export function detSin(t){t=+t;const n=l(t)&2147483647;if(n<=1072243195)return x(t,0,0);if(n>=2146435072)return t-t;if(n>1094263291)return NaN;switch(U(t)&3){case 0:return x(e[0],e[1],1);case 1:return d(e[0],e[1]);case 2:return-x(e[0],e[1],1);default:return-d(e[0],e[1])}}export function detCos(t){t=+t;const n=l(t)&2147483647;if(n<=1072243195)return d(t,0);if(n>=2146435072)return t-t;if(n>1094263291)return NaN;switch(U(t)&3){case 0:return d(e[0],e[1]);case 1:return-x(e[0],e[1],1);case 2:return-d(e[0],e[1]);default:return x(e[0],e[1],1)}}export const LN_064=-.4462871026284195,LN_055=-.5978370007556204,LN_094=-.06187540371808753;
