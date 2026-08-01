@@ -62,11 +62,38 @@ def _collect_paths(text: str) -> set[str]:
     return found
 
 
+def _apply_offline_market_chart_patch(text: str) -> str:
+    """Skip background candle chart when local training has no live feed."""
+    if "CHART_TRIAL_CONFIG?.offlineMode)return" in text:
+        return text
+    hook_old = "function Pp(){if(I||Bp())return;"
+    hook_new = (
+        "function Pp(){if(I||Bp()||window.CHART_TRIAL_CONFIG?.hideMarketChart"
+        "||window.CHART_TRIAL_CONFIG?.offlineMode)return;"
+    )
+    if hook_old not in text:
+        raise RuntimeError(
+            "Could not find market chart draw hook; the upstream build may have changed."
+        )
+    return text.replace(hook_old, hook_new, 1)
+
+
+def _patch_offline_market_chart(game_js: Path) -> None:
+    text = game_js.read_text(encoding="utf-8")
+    updated = _apply_offline_market_chart_patch(text)
+    if updated == text:
+        print(f"Offline market chart patch already applied: {game_js.name}")
+        return
+    game_js.write_text(updated, encoding="utf-8")
+    print(f"Patched {game_js.name} to hide fallback market candles when offline.")
+
+
 def _patch_game_js(game_js: Path, inject_src: Path) -> None:
     text = game_js.read_text(encoding="utf-8")
     marker = "/*__ASCENT_PLAYER_INJECTED__*/"
     if marker in text:
         print(f"Already patched: {game_js.name}")
+        _patch_offline_market_chart(game_js)
         return
 
     inject = inject_src.read_text(encoding="utf-8").strip()
@@ -118,6 +145,7 @@ function __ascentResolveLocalSeed__() {
     text = text.replace(hook_old, hook_new, 1)
 
     text = f'{text.rstrip()}\n{inject}\n'
+    text = _apply_offline_market_chart_patch(text)
     game_js.write_text(text, encoding="utf-8")
     print(f"Patched {game_js.name} for agent export + run seed.")
 

@@ -100,7 +100,7 @@ class RecordingWorker(QThread):
                 self.status_ready.emit(
                     f"Recording demo | action={ACTION_LABELS[action]} | frames={len(recorder.transitions)}"
                 )
-                await backend.wait_ms(env._step_ms())
+                await backend.wait_ms(env.step_wait_ms())
                 if done:
                     self.status_ready.emit("Run ended — restarting for more recording...")
                     recorder.on_episode_end()

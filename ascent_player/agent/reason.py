@@ -98,7 +98,7 @@ def assign_reason(
     if source == "explore":
         return EXPLORE
     # Thread prior shares the rule-prior aux class so checkpoint heads stay sized.
-    if source in ("rule", "thread"):
+    if source in ("rule", "thread", "skill"):
         return RULE_PRIOR
     if frame_state is None:
         return EXPLORE
