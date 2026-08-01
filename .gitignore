@@ -9,5 +9,6 @@ logs/
 *.keras
 # Human demonstrations (optional, large)
 demonstrations/*.npz
+demonstrations/*/*.npz
 
 .DS_Store
