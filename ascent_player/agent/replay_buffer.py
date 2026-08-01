@@ -20,6 +20,9 @@ class TransitionBatch:
     weights: np.ndarray | None = None
     sim_indices: np.ndarray | None = None
     reasons: np.ndarray | None = None
+    skills: np.ndarray | None = None
+    episode_scores: np.ndarray | None = None
+    episode_ids: np.ndarray | None = None
 
 
 def _is_hybrid_state(state) -> bool:
@@ -36,14 +39,28 @@ def _pack_hybrid_states(states) -> np.ndarray:
 
 
 def _normalize_item(item: tuple) -> tuple:
-    """Normalize to (state, action, reward, next, done, discount, reason)."""
+    """Normalize to (state, action, reward, next, done, discount, reason, skill, ep_score, ep_id)."""
     if len(item) == 5:
         state, action, reward, next_state, done = item
-        return (state, action, reward, next_state, done, 1.0, -1)
+        return (state, action, reward, next_state, done, 1.0, -1, -1, -1.0, -1)
     if len(item) == 6:
         state, action, reward, next_state, done, discount = item
-        return (state, action, reward, next_state, done, float(discount), -1)
-    if len(item) >= 7:
+        return (state, action, reward, next_state, done, float(discount), -1, -1, -1.0, -1)
+    if len(item) == 7:
+        state, action, reward, next_state, done, discount, reason = item
+        return (
+            state,
+            action,
+            reward,
+            next_state,
+            done,
+            float(discount),
+            int(reason),
+            -1,
+            -1.0,
+            -1,
+        )
+    if len(item) == 8:
         return (
             item[0],
             item[1],
@@ -52,6 +69,35 @@ def _normalize_item(item: tuple) -> tuple:
             item[4],
             float(item[5]),
             int(item[6]),
+            int(item[7]),
+            -1.0,
+            -1,
+        )
+    if len(item) == 9:
+        return (
+            item[0],
+            item[1],
+            item[2],
+            item[3],
+            item[4],
+            float(item[5]),
+            int(item[6]),
+            int(item[7]),
+            float(item[8]),
+            -1,
+        )
+    if len(item) >= 10:
+        return (
+            item[0],
+            item[1],
+            item[2],
+            item[3],
+            item[4],
+            float(item[5]),
+            int(item[6]),
+            int(item[7]),
+            float(item[8]),
+            int(item[9]),
         )
     raise ValueError(f"unexpected replay item length {len(item)}")
 
@@ -71,7 +117,18 @@ def _adapt_vector(state, vector_dim: int):
 
 
 def _adapt_item_vector_dim(item: tuple, vector_dim: int) -> tuple:
-    state, action, reward, next_state, done, discount, reason = _normalize_item(item)
+    (
+        state,
+        action,
+        reward,
+        next_state,
+        done,
+        discount,
+        reason,
+        skill,
+        ep_score,
+        ep_id,
+    ) = _normalize_item(item)
     return (
         _adapt_vector(state, vector_dim),
         action,
@@ -80,6 +137,9 @@ def _adapt_item_vector_dim(item: tuple, vector_dim: int) -> tuple:
         done,
         discount,
         reason,
+        skill,
+        ep_score,
+        ep_id,
     )
 
 
@@ -121,6 +181,9 @@ class ReplayBuffer:
         discount: float = 1.0,
         priority: float | None = None,
         reason: int = -1,
+        skill: int = -1,
+        episode_score: float = -1.0,
+        episode_id: int = -1,
     ) -> None:
         with self._lock:
             self._items.append(
@@ -132,6 +195,9 @@ class ReplayBuffer:
                     done,
                     float(discount),
                     int(reason),
+                    int(skill),
+                    float(episode_score),
+                    int(episode_id),
                 )
             )
             if self.prioritized:
@@ -147,11 +213,17 @@ class ReplayBuffer:
         *,
         discounts: np.ndarray | None = None,
         reasons: np.ndarray | None = None,
+        skills: np.ndarray | None = None,
+        episode_scores: np.ndarray | None = None,
+        episode_ids: np.ndarray | None = None,
     ) -> None:
         with self._lock:
             for idx in range(len(actions)):
                 discount = 1.0 if discounts is None else float(discounts[idx])
                 reason = -1 if reasons is None else int(reasons[idx])
+                skill = -1 if skills is None else int(skills[idx])
+                ep_score = -1.0 if episode_scores is None else float(episode_scores[idx])
+                ep_id = -1 if episode_ids is None else int(episode_ids[idx])
                 self._items.append(
                     (
                         self._copy_state(states[idx]),
@@ -161,6 +233,9 @@ class ReplayBuffer:
                         bool(dones[idx]),
                         discount,
                         reason,
+                        skill,
+                        ep_score,
+                        ep_id,
                     )
                 )
                 if self.prioritized:
@@ -194,9 +269,18 @@ class ReplayBuffer:
                 normalized = [
                     _adapt_item_vector_dim(item, target_dim) for item in normalized
                 ]
-        states, actions, rewards, next_states, dones, discounts, reasons = zip(
-            *normalized, strict=True
-        )
+        (
+            states,
+            actions,
+            rewards,
+            next_states,
+            dones,
+            discounts,
+            reasons,
+            skills,
+            episode_scores,
+            episode_ids,
+        ) = zip(*normalized, strict=True)
         common = dict(
             actions=np.asarray(actions, dtype=np.int32),
             rewards=np.asarray(rewards, dtype=np.float32),
@@ -205,6 +289,9 @@ class ReplayBuffer:
             indices=indices,
             weights=weights,
             reasons=np.asarray(reasons, dtype=np.int32),
+            skills=np.asarray(skills, dtype=np.int32),
+            episode_scores=np.asarray(episode_scores, dtype=np.float32),
+            episode_ids=np.asarray(episode_ids, dtype=np.int32),
         )
         if batch and _is_hybrid_state(states[0]):
             return TransitionBatch(
@@ -253,6 +340,62 @@ class ReplayBuffer:
                     self._priorities.popleft()
                 removed += 1
         return removed
+
+    def filter_min_episode_score(self, min_score: float) -> int:
+        """Keep only transitions stamped with episode_score >= min_score.
+
+        Transitions without a score stamp (legacy = -1) are dropped when
+        ``min_score`` > 0 so elite stores stay clean.
+        """
+        min_score = float(min_score)
+        if min_score <= 0:
+            return len(self)
+        with self._lock:
+            kept = [
+                item
+                for item in self._items
+                if float(_normalize_item(item)[8]) >= min_score
+            ]
+            self._items.clear()
+            self._priorities.clear()
+            for item in kept:
+                self._items.append(item)
+                if self.prioritized:
+                    self._priorities.append(self._max_priority)
+            return len(kept)
+
+    def filter_episode_score_range(
+        self,
+        min_score: float,
+        max_score: float | None = None,
+    ) -> int:
+        """Keep transitions with min_score <= episode_score < max_score (if set)."""
+        lo = float(min_score)
+        hi = float(max_score) if max_score is not None else float("inf")
+        with self._lock:
+            kept = [
+                item
+                for item in self._items
+                if lo <= float(_normalize_item(item)[8]) < hi
+            ]
+            self._items.clear()
+            self._priorities.clear()
+            for item in kept:
+                self._items.append(item)
+                if self.prioritized:
+                    self._priorities.append(self._max_priority)
+            return len(kept)
+
+    def skill_label_distribution(self) -> dict[int, int]:
+        """Count skill labels across the buffer (ignores -1)."""
+        counts: dict[int, int] = {}
+        with self._lock:
+            for item in self._items:
+                skill = int(_normalize_item(item)[7])
+                if skill < 0:
+                    continue
+                counts[skill] = counts.get(skill, 0) + 1
+        return counts
 
     def compact_diverse_episodes(
         self,
@@ -305,8 +448,16 @@ class ReplayBuffer:
 
         selected: list[list[tuple]] = []
         seen: set[tuple[int, ...]] = set()
-        # Prefer recent episodes because they reflect the current policy/rule.
-        for episode in reversed(episodes):
+        # Prefer higher-scoring, then more recent episodes.
+        ranked = sorted(
+            enumerate(episodes),
+            key=lambda pair: (
+                float(max((item[8] for item in pair[1]), default=-1.0)),
+                pair[0],
+            ),
+            reverse=True,
+        )
+        for _, episode in ranked:
             key = signature(episode)
             if key in seen:
                 continue
@@ -314,7 +465,11 @@ class ReplayBuffer:
             selected.append(episode)
             if len(selected) >= max_episodes:
                 break
-        selected.reverse()
+        # Restore chronological order among the selected set.
+        selected.sort(
+            key=lambda ep: float(max((item[8] for item in ep), default=-1.0)),
+            reverse=True,
+        )
 
         compacted: list[tuple] = []
         for episode in selected:

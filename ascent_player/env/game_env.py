@@ -93,7 +93,7 @@ class AscentGameEnv:
         self._last_frame_state = None
         self._prev_bounces = 0
         await self._release_all()
-        await self.backend.force_open_game()
+        await self.backend.ensure_game_session(reload=False)
         if self.config.browser.agent_mode:
             await self.backend.ensure_agent_mode()
             await self.backend.select_training_tier(
@@ -101,6 +101,9 @@ class AscentGameEnv:
             )
         await self.backend.ensure_run_seed()
         await self._start_or_restart()
+        playing = await self.backend.ensure_playing(timeout_seconds=25.0)
+        if not playing:
+            print("BROWSER_RESET_WARN still not playing after menu automation", flush=True)
         frame, hud = await self._capture_turn()
         frame_state = await self._detect_state(frame, hud)
         self._last_frame_state = frame_state
@@ -251,7 +254,7 @@ class AscentGameEnv:
             await self.backend.wait_ms(500)
 
         if not await self.backend.has_canvas():
-            await self.backend.force_open_game()
+            await self.backend.ensure_game_session(reload=True)
         await self.backend.browser_heartbeat()
 
     async def _apply_action(self, action: int) -> None:

@@ -35,6 +35,28 @@ def import_tensorflow(device_mode: DeviceMode):
     return tf
 
 
+def enable_mixed_precision(enabled: bool = True) -> bool:
+    """Enable Keras mixed_float16 when requested. Returns True if active."""
+    import tensorflow as tf
+
+    if not enabled:
+        try:
+            tf.keras.mixed_precision.set_global_policy("float32")
+        except Exception:
+            pass
+        return False
+    try:
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+        return True
+    except Exception as exc:
+        print(f"MIXED_PRECISION_SKIP reason={exc}", flush=True)
+        try:
+            tf.keras.mixed_precision.set_global_policy("float32")
+        except Exception:
+            pass
+        return False
+
+
 def resolve_device(device_mode: DeviceMode) -> DeviceInfo:
     tf = import_tensorflow(device_mode)
     gpus = tf.config.list_physical_devices("GPU")

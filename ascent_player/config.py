@@ -6,9 +6,7 @@ import os
 from pathlib import Path
 
 
-ASCENT_URL = (
-    "http://127.0.0.1:8765/index.html"
-)
+ASCENT_URL = "http://127.0.0.1:8765/index.html"
 ASCENT_HOST = "127.0.0.1"
 
 # On KDE Wayland + NVIDIA, Chromium on native Wayland can crash kwin_wayland.
@@ -71,6 +69,8 @@ class BrowserConfig:
     # Applied via CHART_TRIAL_CONFIG / __ASCENT_SET_RUN_SEED__ before play.
     run_seed: int | None = None
     lock_run_seed: bool = True
+    # Raise/focus the game window after launch (helps when pinned to a side monitor).
+    raise_on_launch: bool = True
 
 
 @dataclass(slots=True)
@@ -242,7 +242,11 @@ class TrainingConfig:
     epsilon_decay: float = 0.992
     replay_buffer_size: int = 50_000
     batch_size_cpu: int = 32
-    batch_size_gpu: int = 64
+    # Default sized for impala_mid + mixed precision on RTX 3070-class GPUs.
+    batch_size_gpu: int = 128
+    # Network capacity: nature (~1.8M) | impala_mid (~8–15M) | impala_large (~20M+).
+    model_variant: str = "impala_mid"
+    mixed_precision: bool = True
     min_replay_size: int = 400
     target_sync_interval: int = 800
     soft_target_tau: float = 0.005
@@ -343,7 +347,12 @@ class TrainingConfig:
     log_browser_detail_steps: int = 100
     log_weight_norm_every: int = 5000
     use_prioritized_replay: bool = True
-    n_step: int = 3
+    n_step: int = 5
+    # Minimum greedy 100-ep mean before online fine-tune is allowed in thread-BC.
+    finetune_min_greedy_mean: float = 1400.0
+    # Policy-collect thread prior ceiling after teacher bootstrap (objective split).
+    policy_collect_thread_prior: float = 0.20
+    teacher_collect_thread_prior: float = 0.75
     per_beta_start: float = 0.4
     per_beta_end: float = 1.0
     per_beta_anneal_steps: int = 100_000
@@ -378,10 +387,29 @@ class TrainingConfig:
     browser_epsilon_cap_after_gate_a: float = 0.15
     # Aux CE weight for the action-reason head (0 disables aux gradient).
     reason_aux_weight: float = 0.1
+    # Skill library: deterministic routines + skill head for when to invoke them.
+    skills_enabled: bool = False
+    skill_exec_at_watch: bool = False
+    skill_teacher_prior_start: float = 0.50
+    skill_teacher_prior_end: float = 0.08
+    skill_teacher_prior_steps: int = 120_000
+    skill_aux_weight: float = 0.12
+    # Minimum softmax margin (best - second) before Watch trusts skill over Q.
+    skill_confidence_margin: float = 0.12
     # Log every N browser steps to decisions CSV (1 = every step).
     log_decision_every: int = 5
     # If > 0, only commit browser transitions from episodes reaching this score.
     replay_min_episode_score: float = 0.0
+    # Separate elite store gate (can be higher than collect gate).
+    elite_replay_min_episode_score: float = 0.0
+    elite_max_episodes: int = 64
+    elite_max_transitions_per_episode: int = 128
+    # Require skill-head validation accuracy before Watch skill execution.
+    skill_exec_min_accuracy: float = 0.85
+    # Post-2k path: raise elite gate and re-enable skill only after A/B gain.
+    post_2k_elite_gate: float = 3000.0
+    skill_reenable_min_accuracy: float = 0.70
+    skill_accuracy_path: Path = Path("checkpoints/skill_head_accuracy.json")
     # When True, always persist browser_replay.pkl at session end.
     force_save_browser_replay: bool = False
     # When True, do not load checkpoints/browser_replay.pkl at browser session start.

@@ -699,6 +699,9 @@ async def run_training_no_ui(
         replay_score_gate = float(
             getattr(config.training, "replay_min_episode_score", 0.0) or 0.0
         )
+        elite_score_gate = float(
+            getattr(config.training, "elite_replay_min_episode_score", 0.0) or 0.0
+        )
         while max_episodes is None or episodes_run < max_episodes:
             if deadline is not None and time.perf_counter() >= deadline:
                 print(f"Finetune time limit reached ({max_seconds}s)")
@@ -722,6 +725,20 @@ async def run_training_no_ui(
                     f"TRAIN_LOOP first_step_done score={result.frame_state.score}",
                     flush=True,
                 )
+            if (
+                not config.training.sim_mode
+                and episode_steps == 45
+                and episode_max_score <= 0
+            ):
+                try:
+                    hb = await env.backend.browser_heartbeat()
+                    if isinstance(hb, dict) and (
+                        hb.get("inMenu") or not hb.get("playing")
+                    ):
+                        print("BROWSER_MENU_RECOVERY begin", flush=True)
+                        await env.backend.ensure_playing(timeout_seconds=15.0)
+                except Exception as exc:
+                    print(f"BROWSER_MENU_RECOVERY_FAIL {exc}", flush=True)
             step_ms = (time.perf_counter() - step_started) * 1000.0
             if step_ms > 0:
                 instant_hz = 1000.0 / step_ms
@@ -732,7 +749,15 @@ async def run_training_no_ui(
                 and not config.training.watch_mode
             ):
                 episode_buffer.append(
-                    (state, action, result.reward, result.state, result.done)
+                    (
+                        state,
+                        action,
+                        result.reward,
+                        result.state,
+                        result.done,
+                        int(getattr(agent, "last_reason_index", -1)),
+                        int(getattr(agent, "last_skill_index", -1)),
+                    )
                 )
                 metrics = agent.maybe_train() if len(agent.replay) >= config.training.min_replay_size else agent.metrics
             else:
@@ -840,12 +865,15 @@ async def run_training_no_ui(
             if result.done:
                 if episode_buffer:
                     if episode_max_score >= replay_score_gate:
+                        ep_id = int(getattr(agent.progress, "episodes_completed", 0) or 0)
                         for (
                             buf_state,
                             buf_action,
                             buf_reward,
                             buf_next,
                             buf_done,
+                            buf_reason,
+                            buf_skill,
                         ) in episode_buffer:
                             agent.remember(
                                 buf_state,
@@ -854,6 +882,20 @@ async def run_training_no_ui(
                                 buf_next,
                                 buf_done,
                                 sim=False,
+                                reason=int(buf_reason),
+                                skill=int(buf_skill),
+                                episode_score=float(episode_max_score),
+                                episode_id=ep_id,
+                            )
+                        if (
+                            elite_score_gate > 0
+                            and episode_max_score >= elite_score_gate
+                        ):
+                            print(
+                                f"ELITE_STAGE score={episode_max_score:.0f} "
+                                f">={elite_score_gate:.0f} "
+                                f"steps={len(episode_buffer)}",
+                                flush=True,
                             )
                     else:
                         print(

@@ -8,6 +8,7 @@ import numpy as np
 
 from ascent_player.agent.dqn import DQNAgent
 from ascent_player.agent.teacher import RulePolicy, SeedThreadPolicy
+from ascent_player.agent.skills import FREE_PLAY, SkillRouter
 from ascent_player.config import AppConfig
 from ascent_player.env.game_env import AscentGameEnv
 from ascent_player.env.sim_env import AscentSimEnv
@@ -25,6 +26,60 @@ class SkillMetrics:
     meaningful_boost_rate: float
     wasted_boost_rate: float
     min_score: float = 0.0
+    scores: tuple[float, ...] = ()
+    p10: float = 0.0
+    p50: float = 0.0
+    p90: float = 0.0
+
+
+def score_percentiles(scores: list[float] | tuple[float, ...] | np.ndarray) -> dict[str, float]:
+    """Return mean/min/max and p10/p50/p90 for a score list."""
+    if not len(scores):
+        return {
+            "mean": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "p10": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+        }
+    arr = np.asarray(scores, dtype=np.float64)
+    return {
+        "mean": float(np.mean(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "p10": float(np.percentile(arr, 10)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+    }
+
+
+def _metrics_from_episode_stats(episode_stats: list[dict[str, float]]) -> SkillMetrics:
+    if not episode_stats:
+        return SkillMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    scores = [float(item["score"]) for item in episode_stats]
+    pct = score_percentiles(scores)
+    return SkillMetrics(
+        episodes=len(episode_stats),
+        mean_score=pct["mean"],
+        max_score=pct["max"],
+        mean_length=float(np.mean([item["steps"] for item in episode_stats])),
+        landing_rate=float(np.mean([item["landing_rate"] for item in episode_stats])),
+        mean_platform_dx=float(
+            np.mean([item["mean_platform_dx"] for item in episode_stats])
+        ),
+        meaningful_boost_rate=float(
+            np.mean([item["meaningful_boost_rate"] for item in episode_stats])
+        ),
+        wasted_boost_rate=float(
+            np.mean([item["wasted_boost_rate"] for item in episode_stats])
+        ),
+        min_score=pct["min"],
+        scores=tuple(scores),
+        p10=pct["p10"],
+        p50=pct["p50"],
+        p90=pct["p90"],
+    )
 
 
 def _episode_skill(
@@ -61,6 +116,24 @@ async def evaluate_rule_baseline(
         agent=None,
         rule_only=True,
         thread_only=False,
+    )
+
+
+async def evaluate_skill_router_baseline(
+    config: AppConfig,
+    *,
+    episodes: int = 10,
+    use_sim: bool = False,
+) -> SkillMetrics:
+    """Pure skill-router ceiling (deterministic routines, no DQN)."""
+    return await _evaluate_policy(
+        config,
+        episodes=episodes,
+        use_sim=use_sim,
+        agent=None,
+        rule_only=False,
+        thread_only=False,
+        skill_only=True,
     )
 
 
@@ -114,6 +187,7 @@ async def _evaluate_policy(
     agent: DQNAgent | None,
     rule_only: bool,
     thread_only: bool = False,
+    skill_only: bool = False,
 ) -> SkillMetrics:
     rule = RulePolicy()
     thread = SeedThreadPolicy(
@@ -121,6 +195,7 @@ async def _evaluate_policy(
             getattr(config.training, "seed_thread_corridor", 0.18) or 0.18
         )
     )
+    skill_router = SkillRouter()
     if use_sim:
         env = AscentSimEnv(config, fast_mode=True)
         backend = None
@@ -135,7 +210,7 @@ async def _evaluate_policy(
 
     episode_stats: list[dict[str, float]] = []
     try:
-        for _ in range(episodes):
+        for ep_index in range(episodes):
             state = await env.reset()
             if thread_only:
                 thread.reset()
@@ -155,6 +230,10 @@ async def _evaluate_policy(
                     break
                 if thread_only:
                     action = thread.act(frame_state)
+                elif skill_only:
+                    action, skill = skill_router.act(frame_state)
+                    if skill == FREE_PLAY:
+                        action = rule.act(frame_state)
                 elif rule_only:
                     action = rule.act(frame_state)
                 else:
@@ -196,33 +275,32 @@ async def _evaluate_policy(
                     max_score=max_score,
                 )
             )
+            progress_every = max(1, episodes // 10)
+            if not use_sim and (ep_index + 1) % progress_every == 0:
+                last = episode_stats[-1]
+                print(
+                    f"BROWSER_EVAL_PROGRESS {ep_index + 1}/{episodes} "
+                    f"last_score={last.get('score', 0):.0f}",
+                    flush=True,
+                )
     finally:
         await env.close()
         if backend is not None:
             await backend.stop()
 
-    if not episode_stats:
-        return SkillMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    return SkillMetrics(
-        episodes=len(episode_stats),
-        mean_score=float(np.mean([item["score"] for item in episode_stats])),
-        max_score=float(max(item["score"] for item in episode_stats)),
-        mean_length=float(np.mean([item["steps"] for item in episode_stats])),
-        landing_rate=float(np.mean([item["landing_rate"] for item in episode_stats])),
-        mean_platform_dx=float(np.mean([item["mean_platform_dx"] for item in episode_stats])),
-        meaningful_boost_rate=float(
-            np.mean([item["meaningful_boost_rate"] for item in episode_stats])
-        ),
-        wasted_boost_rate=float(np.mean([item["wasted_boost_rate"] for item in episode_stats])),
-        min_score=float(min(item["score"] for item in episode_stats)),
-    )
+    return _metrics_from_episode_stats(episode_stats)
 
 
 def format_skill_metrics(label: str, metrics: SkillMetrics) -> str:
+    extras = ""
+    if metrics.scores:
+        extras = (
+            f" p10={metrics.p10:.1f} p50={metrics.p50:.1f} p90={metrics.p90:.1f}"
+        )
     return (
         f"{label}: episodes={metrics.episodes} "
         f"mean_score={metrics.mean_score:.1f} max_score={metrics.max_score:.1f} "
-        f"min_score={metrics.min_score:.1f} "
+        f"min_score={metrics.min_score:.1f}{extras} "
         f"mean_length={metrics.mean_length:.0f} landing_rate={metrics.landing_rate:.3f} "
         f"mean_platform_dx={metrics.mean_platform_dx:.3f} "
         f"meaningful_boost={metrics.meaningful_boost_rate:.2f} "
@@ -450,18 +528,4 @@ def evaluate_sim_greedy_sync(
     finally:
         agent.epsilon = saved_epsilon
 
-    if not episode_stats:
-        return SkillMetrics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    return SkillMetrics(
-        episodes=len(episode_stats),
-        mean_score=float(np.mean([item["score"] for item in episode_stats])),
-        max_score=float(max(item["score"] for item in episode_stats)),
-        mean_length=float(np.mean([item["steps"] for item in episode_stats])),
-        landing_rate=float(np.mean([item["landing_rate"] for item in episode_stats])),
-        mean_platform_dx=float(np.mean([item["mean_platform_dx"] for item in episode_stats])),
-        meaningful_boost_rate=float(
-            np.mean([item["meaningful_boost_rate"] for item in episode_stats])
-        ),
-        wasted_boost_rate=float(np.mean([item["wasted_boost_rate"] for item in episode_stats])),
-        min_score=float(min(item["score"] for item in episode_stats)),
-    )
+    return _metrics_from_episode_stats(episode_stats)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import random
 import time
 
@@ -26,11 +27,20 @@ from ascent_player.agent.reason import (
     reason_to_index,
 )
 from ascent_player.agent.teacher import RulePolicy, SeedThreadPolicy
+from ascent_player.agent.skills import (
+    FREE_PLAY,
+    SkillControllers,
+    SkillRouter,
+    index_to_skill,
+    skill_count,
+    skill_to_index,
+)
 from ascent_player.config import AppConfig
 from ascent_player.env.state_detector import FrameState
 from ascent_player.utils.device import (
     DeviceInfo,
     benchmark_inference_device,
+    enable_mixed_precision,
     import_tensorflow,
     resolve_device,
 )
@@ -96,10 +106,17 @@ class DQNAgent:
         self._sim_pretrain_mode = False
         self.curriculum_stage = "M0"
         self._reason_count = reason_count()
+        self._skill_count = (
+            skill_count() if getattr(config.training, "skills_enabled", False) else 0
+        )
+        self.skill_router = SkillRouter(SkillControllers(self.rule_policy))
         self.last_action_source = "greedy"
         self.last_reason = EXPLORE
         self.last_reason_pred = EXPLORE
         self.last_reason_index = reason_to_index(EXPLORE)
+        self.last_skill = FREE_PLAY
+        self.last_skill_index = skill_to_index(FREE_PLAY)
+        self._last_skill_logits: np.ndarray | None = None
         input_shape = (
             config.observation.height,
             config.observation.width,
@@ -110,6 +127,16 @@ class DQNAgent:
             if config.observation.include_vector_state
             else 0
         )
+        self._model_variant = str(
+            getattr(config.training, "model_variant", "impala_mid") or "impala_mid"
+        ).strip().lower()
+        self._use_mixed_precision = bool(
+            getattr(config.training, "mixed_precision", True)
+        ) and self.device_info.training_device.startswith("/GPU")
+        if self._use_mixed_precision:
+            self._use_mixed_precision = enable_mixed_precision(True)
+        else:
+            enable_mixed_precision(False)
 
         with self.tf.device(self.device_info.training_device):
             self.online = build_q_network(
@@ -119,6 +146,9 @@ class DQNAgent:
                 vector_dim=self._vector_dim,
                 dueling=config.training.dueling_dqn,
                 reason_count=self._reason_count,
+                skill_count=self._skill_count,
+                model_variant=self._model_variant,
+                use_mixed_precision=self._use_mixed_precision,
             )
             self.target = build_q_network(
                 input_shape,
@@ -127,8 +157,18 @@ class DQNAgent:
                 vector_dim=self._vector_dim,
                 dueling=config.training.dueling_dqn,
                 reason_count=self._reason_count,
+                skill_count=self._skill_count,
+                model_variant=self._model_variant,
+                use_mixed_precision=self._use_mixed_precision,
             )
             self.target.set_weights(self.online.get_weights())
+        print(
+            f"MODEL_BUILD variant={self._model_variant} "
+            f"params={self.online.count_params():,} "
+            f"mixed_precision={int(self._use_mixed_precision)} "
+            f"batch={self.batch_size}",
+            flush=True,
+        )
 
         sample = self._sample_model_input(np.zeros(input_shape, dtype=np.float32))
         self.device_info.inference_device = benchmark_inference_device(
@@ -207,12 +247,13 @@ class DQNAgent:
         return [visuals, vectors]
 
     def _unpack_outputs(self, outputs):
-        """Split multi-output model result into (q_values, reason_logits|None)."""
+        """Split multi-output model into (q_values, reason_logits|None, skill_logits|None)."""
         if isinstance(outputs, (list, tuple)):
             q_values = outputs[0]
             reason_logits = outputs[1] if len(outputs) > 1 else None
-            return q_values, reason_logits
-        return outputs, None
+            skill_logits = outputs[2] if len(outputs) > 2 else None
+            return q_values, reason_logits, skill_logits
+        return outputs, None, None
 
     def _predict_q_values(self, state) -> np.ndarray:
         with self.tf.device(self.device_info.inference_device):
@@ -230,11 +271,19 @@ class DQNAgent:
                     self.tf.convert_to_tensor(state[None, ...], dtype=self.tf.float32),
                     training=False,
                 )
-            q_values, reason_logits = self._unpack_outputs(outputs)
+            q_values, reason_logits, skill_logits = self._unpack_outputs(outputs)
             q_np = q_values[0].numpy() if hasattr(q_values, "numpy") else np.asarray(q_values)[0]
             if reason_logits is not None:
                 logits = reason_logits[0].numpy() if hasattr(reason_logits, "numpy") else np.asarray(reason_logits)[0]
                 self.last_reason_pred = index_to_reason(int(np.argmax(logits)))
+            if skill_logits is not None:
+                slogits = (
+                    skill_logits[0].numpy()
+                    if hasattr(skill_logits, "numpy")
+                    else np.asarray(skill_logits)[0]
+                )
+                self._last_skill_logits = slogits
+                self.last_skill = index_to_skill(int(np.argmax(slogits)))
             return q_np
 
     def _build_batch_predict(self):
@@ -243,7 +292,7 @@ class DQNAgent:
         @self.tf.function(reduce_retracing=True)
         def batch_predict(states):
             outputs = agent.online(states, training=False)
-            q_values, _ = agent._unpack_outputs(outputs)
+            q_values, _, _ = agent._unpack_outputs(outputs)
             return q_values
 
         return batch_predict
@@ -289,6 +338,39 @@ class DQNAgent:
         progress = min(1.0, local / steps)
         return max(end, start - (start - end) * progress)
 
+    def skill_teacher_prior_probability(self) -> float:
+        training = self.config.training
+        if not getattr(training, "skills_enabled", False):
+            return 0.0
+        steps = int(getattr(training, "skill_teacher_prior_steps", 0) or 0)
+        start = float(getattr(training, "skill_teacher_prior_start", 0.0) or 0.0)
+        end = float(getattr(training, "skill_teacher_prior_end", 0.0) or 0.0)
+        if steps <= 0:
+            return max(0.0, end)
+        origin = int(getattr(self, "_prior_anneal_origin", 0) or 0)
+        local = max(0, int(self.metrics.total_steps) - origin)
+        progress = min(1.0, local / steps)
+        return max(end, start - (start - end) * progress)
+
+    def _label_skill_from_router(self, frame_state: FrameState | None) -> None:
+        if frame_state is None:
+            return
+        proposed = self.skill_router.propose(frame_state)
+        self.last_skill = proposed
+        self.last_skill_index = skill_to_index(proposed)
+
+    def _skill_network_confident(self) -> bool:
+        logits = self._last_skill_logits
+        if logits is None or logits.size < 2:
+            return False
+        order = np.argsort(logits)[::-1]
+        best = float(logits[order[0]])
+        second = float(logits[order[1]])
+        margin = float(
+            getattr(self.config.training, "skill_confidence_margin", 0.12) or 0.12
+        )
+        return (best - second) >= margin
+
     def reset_prior_anneal_origin(self) -> None:
         """Call after loading a continue checkpoint so priors start strong again."""
         self._prior_anneal_origin = int(self.metrics.total_steps)
@@ -305,6 +387,10 @@ class DQNAgent:
         source = "greedy"
         prior = 0.0
         if frame_state is not None:
+            skills_on = bool(getattr(self.config.training, "skills_enabled", False))
+            if skills_on:
+                self._label_skill_from_router(frame_state)
+
             safety = bool(
                 getattr(self.config.training, "watch_safety_override", False)
             )
@@ -330,6 +416,17 @@ class DQNAgent:
             if getattr(self.config.training, "seed_thread_enabled", False):
                 self.seed_thread.observe(frame_state)
 
+            if skills_on:
+                skill_teacher = self.skill_teacher_prior_probability() if training else 0.0
+                if skill_teacher > 0.0 and random.random() < skill_teacher:
+                    action, skill = self.skill_router.act(frame_state)
+                    if skill != FREE_PLAY:
+                        source = "skill"
+                        self.last_skill = skill
+                        self.last_skill_index = skill_to_index(skill)
+                        self._set_action_meta(action, frame_state, source)
+                        return action
+
             if training:
                 prior = self.rule_prior_probability()
                 thread_prior = self.seed_thread_prior_probability()
@@ -340,6 +437,22 @@ class DQNAgent:
                 thread_prior = float(
                     getattr(self.config.training, "seed_thread_watch_prior", 0.0) or 0.0
                 )
+                if skills_on and self.skill_exec_allowed():
+                    self._predict_q_values(state)
+                    pred_skill = self.last_skill
+                    if (
+                        pred_skill != FREE_PLAY
+                        and self._skill_network_confident()
+                        and self.skill_router.controllers.applicable(
+                            pred_skill, frame_state
+                        )
+                    ):
+                        action = self.skill_router.controllers.act(
+                            pred_skill, frame_state
+                        )
+                        source = "skill"
+                        self._set_action_meta(action, frame_state, source)
+                        return action
 
             # Seed-thread first: strong path bias when a landing/climb target exists.
             if thread_prior > 0.0:
@@ -401,7 +514,7 @@ class DQNAgent:
                 pass
             except Exception:
                 self.last_reason_pred = EXPLORE
-        if source in ("rule", "explore", "thread"):
+        if source in ("rule", "explore", "thread", "skill"):
             # Predicted head not queried; mark pred as teacher for agree stats on explore
             # only when we actually ran the network (greedy). For explore/rule, pred=explore/rule.
             if source == "explore":
@@ -477,7 +590,7 @@ class DQNAgent:
                         ],
                         training=False,
                     )
-                    q_values, _ = self._unpack_outputs(outputs)
+                    q_values, _, _ = self._unpack_outputs(outputs)
                     q_values = q_values.numpy()
                 else:
                     q_values = self._batch_predict(
@@ -598,13 +711,24 @@ class DQNAgent:
         self.metrics.replay_size = len(self.replay)
         return added
 
+    def _demo_replay_has_hybrid_vectors(self) -> bool:
+        """True when demo_replay stores (visual, vector) states matching vector_dim."""
+        if self._vector_dim <= 0 or len(self.demo_replay) == 0:
+            return self._vector_dim <= 0 and len(self.demo_replay) > 0
+        with self.demo_replay._lock:
+            probe = self.demo_replay._items[0]
+        state = probe[0] if isinstance(probe, (tuple, list)) else None
+        if not isinstance(state, (tuple, list)) or len(state) != 2:
+            return False
+        vector = np.asarray(state[1], dtype=np.float32).reshape(-1)
+        return int(vector.shape[0]) == int(self._vector_dim)
+
     def pretrain_from_replay(self, steps: int | None = None) -> float | None:
         if len(self.demo_replay) == 0:
             return None
-        # Hybrid policies need real vector features. Demo buffers are visual-only;
-        # BC with zeroed vectors collapses Q-values (often to 100% noop) and must
-        # not run — especially before Watch mode.
-        if self._vector_dim > 0:
+        # Hybrid policies need real vector features. Visual-only demos would be
+        # zero-padded and collapse Q-values; stamped hybrid demos are OK.
+        if self._vector_dim > 0 and not self._demo_replay_has_hybrid_vectors():
             print(
                 "Skipping demo BC pretrain: hybrid model cannot use visual-only demos"
             )
@@ -652,9 +776,13 @@ class DQNAgent:
         *,
         sim: bool = False,
         reason: int | None = None,
+        skill: int | None = None,
+        episode_score: float = -1.0,
+        episode_id: int = -1,
     ) -> None:
         buffer = self.sim_replay if sim else self.replay
         reason_idx = self.last_reason_index if reason is None else int(reason)
+        skill_idx = self.last_skill_index if skill is None else int(skill)
         self._push_n_step(
             self._n_step_queue,
             buffer,
@@ -664,6 +792,9 @@ class DQNAgent:
             next_state,
             done,
             reason=reason_idx,
+            skill=skill_idx,
+            episode_score=float(episode_score),
+            episode_id=int(episode_id),
         )
         self.metrics.replay_size = len(self.replay)
 
@@ -678,9 +809,24 @@ class DQNAgent:
         done: bool,
         *,
         reason: int = -1,
+        skill: int = -1,
+        episode_score: float = -1.0,
+        episode_id: int = -1,
     ) -> None:
         n_step = max(1, self.config.training.n_step)
-        queue.append((state, action, reward, next_state, done, reason))
+        queue.append(
+            (
+                state,
+                action,
+                reward,
+                next_state,
+                done,
+                reason,
+                skill,
+                float(episode_score),
+                int(episode_id),
+            )
+        )
         while len(queue) >= n_step:
             self._flush_n_step_queue(queue, buffer)
         if done:
@@ -696,14 +842,33 @@ class DQNAgent:
         steps_used = 0
         final_next = queue[-1][3]
         final_done = False
-        for index, (_, _, step_reward, step_next, step_done, _) in enumerate(queue):
+        for index, (_, _, step_reward, step_next, step_done, _, _, _, _) in enumerate(
+            queue
+        ):
             accumulated += (gamma ** index) * step_reward
             final_next = step_next
             final_done = step_done
             steps_used = index + 1
             if step_done:
                 break
-        first_state, first_action, _, _, _, first_reason = queue[0]
+        (
+            first_state,
+            first_action,
+            _,
+            _,
+            _,
+            first_reason,
+            first_skill,
+            first_ep_score,
+            first_ep_id,
+        ) = queue[0]
+        # Prefer terminal transition's episode score when available.
+        ep_score = float(queue[-1][7]) if len(queue[-1]) > 7 else float(first_ep_score)
+        ep_id = int(queue[-1][8]) if len(queue[-1]) > 8 else int(first_ep_id)
+        if ep_score < 0:
+            ep_score = float(first_ep_score)
+        if ep_id < 0:
+            ep_id = int(first_ep_id)
         buffer.add(
             first_state,
             first_action,
@@ -712,6 +877,9 @@ class DQNAgent:
             final_done,
             discount=gamma ** steps_used,
             reason=int(first_reason),
+            skill=int(first_skill),
+            episode_score=ep_score,
+            episode_id=ep_id,
         )
         queue.pop(0)
 
@@ -1326,6 +1494,8 @@ class DQNAgent:
                                 )
                             if len(loaded.outputs) < 2 and self._reason_count > 0:
                                 raise ValueError("missing reason head")
+                            if self._skill_count > 0 and len(loaded.outputs) < 3:
+                                raise ValueError("missing skill head")
                         self.online.set_weights(loaded.get_weights())
                         self.target.set_weights(loaded.get_weights())
                     except Exception as shape_exc:
@@ -1344,7 +1514,7 @@ class DQNAgent:
                     self._last_load_error = None
                     if migrated:
                         print(
-                            "REASON_HEAD_INIT: reason logits randomly initialized",
+                            "REASON_HEAD_INIT: reason/skill logits randomly initialized",
                             flush=True,
                         )
                     return True
@@ -1376,6 +1546,10 @@ class DQNAgent:
             batch.reasons if batch.reasons is not None else np.full(len(batch.actions), -1, dtype=np.int32),
             dtype=self.tf.int32,
         )
+        skills_t = self.tf.convert_to_tensor(
+            batch.skills if batch.skills is not None else np.full(len(batch.actions), -1, dtype=np.int32),
+            dtype=self.tf.int32,
+        )
         weights_t = (
             self.tf.convert_to_tensor(batch.weights, dtype=self.tf.float32)
             if batch.weights is not None
@@ -1393,6 +1567,7 @@ class DQNAgent:
                 discounts,
                 weights_t,
                 reasons_t,
+                skills_t,
             )
         else:
             dummy = self.tf.zeros((len(batch.actions), 1), dtype=self.tf.float32)
@@ -1407,6 +1582,7 @@ class DQNAgent:
                 discounts,
                 weights_t,
                 reasons_t,
+                skills_t,
             )
         self._last_td_errors = td_errors
         td_abs = np.abs(td_errors.numpy())
@@ -1463,7 +1639,15 @@ class DQNAgent:
 
     def set_learning_rate(self, learning_rate: float) -> None:
         self.config.training.learning_rate = learning_rate
-        self.online.optimizer.learning_rate.assign(learning_rate)
+        opt = self.online.optimizer
+        # LossScaleOptimizer (mixed precision) wraps the inner Adam.
+        inner = getattr(opt, "inner_optimizer", None) or getattr(opt, "_optimizer", None)
+        target = inner if inner is not None else opt
+        lr_var = getattr(target, "learning_rate", None)
+        if lr_var is not None and hasattr(lr_var, "assign"):
+            lr_var.assign(learning_rate)
+        elif hasattr(opt, "learning_rate") and hasattr(opt.learning_rate, "assign"):
+            opt.learning_rate.assign(learning_rate)
 
     @property
     def _train_step(self):
@@ -1485,6 +1669,7 @@ class DQNAgent:
                 discounts,
                 weights,
                 reasons,
+                skills,
             ):
                 if agent._vector_dim > 0:
                     next_states_tensor = [next_visual, next_vector]
@@ -1506,8 +1691,10 @@ class DQNAgent:
 
                 online_next_out = agent.online(next_states_tensor, training=False)
                 target_next_out = agent.target(next_states_tensor, training=False)
-                online_next_q, _ = agent._unpack_outputs(online_next_out)
-                target_next_q, _ = agent._unpack_outputs(target_next_out)
+                online_next_q, _, _ = agent._unpack_outputs(online_next_out)
+                target_next_q, _, _ = agent._unpack_outputs(target_next_out)
+                online_next_q = tf.cast(online_next_q, tf.float32)
+                target_next_q = tf.cast(target_next_q, tf.float32)
                 masked_online = tf.where(mask > 0.0, online_next_q, neg_inf)
                 masked_target = tf.where(mask > 0.0, target_next_q, neg_inf)
 
@@ -1522,11 +1709,22 @@ class DQNAgent:
 
                 targets = rewards + (1.0 - dones) * discounts * next_values
                 aux_weight = float(agent.config.training.reason_aux_weight)
+                skill_aux_weight = float(
+                    getattr(agent.config.training, "skill_aux_weight", 0.0) or 0.0
+                )
                 reason_count_t = int(agent._reason_count)
+                skill_count_t = int(agent._skill_count)
 
                 with tf.GradientTape() as tape:
                     online_out = agent.online(states_tensor, training=True)
-                    q_values, reason_logits = agent._unpack_outputs(online_out)
+                    q_values, reason_logits, skill_logits = agent._unpack_outputs(
+                        online_out
+                    )
+                    q_values = tf.cast(q_values, tf.float32)
+                    if reason_logits is not None:
+                        reason_logits = tf.cast(reason_logits, tf.float32)
+                    if skill_logits is not None:
+                        skill_logits = tf.cast(skill_logits, tf.float32)
                     action_masks = tf.one_hot(actions, action_count)
                     selected_q = tf.reduce_sum(q_values * action_masks, axis=1)
                     td_errors = targets - selected_q
@@ -1546,10 +1744,33 @@ class DQNAgent:
                         ce = tf.where(valid, ce, tf.zeros_like(ce))
                         denom = tf.maximum(tf.reduce_sum(tf.cast(valid, tf.float32)), 1.0)
                         loss = loss + aux_weight * (tf.reduce_sum(ce) / denom)
+                    if (
+                        skill_logits is not None
+                        and skill_aux_weight > 0.0
+                        and skill_count_t > 0
+                    ):
+                        valid_s = skills >= 0
+                        safe_skills = tf.clip_by_value(skills, 0, skill_count_t - 1)
+                        ce_s = tf.keras.losses.sparse_categorical_crossentropy(
+                            safe_skills,
+                            skill_logits,
+                            from_logits=True,
+                        )
+                        ce_s = tf.where(valid_s, ce_s, tf.zeros_like(ce_s))
+                        denom_s = tf.maximum(
+                            tf.reduce_sum(tf.cast(valid_s, tf.float32)), 1.0
+                        )
+                        loss = loss + skill_aux_weight * (tf.reduce_sum(ce_s) / denom_s)
 
                 agent._last_td_errors = td_errors
 
-                gradients = tape.gradient(loss, agent.online.trainable_variables)
+                opt = agent.online.optimizer
+                train_loss = loss
+                if hasattr(opt, "get_scaled_loss"):
+                    train_loss = opt.get_scaled_loss(loss)
+                gradients = tape.gradient(train_loss, agent.online.trainable_variables)
+                if hasattr(opt, "get_unscaled_gradients"):
+                    gradients = opt.get_unscaled_gradients(gradients)
                 clipped, _ = tf.clip_by_global_norm(
                     gradients,
                     agent.config.training.gradient_clip_norm,
@@ -1600,11 +1821,17 @@ class DQNAgent:
                     model_in = state_visual
                 with tf.GradientTape() as tape:
                     outputs = agent.online(model_in, training=True)
-                    q_values, _ = agent._unpack_outputs(outputs)
+                    q_values, _, _ = agent._unpack_outputs(outputs)
                     loss = tf.keras.losses.SparseCategoricalCrossentropy(
                         from_logits=True
                     )(actions, q_values)
-                gradients = tape.gradient(loss, agent.online.trainable_variables)
+                opt = agent.online.optimizer
+                train_loss = loss
+                if hasattr(opt, "get_scaled_loss"):
+                    train_loss = opt.get_scaled_loss(loss)
+                gradients = tape.gradient(train_loss, agent.online.trainable_variables)
+                if hasattr(opt, "get_unscaled_gradients"):
+                    gradients = opt.get_unscaled_gradients(gradients)
                 clipped, _ = tf.clip_by_global_norm(
                     gradients,
                     agent.config.training.gradient_clip_norm,
@@ -1623,6 +1850,232 @@ class DQNAgent:
 
             self._compiled_bc_train_step = bc_train_step
         return self._compiled_bc_train_step
+
+    def train_skill_head(self, *, steps: int, lr: float) -> float | None:
+        """Behavior-clone router skill labels stored in replay (skill head only)."""
+        if self._skill_count <= 0 or len(self.replay) < max(64, self.batch_size):
+            return None
+        self.set_learning_rate(lr)
+        trainable = []
+        for layer in self.online.layers:
+            if layer.name == "skill_logits" or "skill_logits" in (layer.name or ""):
+                layer.trainable = True
+                trainable.append(layer)
+            else:
+                layer.trainable = False
+        if not trainable:
+            for var in self.online.trainable_variables:
+                if "skill_logits" in var.name:
+                    trainable.append(var)
+        last_loss = None
+        batch_size = min(self.batch_size, len(self.replay))
+        try:
+            with self.tf.device(self.device_info.training_device):
+                for i in range(max(1, steps)):
+                    batch = self.replay.sample(batch_size)
+                    if batch.skills is None:
+                        return None
+                    valid = batch.skills >= 0
+                    if not np.any(valid):
+                        return None
+                    loss = float(
+                        self._invoke_skill_bc_step(
+                            batch.states, batch.skills
+                        ).numpy()
+                    )
+                    last_loss = loss
+                    if (i + 1) % max(1, steps // 5) == 0:
+                        print(
+                            f"SKILL_BC step={i + 1}/{steps} loss={loss:.4f}",
+                            flush=True,
+                        )
+        finally:
+            for layer in self.online.layers:
+                layer.trainable = True
+        return last_loss
+
+    def evaluate_skill_accuracy(
+        self,
+        *,
+        max_batches: int = 32,
+        holdout_fraction: float = 0.25,
+    ) -> dict[str, float]:
+        """Held-out skill-head accuracy / CE against router labels in replay."""
+        if self._skill_count <= 0 or len(self.replay) < max(64, self.batch_size):
+            return {"accuracy": 0.0, "loss": -1.0, "n": 0.0, "valid": 0.0}
+        n = len(self.replay)
+        hold = max(self.batch_size, int(n * holdout_fraction))
+        batch_size = min(self.batch_size, hold)
+        correct = 0
+        total = 0
+        loss_sum = 0.0
+        batches = 0
+        with self.tf.device(self.device_info.inference_device):
+            for _ in range(max(1, max_batches)):
+                batch = self.replay.sample(batch_size)
+                if batch.skills is None:
+                    break
+                skills = np.asarray(batch.skills, dtype=np.int32)
+                valid = skills >= 0
+                if not np.any(valid):
+                    continue
+                model_batch = self._to_model_batch(batch.states)
+                if self._vector_dim > 0:
+                    outputs = self.online(
+                        [
+                            self.tf.convert_to_tensor(model_batch[0], dtype=self.tf.float32),
+                            self.tf.convert_to_tensor(model_batch[1], dtype=self.tf.float32),
+                        ],
+                        training=False,
+                    )
+                else:
+                    outputs = self.online(
+                        self.tf.convert_to_tensor(model_batch, dtype=self.tf.float32),
+                        training=False,
+                    )
+                _, _, skill_logits = self._unpack_outputs(outputs)
+                if skill_logits is None:
+                    break
+                logits = (
+                    skill_logits.numpy()
+                    if hasattr(skill_logits, "numpy")
+                    else np.asarray(skill_logits)
+                )
+                pred = np.argmax(logits, axis=1).astype(np.int32)
+                correct += int(np.sum((pred == skills) & valid))
+                total += int(np.sum(valid))
+                # Sparse CE for reporting.
+                safe = np.clip(skills, 0, self._skill_count - 1)
+                row = np.arange(len(safe))
+                log_probs = logits - logits.max(axis=1, keepdims=True)
+                log_probs = log_probs - np.log(
+                    np.sum(np.exp(log_probs), axis=1, keepdims=True) + 1e-8
+                )
+                ce = -log_probs[row, safe]
+                loss_sum += float(np.sum(ce[valid]))
+                batches += 1
+        accuracy = float(correct / max(1, total))
+        loss = float(loss_sum / max(1, total)) if total else -1.0
+        result = {
+            "accuracy": accuracy,
+            "loss": loss,
+            "n": float(total),
+            "valid": float(total),
+            "batches": float(batches),
+        }
+        path = Path(
+            getattr(
+                self.config.training,
+                "skill_accuracy_path",
+                Path("checkpoints/skill_head_accuracy.json"),
+            )
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    **result,
+                    "threshold": float(
+                        getattr(self.config.training, "skill_exec_min_accuracy", 0.85)
+                        or 0.85
+                    ),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"SKILL_ACCURACY accuracy={accuracy:.3f} loss={loss:.4f} n={total} "
+            f"-> {path.name}",
+            flush=True,
+        )
+        return result
+
+    def skill_exec_allowed(self) -> bool:
+        """Watch may execute predicted skills only after accuracy clears threshold."""
+        if not getattr(self.config.training, "skills_enabled", False):
+            return False
+        if not getattr(self.config.training, "skill_exec_at_watch", True):
+            return False
+        threshold = float(
+            getattr(self.config.training, "skill_exec_min_accuracy", 0.85) or 0.85
+        )
+        path = Path(
+            getattr(
+                self.config.training,
+                "skill_accuracy_path",
+                Path("checkpoints/skill_head_accuracy.json"),
+            )
+        )
+        if not path.exists():
+            return False
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            return float(meta.get("accuracy", 0.0)) >= threshold
+        except (OSError, ValueError, TypeError):
+            return False
+
+    @property
+    def _skill_bc_train_step(self):
+        if not hasattr(self, "_compiled_skill_bc_train_step"):
+            agent = self
+            tf = agent.tf
+            skill_count_t = int(agent._skill_count)
+
+            @self.tf.function
+            def skill_bc_step(state_visual, state_vector, skills):
+                if agent._vector_dim > 0:
+                    model_in = [state_visual, state_vector]
+                else:
+                    model_in = state_visual
+                with tf.GradientTape() as tape:
+                    outputs = agent.online(model_in, training=True)
+                    _, _, skill_logits = agent._unpack_outputs(outputs)
+                    if skill_logits is None:
+                        return tf.constant(0.0, dtype=tf.float32)
+                    valid = skills >= 0
+                    safe = tf.clip_by_value(skills, 0, skill_count_t - 1)
+                    ce = tf.keras.losses.sparse_categorical_crossentropy(
+                        safe, skill_logits, from_logits=True
+                    )
+                    ce = tf.where(valid, ce, tf.zeros_like(ce))
+                    denom = tf.maximum(tf.reduce_sum(tf.cast(valid, tf.float32)), 1.0)
+                    loss = tf.reduce_sum(ce) / denom
+                vars_skill = [
+                    v
+                    for v in agent.online.trainable_variables
+                    if "skill_logits" in v.name
+                ]
+                gradients = tape.gradient(loss, vars_skill)
+                pairs = [
+                    (g, v)
+                    for g, v in zip(gradients, vars_skill, strict=True)
+                    if g is not None
+                ]
+                if pairs:
+                    agent.online.optimizer.apply_gradients(pairs)
+                return loss
+
+            self._compiled_skill_bc_train_step = skill_bc_step
+        return self._compiled_skill_bc_train_step
+
+    def _invoke_skill_bc_step(self, states, skills):
+        skills_t = self.tf.convert_to_tensor(skills, dtype=self.tf.int32)
+        model_batch = self._to_model_batch(states)
+        dummy = self.tf.zeros((self.tf.shape(skills_t)[0], 1), dtype=self.tf.float32)
+        if self._vector_dim > 0:
+            visual, vector = model_batch
+            return self._skill_bc_train_step(
+                self.tf.convert_to_tensor(visual, dtype=self.tf.float32),
+                self.tf.convert_to_tensor(vector, dtype=self.tf.float32),
+                skills_t,
+            )
+        return self._skill_bc_train_step(
+            self.tf.convert_to_tensor(model_batch, dtype=self.tf.float32),
+            dummy,
+            skills_t,
+        )
 
     def weight_norm(self) -> float:
         total = 0.0

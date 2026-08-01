@@ -4,12 +4,21 @@ from typing import Any
 
 _INSTALL_LISTENERS_JS = """
 () => {
-    if (window.__ascentKeyState) {
-        return true;
-    }
-    window.__ascentKeyState = { left: false, right: false, space: false };
+    const install = (target) => {
+        if (!target || target.__ascentKeyProbeInstalled) {
+            return;
+        }
+        target.__ascentKeyProbeInstalled = true;
+        target.addEventListener("keydown", (event) => apply(event, true), true);
+        target.addEventListener("keyup", (event) => apply(event, false), true);
+    };
     const apply = (event, down) => {
         const key = (event.key || "").toLowerCase();
+        window.__ascentKeyState = window.__ascentKeyState || {
+            left: false,
+            right: false,
+            space: false,
+        };
         if (key === "a" || key === "arrowleft") {
             window.__ascentKeyState.left = down;
         }
@@ -21,8 +30,13 @@ _INSTALL_LISTENERS_JS = """
             event.preventDefault();
         }
     };
-    document.addEventListener("keydown", (event) => apply(event, true), true);
-    document.addEventListener("keyup", (event) => apply(event, false), true);
+    window.__ascentKeyState = window.__ascentKeyState || {
+        left: false,
+        right: false,
+        space: false,
+    };
+    install(window);
+    install(document);
     return true;
 }
 """
@@ -34,23 +48,32 @@ _READ_STATE_JS = """
         left: !!state.left,
         right: !!state.right,
         space: !!state.space,
+        installed: !!window.__ascentKeyState,
     };
 }
 """
 
 
 async def install_keyboard_probe(page: Any) -> None:
+    context = getattr(page, "context", None)
+    if callable(context):
+        ctx = context()
+        if hasattr(ctx, "add_init_script"):
+            await ctx.add_init_script(_INSTALL_LISTENERS_JS)
+    if hasattr(page, "add_init_script"):
+        await page.add_init_script(_INSTALL_LISTENERS_JS)
     await page.evaluate(_INSTALL_LISTENERS_JS)
 
 
 async def read_keyboard_state(page: Any) -> dict[str, bool]:
     payload = await page.evaluate(_READ_STATE_JS)
     if not isinstance(payload, dict):
-        return {"left": False, "right": False, "space": False}
+        return {"left": False, "right": False, "space": False, "installed": False}
     return {
         "left": bool(payload.get("left")),
         "right": bool(payload.get("right")),
         "space": bool(payload.get("space")),
+        "installed": bool(payload.get("installed", True)),
     }
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -304,6 +305,7 @@ class BrowserBackend:
               window.CHART_TRIAL_CONFIG || {},
               {
                 offlineMode: true,
+                hideMarketChart: true,
                 agentMode: true,
                 devUnlockTiers: true,
                 trainingTierIndex: 0,
@@ -526,12 +528,17 @@ class BrowserBackend:
         except Exception as exc:
             print(f"VIEWPORT_FIT_FAIL {exc}", flush=True)
 
-    async def force_open_game(self) -> BrowserStatus:
+    async def ensure_game_session(self, *, reload: bool = False) -> BrowserStatus:
+        """Keep the existing tab when possible — avoid reloading every episode."""
         self._require_page()
-        await self._goto_ascent()
+        if reload or self.config.host_match not in (self.page.url or ""):
+            await self._goto_ascent()
         await self._ensure_page_ready(navigate_if_needed=False)
         self.status = await self._make_status(True, self.status.mode, self.status.cdp_url)
         return self.status
+
+    async def force_open_game(self) -> BrowserStatus:
+        return await self.ensure_game_session(reload=True)
 
     async def _select_ascent_page(self, pages: list[Any]) -> Any:
         for page in pages:
@@ -579,25 +586,36 @@ class BrowserBackend:
                 self.page.evaluate(
                     """() => {
                         try {
+                          try {
+                            localStorage.setItem(
+                              'ascent-cosmetics-reveal-dismissed-v4', '1'
+                            );
+                          } catch (e) {}
                           document.getElementById('cosmeticsRevealOverlay')
                             ?.classList.add('hidden');
-                          const mode = document.querySelector(
-                            '.mode-btn[data-ghost="0"]'
-                          );
-                          mode?.click();
+                          document.querySelector('.mode-btn[data-ghost="0"]')
+                            ?.click();
+                          const startOverlay = document.getElementById('startOverlay');
                           const play = document.getElementById('playBtn');
-                          const overlay = document.getElementById('startOverlay');
-                          if (play && overlay && !overlay.classList.contains('hidden')) {
+                          if (
+                            play
+                            && startOverlay
+                            && !startOverlay.classList.contains('hidden')
+                          ) {
                             play.click();
                             return 'playBtn';
                           }
-                          const grid = document.getElementById('ultiSelectGrid');
+                          const ultiScreen = document.getElementById('ultiSelectScreen');
                           const confirm = document.getElementById('ultiSelectConfirm');
-                          if (grid && confirm) {
-                            const card = grid.querySelector('.ulti-card');
-                            card?.click();
-                            if (!confirm.disabled) confirm.click();
-                            else confirm.click();
+                          if (
+                            ultiScreen
+                            && !ultiScreen.classList.contains('hidden')
+                            && confirm
+                          ) {
+                            document
+                              .querySelector('#ultiSelectGrid .ulti-card')
+                              ?.click();
+                            confirm.click();
                             return 'ultiSelectConfirm';
                           }
                           if (typeof startGame === 'function') {
@@ -616,6 +634,39 @@ class BrowserBackend:
             print(f"BROWSER_FORCE_START_FAIL {exc}", flush=True)
             return "fail"
 
+    async def ensure_playing(self, *, timeout_seconds: float = 20.0) -> bool:
+        """Click through menus until __ASCENT_AGENT__ reports playing."""
+        self._require_page()
+        deadline = time.monotonic() + max(2.0, timeout_seconds)
+        last_result = "none"
+        while time.monotonic() < deadline:
+            payload = await self.page.evaluate(
+                """() => {
+                    const agent = window.__ASCENT_AGENT__;
+                    const start = document.getElementById('startOverlay');
+                    const ulti = document.getElementById('ultiSelectScreen');
+                    return {
+                      playing: agent?.state === 'playing',
+                      agentState: agent?.state || null,
+                      startVisible: !!(start && !start.classList.contains('hidden')),
+                      ultiVisible: !!(ulti && !ulti.classList.contains('hidden')),
+                    };
+                }"""
+            )
+            if isinstance(payload, dict) and payload.get("playing"):
+                print(
+                    f"BROWSER_PLAYING agentState={payload.get('agentState')!r}",
+                    flush=True,
+                )
+                return True
+            last_result = await self.force_start_game()
+            await asyncio.sleep(0.45)
+        print(
+            f"BROWSER_PLAYING_FAIL last={last_result!r} timeout={timeout_seconds:.0f}s",
+            flush=True,
+        )
+        return False
+
     async def browser_heartbeat(self) -> dict:
         """Quick liveness probe for watchdog / logs."""
         self._require_page()
@@ -630,16 +681,31 @@ class BrowserBackend:
                         const body = document.body
                           ? document.body.innerText.toUpperCase()
                           : '';
+                        const start = document.getElementById('startOverlay');
+                        const ulti = document.getElementById('ultiSelectScreen');
+                        const agent = window.__ASCENT_AGENT__;
+                        const startVisible = !!(
+                          start && !start.classList.contains('hidden')
+                        );
+                        const ultiVisible = !!(
+                          ulti && !ulti.classList.contains('hidden')
+                        );
                         return {
                           url: location.href,
                           score: digits ? parseInt(digits, 10) : null,
-                          inMenu: body.includes('START THE ASCENT')
+                          inMenu: startVisible
+                            || ultiVisible
+                            || body.includes('START THE ASCENT')
                             || body.includes('PICK 1 ULTI')
                             || body.includes('PREPARE FOR THE ASCENT'),
+                          startVisible,
+                          ultiVisible,
+                          playing: agent?.state === 'playing',
+                          agentState: agent?.state || null,
                           fell: body.includes('FELL')
                             || body.includes('BACK TO EARTH'),
                           hasCanvas: !!document.querySelector('#gameCanvas'),
-                          agent: !!window.__ASCENT_AGENT__,
+                          agent: !!agent,
                         };
                     }"""
                 ),
@@ -648,8 +714,11 @@ class BrowserBackend:
             if isinstance(payload, dict):
                 print(
                     f"BROWSER_ALIVE score={payload.get('score')} "
-                    f"menu={payload.get('inMenu')} fell={payload.get('fell')} "
-                    f"canvas={payload.get('hasCanvas')} agent={payload.get('agent')}",
+                    f"menu={payload.get('inMenu')} playing={payload.get('playing')} "
+                    f"agentState={payload.get('agentState')!r} "
+                    f"start={payload.get('startVisible')} ulti={payload.get('ultiVisible')} "
+                    f"fell={payload.get('fell')} canvas={payload.get('hasCanvas')} "
+                    f"agent={payload.get('agent')}",
                     flush=True,
                 )
                 return payload
