@@ -1649,6 +1649,35 @@ class DQNAgent:
         elif hasattr(opt, "learning_rate") and hasattr(opt.learning_rate, "assign"):
             opt.learning_rate.assign(learning_rate)
 
+    def rebuild_optimizer(self, learning_rate: float | None = None) -> None:
+        """Recreate Adam (+ LossScale) after BC/load so TD can see all variables.
+
+        Mixed-precision LossScaleOptimizer tracks the variable set from the first
+        apply_gradients call. Offline BC only backprops into Q logits, so a later
+        TD step that also touches reason/skill heads raises "Unknown variable".
+        """
+        lr = float(
+            self.config.training.learning_rate
+            if learning_rate is None
+            else learning_rate
+        )
+        self.config.training.learning_rate = lr
+        optimizer = self.tf.keras.optimizers.Adam(learning_rate=lr)
+        if self._use_mixed_precision:
+            optimizer = self.tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+        self.online.optimizer = optimizer
+        for attr in (
+            "_compiled_train_step",
+            "_compiled_bc_train_step",
+            "_compiled_skill_bc_train_step",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        print(
+            f"OPTIMIZER_REBUILD lr={lr:.2e} mixed_precision={int(self._use_mixed_precision)}",
+            flush=True,
+        )
+
     @property
     def _train_step(self):
         if not hasattr(self, "_compiled_train_step"):

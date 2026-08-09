@@ -1,4 +1,4 @@
-"""PyQt window for live watchdog / thread-BC training session stats."""
+"""PyQt window for live watchdog / thread-BC / v2-climb training session stats."""
 from __future__ import annotations
 
 import time
@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPlainTextEdit,
+    QProgressBar,
     QVBoxLayout,
     QWidget,
 )
@@ -22,6 +23,7 @@ from ascent_player.utils.watchdog_log import (
     SessionStats,
     format_duration,
     parse_watchdog_hours_from_ps,
+    session_start_from_log_path,
     watchdog_running,
 )
 
@@ -32,6 +34,18 @@ def _fmt_opt(value: float | int | None, *, digits: int = 1) -> str:
     if isinstance(value, int):
         return str(value)
     return f"{value:.{digits}f}"
+
+
+def _supervisor_log_for(trainer_log: Path) -> Path | None:
+    stamp = None
+    for prefix in ("v2_climb_watchdog_", "v2_climb_ladder_", "skill_training_watchdog_"):
+        if trainer_log.name.startswith(prefix):
+            stamp = trainer_log.name[len(prefix) :].removesuffix(".log")
+            break
+    if not stamp:
+        return None
+    candidate = trainer_log.parent / f"v2_climb_watchdog_supervisor_{stamp}.log"
+    return candidate if candidate.exists() else None
 
 
 class TrainingMonitorWindow(QMainWindow):
@@ -46,9 +60,16 @@ class TrainingMonitorWindow(QMainWindow):
         self._hours = hours if hours is not None else parse_watchdog_hours_from_ps() or 8.0
         self._reader = LogTailReader(path=log_path)
         self._reader.stats.hours = self._hours
+        if "v2_climb" in log_path.name:
+            self._reader.stats.session_kind = "v2_climb"
+
+        supervisor = _supervisor_log_for(log_path)
+        self._supervisor_reader = (
+            LogTailReader(path=supervisor) if supervisor is not None else None
+        )
 
         self.setWindowTitle("Ascent — Training Monitor")
-        self.setMinimumSize(520, 520)
+        self.setMinimumSize(560, 620)
         self.setStyleSheet(APP_STYLESHEET)
 
         root = QWidget()
@@ -60,8 +81,13 @@ class TrainingMonitorWindow(QMainWindow):
         self._log_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self._log_label)
 
+        self._kind_lbl = QLabel("—")
+        self._kind_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
+        layout.addWidget(self._kind_lbl)
+
         time_box = QGroupBox("Session time")
-        time_form = QFormLayout(time_box)
+        time_layout = QVBoxLayout(time_box)
+        time_form = QFormLayout()
         self._elapsed_lbl = QLabel("—")
         self._remaining_lbl = QLabel("—")
         self._deadline_lbl = QLabel("—")
@@ -70,6 +96,14 @@ class TrainingMonitorWindow(QMainWindow):
         time_form.addRow("Remaining", self._remaining_lbl)
         time_form.addRow(f"Budget ({self._hours:g}h)", self._deadline_lbl)
         time_form.addRow("Watchdog", self._watchdog_lbl)
+        time_layout.addLayout(time_form)
+
+        self._time_bar = QProgressBar()
+        self._time_bar.setRange(0, 1000)
+        self._time_bar.setValue(0)
+        self._time_bar.setTextVisible(True)
+        self._time_bar.setFormat("%p% of budget used")
+        time_layout.addWidget(self._time_bar)
         layout.addWidget(time_box)
 
         stats_box = QGroupBox("Training stats")
@@ -78,13 +112,15 @@ class TrainingMonitorWindow(QMainWindow):
         self._episode_lbl = QLabel("—")
         self._collect_lbl = QLabel("—")
         self._eval_lbl = QLabel("—")
+        self._bc_lbl = QLabel("—")
         self._phase_lbl = QLabel("—")
         self._wd_prog_lbl = QLabel("—")
         self._errors_lbl = QLabel("0")
-        stats_form.addRow("Cycle", self._cycle_lbl)
-        stats_form.addRow("Episode", self._episode_lbl)
+        stats_form.addRow("Round / cycle", self._cycle_lbl)
+        stats_form.addRow("Episode / score", self._episode_lbl)
         stats_form.addRow("Collect", self._collect_lbl)
-        stats_form.addRow("Eval / ceiling", self._eval_lbl)
+        stats_form.addRow("Eval / probe", self._eval_lbl)
+        stats_form.addRow("Offline BC", self._bc_lbl)
         stats_form.addRow("Phase", self._phase_lbl)
         stats_form.addRow("Watchdog progress", self._wd_prog_lbl)
         stats_form.addRow("Errors flagged", self._errors_lbl)
@@ -113,25 +149,57 @@ class TrainingMonitorWindow(QMainWindow):
 
     def _tick(self) -> None:
         stats = self._reader.refresh()
+        if self._supervisor_reader is not None:
+            sup = self._supervisor_reader.refresh()
+            if sup.watchdog_events is not None:
+                stats.watchdog_events = sup.watchdog_events
+                stats.watchdog_last = sup.watchdog_last
+                stats.watchdog_trainer_pid = sup.watchdog_trainer_pid
+            if sup.hours and abs(sup.hours - stats.hours) > 0.01:
+                # Prefer live remaining budget from watchdog supervisor.
+                pass
+            for line in sup.key_lines[-8:]:
+                if line.startswith("WATCHDOG_") and (
+                    not stats.key_lines or stats.key_lines[-1] != line
+                ):
+                    stats.key_lines.append(line)
+                    if len(stats.key_lines) > 24:
+                        stats.key_lines = stats.key_lines[-24:]
+        if stats.hours > 0:
+            self._hours = stats.hours
         self._render(stats)
 
     def _render(self, stats: SessionStats) -> None:
         self._log_label.setText(f"Log: {self._log_path}  ({stats.log_bytes:,} bytes)")
 
-        start = stats.session_start
+        kind = stats.session_kind or "thread_bc"
+        variant = stats.model_variant or ("impala_mid" if kind == "v2_climb" else "—")
+        title = "v2 climb (Impala-mid)" if kind == "v2_climb" else "thread-BC cycle"
+        self._kind_lbl.setText(f"{title}  ·  model={variant}")
+        self.setWindowTitle(f"Ascent — {title}")
+
+        start = stats.session_start or session_start_from_log_path(self._log_path)
         if start is not None:
             elapsed = time.time() - start.timestamp()
-            budget = self._hours * 3600.0
+            budget = max(1.0, self._hours * 3600.0)
             remaining = max(0.0, budget - elapsed)
+            pct = min(1.0, elapsed / budget)
             self._elapsed_lbl.setText(format_duration(elapsed))
             self._remaining_lbl.setText(format_duration(remaining))
             self._deadline_lbl.setText(
-                f"started {start.strftime('%Y-%m-%d %H:%M:%S')} local"
+                f"started {start.strftime('%Y-%m-%d %H:%M:%S')} local  ·  "
+                f"{self._hours:g}h budget"
+            )
+            self._time_bar.setValue(int(pct * 1000))
+            self._time_bar.setFormat(
+                f"{pct * 100:.1f}% used  ·  {format_duration(remaining)} left"
             )
         else:
             self._elapsed_lbl.setText("—")
             self._remaining_lbl.setText("—")
             self._deadline_lbl.setText("unknown start (name not timestamped)")
+            self._time_bar.setValue(0)
+            self._time_bar.setFormat("unknown start")
 
         running = watchdog_running()
         pid = stats.watchdog_trainer_pid
@@ -142,7 +210,9 @@ class TrainingMonitorWindow(QMainWindow):
 
         cycle = _fmt_opt(stats.cycle_round, digits=0)
         if stats.cycle_remaining_h is not None:
-            cycle += f"  (cycle remaining {stats.cycle_remaining_h:.2f}h)"
+            cycle += f"  (wall remaining {stats.cycle_remaining_h:.2f}h)"
+        if stats.climb_best_mean is not None:
+            cycle += f"  best={stats.climb_best_mean:.0f}"
         self._cycle_lbl.setText(cycle)
 
         if stats.episode is not None:
@@ -150,6 +220,8 @@ class TrainingMonitorWindow(QMainWindow):
                 f"#{stats.episode}  score={_fmt_opt(stats.episode_score, digits=0)}  "
                 f"reward={_fmt_opt(stats.episode_reward)}  ε={_fmt_opt(stats.epsilon, digits=3)}"
             )
+        elif stats.episode_score is not None:
+            self._episode_lbl.setText(f"live score={stats.episode_score:.0f}")
         else:
             self._episode_lbl.setText("—")
 
@@ -165,9 +237,23 @@ class TrainingMonitorWindow(QMainWindow):
             parts.append(f"ceiling={stats.ceiling_mean:.0f}")
         if stats.eval_aligned_mean is not None:
             parts.append(f"aligned={stats.eval_aligned_mean:.0f}")
-        if stats.eval_greedy_mean is not None:
+        if stats.climb_probe_mean is not None:
+            parts.append(f"probe={stats.climb_probe_mean:.0f}")
+        elif stats.eval_greedy_mean is not None:
             parts.append(f"greedy={stats.eval_greedy_mean:.0f}")
         self._eval_lbl.setText("  ".join(parts) if parts else "—")
+
+        if stats.climb_bc_step is not None and stats.climb_bc_steps is not None:
+            self._bc_lbl.setText(
+                f"{stats.climb_bc_step}/{stats.climb_bc_steps}"
+                + (
+                    f"  loss={stats.climb_bc_loss:.3f}"
+                    if stats.climb_bc_loss is not None
+                    else ""
+                )
+            )
+        else:
+            self._bc_lbl.setText("—")
 
         phase = stats.last_phase or "—"
         if stats.last_train_marker:
@@ -229,6 +315,11 @@ class MatrixMonitorWindow(QMainWindow):
         time_form.addRow("Processes", self._process_lbl)
         layout.addWidget(time_box)
 
+        self._time_bar = QProgressBar()
+        self._time_bar.setRange(0, 1000)
+        self._time_bar.setFormat("%p% cells complete")
+        layout.addWidget(self._time_bar)
+
         stats_box = QGroupBox("Current benchmark")
         stats_form = QFormLayout(stats_box)
         self._cell_lbl = QLabel("—")
@@ -281,9 +372,13 @@ class MatrixMonitorWindow(QMainWindow):
         self._remaining_lbl.setText(format_duration(remaining_s))
 
         in_progress = 1 if stats.benchmark_running else 0
+        done = min(stats.cells_total, stats.cells_complete)
         self._cells_lbl.setText(
             f"{stats.cells_complete}/{stats.cells_total} done"
             f"  (+{in_progress} running, {stats.cells_failed} failed)"
+        )
+        self._time_bar.setValue(
+            int(1000 * done / max(1, stats.cells_total))
         )
         parts = []
         if stats.matrix_running:

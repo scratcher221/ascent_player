@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Live UI for watchdog thread-BC training (elapsed time + log stats).
+"""Live UI for watchdog / v2-climb training (elapsed, remaining, log stats).
 
 Example:
   PYTHONPATH=. .venv/bin/python scripts/training_monitor.py
   PYTHONPATH=. .venv/bin/python scripts/training_monitor.py \\
-      --log logs/skill_training_watchdog_20260725_152812.log --hours 8
+      --log logs/v2_climb_watchdog_20260801_165247.log --hours 6
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def main() -> int:
         "--log",
         type=Path,
         default=None,
-        help="Watchdog/cycle log (default: newest active skill_training_watchdog_*.log)",
+        help="Trainer/watchdog log (default: newest active climb or thread-BC log)",
     )
     parser.add_argument(
         "--hours",
@@ -48,18 +48,19 @@ def main() -> int:
     log_dir = ROOT / "logs"
     import subprocess
 
-    matrix_running = bool(
-        subprocess.run(
-            ["pgrep", "-f", "scripts/run_reliability_matrix.py"],
-            capture_output=True,
-        ).stdout.strip()
+    def _running(pattern: str) -> bool:
+        return bool(
+            subprocess.run(
+                ["pgrep", "-f", pattern],
+                capture_output=True,
+            ).stdout.strip()
+        )
+
+    matrix_running = _running("scripts/run_reliability_matrix.py")
+    climb_or_thread = _running("scripts/run_v2_climb_with_watchdog.py") or _running(
+        "scripts/run_thread_bc_with_watchdog.py"
     )
-    use_matrix = args.matrix or (
-        args.log is None and matrix_running and not subprocess.run(
-            ["pgrep", "-f", "scripts/run_thread_bc_with_watchdog.py"],
-            capture_output=True,
-        ).stdout.strip()
-    )
+    use_matrix = args.matrix or (args.log is None and matrix_running and not climb_or_thread)
 
     if use_matrix:
         log_path = args.log or (log_dir / "reliability_matrix_run.log")
@@ -85,7 +86,11 @@ def main() -> int:
 
         log_path = find_active_watchdog_log(log_dir)
         if log_path is None:
-            print("No skill_training_watchdog_*.log found under logs/", file=sys.stderr)
+            print(
+                "No active training log found under logs/ "
+                "(expected v2_climb_watchdog_*.log or skill_training_watchdog_*.log)",
+                file=sys.stderr,
+            )
             return 1
     elif not log_path.is_absolute():
         log_path = (ROOT / log_path).resolve()
@@ -95,11 +100,15 @@ def main() -> int:
         return 1
 
     from ascent_player.ui.training_monitor import TrainingMonitorWindow
+    from ascent_player.utils.watchdog_log import parse_watchdog_hours_from_ps
+
+    hours = args.hours if args.hours is not None else parse_watchdog_hours_from_ps()
+    print(f"Monitoring {log_path}" + (f" ({hours:g}h)" if hours else ""), flush=True)
 
     app = QApplication(sys.argv)
     window = TrainingMonitorWindow(
         log_path=log_path,
-        hours=args.hours,
+        hours=hours,
         refresh_ms=args.refresh_ms,
     )
     window.show()

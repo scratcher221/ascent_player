@@ -1,4 +1,4 @@
-"""Parse skill-training watchdog / thread-BC cycle logs for the training monitor."""
+"""Parse skill-training / v2-climb watchdog logs for the training monitor."""
 from __future__ import annotations
 
 import re
@@ -8,17 +8,31 @@ from datetime import datetime
 from pathlib import Path
 
 _LOG_NAME_RE = re.compile(
-    r"skill_training_watchdog_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.log$"
+    r"(?:skill_training_watchdog|v2_climb_watchdog|v2_climb_ladder)_"
+    r"(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.log$"
 )
 
 _HOURS_PS_RE = re.compile(
-    r"run_thread_bc_with_watchdog\.py(?:\s+\S+)*\s+--hours\s+([0-9.]+)"
+    r"run_(?:thread_bc|v2_climb)_with_watchdog\.py(?:\s+\S+)*\s+--hours\s+([0-9.]+)"
+)
+_CLIMB_HOURS_PS_RE = re.compile(
+    r"run_v2_climb_ladder\.py(?:\s+\S+)*\s+--hours\s+([0-9.]+)"
+)
+
+_WATCHDOG_SCRIPTS = (
+    "scripts/run_v2_climb_with_watchdog.py",
+    "scripts/run_thread_bc_with_watchdog.py",
+)
+_TRAINER_SCRIPTS = (
+    "scripts/run_v2_climb_ladder.py",
+    "scripts/run_thread_bc_cycle.py",
 )
 
 _KEY_LINE_MARKERS = (
     "WATCHDOG_",
     "THREAD_BC_CYCLE",
     "CYCLE_ROUND",
+    "CLIMB_",
     "PHASE_",
     "COLLECT_DONE",
     "CEILING_SUMMARY",
@@ -29,6 +43,9 @@ _KEY_LINE_MARKERS = (
     "SEED_BEST",
     "TARGET_MET",
     "WATCHDOG_STALL",
+    "BROWSER_PLAYING",
+    "BROWSER_RESET done",
+    "SEED_THREAD",
     "Traceback",
     "Error",
     "error",
@@ -39,6 +56,7 @@ _KEY_LINE_MARKERS = (
 class SessionStats:
     hours: float = 8.0
     session_start: datetime | None = None
+    session_kind: str = "thread_bc"  # thread_bc | v2_climb
     cycle_round: int | None = None
     cycle_remaining_h: float | None = None
     episode: int | None = None
@@ -50,6 +68,12 @@ class SessionStats:
     ceiling_mean: float | None = None
     eval_aligned_mean: float | None = None
     eval_greedy_mean: float | None = None
+    climb_probe_mean: float | None = None
+    climb_best_mean: float | None = None
+    climb_bc_loss: float | None = None
+    climb_bc_step: int | None = None
+    climb_bc_steps: int | None = None
+    model_variant: str | None = None
     watchdog_events: int | None = None
     watchdog_last: str | None = None
     watchdog_trainer_pid: int | None = None
@@ -68,6 +92,14 @@ def session_start_from_log_path(path: Path) -> datetime | None:
     return datetime(y, mo, d, h, mi, s)
 
 
+def _pgrep_pids(pattern: str) -> list[int]:
+    try:
+        out = subprocess.check_output(["pgrep", "-f", pattern], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    return [int(x) for x in out.split() if x.strip().isdigit()]
+
+
 def parse_watchdog_hours_from_ps() -> float | None:
     try:
         out = subprocess.check_output(
@@ -78,56 +110,98 @@ def parse_watchdog_hours_from_ps() -> float | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     for line in out.splitlines():
-        if "run_thread_bc_with_watchdog.py" not in line:
-            continue
-        m = _HOURS_PS_RE.search(line)
-        if m:
-            return float(m.group(1))
+        if "run_v2_climb_with_watchdog.py" in line or "run_thread_bc_with_watchdog.py" in line:
+            m = _HOURS_PS_RE.search(line)
+            if m:
+                return float(m.group(1))
+        if "run_v2_climb_ladder.py" in line and "with_watchdog" not in line:
+            m = _CLIMB_HOURS_PS_RE.search(line)
+            if m:
+                return float(m.group(1))
     return None
 
 
 def watchdog_running() -> bool:
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "scripts/run_thread_bc_with_watchdog.py"],
-            text=True,
-        )
-    except subprocess.CalledProcessError:
-        return False
-    return bool(out.strip())
+    return any(_pgrep_pids(script) for script in _WATCHDOG_SCRIPTS)
 
 
 def trainer_pids() -> list[int]:
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "scripts/run_thread_bc_cycle.py"],
-            text=True,
-        )
-    except subprocess.CalledProcessError:
-        return []
-    return [int(x) for x in out.split() if x.strip().isdigit()]
+    pids: list[int] = []
+    for script in _TRAINER_SCRIPTS:
+        pids.extend(_pgrep_pids(script))
+    return pids
+
+
+def active_session_kind() -> str:
+    if _pgrep_pids("scripts/run_v2_climb_with_watchdog.py") or _pgrep_pids(
+        "scripts/run_v2_climb_ladder.py"
+    ):
+        return "v2_climb"
+    return "thread_bc"
 
 
 def find_active_watchdog_log(log_dir: Path) -> Path | None:
     if not log_dir.is_dir():
         return None
-    candidates = sorted(
-        log_dir.glob("skill_training_watchdog_*.log"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+
+    # Prefer pointer written by the v2 climb watchdog.
+    for pointer in (
+        log_dir / "v2_climb_ladder_latest.path",
+        log_dir / "v2_climb_watchdog_supervisor.path",
+    ):
+        if pointer.exists():
+            try:
+                rel = pointer.read_text(encoding="utf-8").strip().splitlines()[0]
+            except OSError:
+                rel = ""
+            if rel:
+                candidate = Path(rel)
+                if not candidate.is_absolute():
+                    candidate = (log_dir.parent / candidate).resolve()
+                    if not candidate.exists():
+                        candidate = (log_dir / Path(rel).name).resolve()
+                if candidate.exists():
+                    # Prefer trainer log over supervisor when both exist.
+                    if "supervisor" in candidate.name:
+                        sibling = log_dir / candidate.name.replace(
+                            "_supervisor", ""
+                        ).replace("supervisor_", "")
+                        # Map v2_climb_watchdog_supervisor_STAMP.log → v2_climb_watchdog_STAMP.log
+                        stamp = re.search(r"(\d{8}_\d{6})", candidate.name)
+                        if stamp:
+                            climb_log = log_dir / f"v2_climb_watchdog_{stamp.group(1)}.log"
+                            if climb_log.exists():
+                                return climb_log
+                    return candidate
+
+    patterns = (
+        "v2_climb_watchdog_*.log",
+        "v2_climb_ladder_*.log",
+        "skill_training_watchdog_*.log",
     )
+    candidates: list[Path] = []
+    for pattern in patterns:
+        candidates.extend(log_dir.glob(pattern))
+    candidates = [
+        p
+        for p in candidates
+        if "supervisor" not in p.name and p.is_file()
+    ]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         return None
     pids = set(trainer_pids())
     if pids:
-        for path in candidates[:5]:
+        for path in candidates[:8]:
             try:
-                tail = path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+                tail = path.read_bytes()[-16000:].decode("utf-8", errors="replace")
             except OSError:
                 continue
             for pid in pids:
                 if f"WATCHDOG_PROGRESS pid={pid} " in tail or f"pid={pid}" in tail:
                     return path
+            if "CLIMB_START" in tail or "CLIMB_ROUND" in tail:
+                return path
     return candidates[0]
 
 
@@ -162,11 +236,45 @@ def _apply_line(stats: SessionStats, line: str) -> None:
     m = re.search(r"THREAD_BC_CYCLE_START\b.*\bhours=([0-9.]+)", stripped)
     if m:
         stats.hours = float(m.group(1))
+        stats.session_kind = "thread_bc"
+
+    m = re.search(
+        r"CLIMB_START\b.*\bvariant=(\S+).*?\bhours=([0-9.]+)",
+        stripped,
+    )
+    if m:
+        stats.model_variant = m.group(1)
+        stats.hours = float(m.group(2))
+        stats.session_kind = "v2_climb"
+    elif stripped.startswith("CLIMB_START"):
+        stats.session_kind = "v2_climb"
+        m = re.search(r"hours=([0-9.]+)", stripped)
+        if m:
+            stats.hours = float(m.group(1))
+        m = re.search(r"variant=(\S+)", stripped)
+        if m:
+            stats.model_variant = m.group(1)
+        m = re.search(r"best=([0-9.]+)", stripped)
+        if m:
+            stats.climb_best_mean = float(m.group(1))
+
+    m = re.search(r"WATCHDOG_START\b.*\bremaining_h=([0-9.]+)", stripped)
+    if m:
+        stats.hours = float(m.group(1))
+        if "variant=impala" in stripped or "v2_climb" in stripped:
+            stats.session_kind = "v2_climb"
 
     m = re.search(r"CYCLE_ROUND id=(\d+) remaining_h=([0-9.]+)", stripped)
     if m:
         stats.cycle_round = int(m.group(1))
         stats.cycle_remaining_h = float(m.group(2))
+
+    m = re.search(r"CLIMB_ROUND\s+(\d+)\s+remaining_s=([0-9.]+)", stripped)
+    if m:
+        stats.cycle_round = int(m.group(1))
+        stats.cycle_remaining_h = float(m.group(2)) / 3600.0
+        stats.session_kind = "v2_climb"
+        stats.last_phase = f"CLIMB_ROUND {m.group(1)}"
 
     m = re.search(
         r"episode=(\d+) reward=([-0-9.]+) score=([0-9.]+) epsilon=([0-9.]+)",
@@ -177,6 +285,12 @@ def _apply_line(stats: SessionStats, line: str) -> None:
         stats.episode_reward = float(m.group(2))
         stats.episode_score = float(m.group(3))
         stats.epsilon = float(m.group(4))
+
+    # Browser collect step lines (no episode counter while gate blocks replay).
+    m = re.search(r"^step=\d+\s+action=\S+.*\bscore=([0-9.]+)", stripped)
+    if m:
+        stats.episode_score = float(m.group(1))
+        stats.last_train_marker = stripped[:120]
 
     m = re.search(r"COLLECT_DONE recent_avg=([0-9.]+) replay=(\d+)", stripped)
     if m:
@@ -195,6 +309,42 @@ def _apply_line(stats: SessionStats, line: str) -> None:
     if m:
         stats.eval_greedy_mean = float(m.group(1))
 
+    m = re.search(r"CLIMB_PROBE_GREEDY mean=([0-9.]+)", stripped)
+    if m:
+        stats.climb_probe_mean = float(m.group(1))
+        stats.eval_greedy_mean = float(m.group(1))
+
+    m = re.search(r"CLIMB_BEST_UPDATE mean=([0-9.]+)", stripped)
+    if m:
+        stats.climb_best_mean = float(m.group(1))
+
+    m = re.search(r"CLIMB_BC step=(\d+)/(\d+) loss=([0-9.]+)", stripped)
+    if m:
+        stats.climb_bc_step = int(m.group(1))
+        stats.climb_bc_steps = int(m.group(2))
+        stats.climb_bc_loss = float(m.group(3))
+        stats.last_phase = "CLIMB_BC"
+        stats.last_train_marker = stripped[:120]
+
+    m = re.search(r"CLIMB_TD step=(\d+)/(\d+)", stripped)
+    if m:
+        stats.last_phase = "CLIMB_TD"
+        stats.last_train_marker = stripped[:120]
+
+    if stripped.startswith("CLIMB_POLICY_COLLECT"):
+        stats.last_phase = "CLIMB_POLICY_COLLECT"
+        stats.last_train_marker = stripped[:120]
+
+    if stripped.startswith("CLIMB_RELIABILITY"):
+        stats.last_phase = "CLIMB_RELIABILITY"
+        m = re.search(r"mean=([0-9.]+)", stripped)
+        if m:
+            stats.eval_greedy_mean = float(m.group(1))
+
+    m = re.search(r"MODEL_BUILD variant=(\S+)", stripped)
+    if m:
+        stats.model_variant = m.group(1)
+
     m = re.search(
         r"WATCHDOG_PROGRESS pid=(\d+) events=(\d+) last='([^']*)'",
         stripped,
@@ -204,10 +354,20 @@ def _apply_line(stats: SessionStats, line: str) -> None:
         stats.watchdog_events = int(m.group(2))
         stats.watchdog_last = m.group(3)
 
-    if stripped.startswith("PHASE_"):
-        stats.last_phase = stripped.split()[0]
+    if stripped.startswith("PHASE_") or stripped.startswith("CLIMB_"):
+        token = stripped.split()[0]
+        if token not in {"CLIMB_BC", "CLIMB_TD"} or stats.last_phase is None:
+            if token.startswith("PHASE_") or token in {
+                "CLIMB_POLICY_COLLECT",
+                "CLIMB_PROBE_GREEDY",
+                "CLIMB_RELIABILITY",
+                "CLIMB_ROUND",
+            }:
+                stats.last_phase = token
 
-    if "TRAIN_LOOP" in stripped or re.search(r"(?:SKILL_BC|OFFLINE_BC) step=", stripped):
+    if "TRAIN_LOOP" in stripped or re.search(
+        r"(?:SKILL_BC|OFFLINE_BC|CLIMB_BC|CLIMB_TD) step=", stripped
+    ):
         stats.last_train_marker = stripped[:120]
 
     _remember_key_line(stats, stripped)
