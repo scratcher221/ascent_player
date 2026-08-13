@@ -23,12 +23,18 @@ sys.path.insert(0, str(ROOT))
 
 from ascent_player.agent.checkpoint import checkpoint_exists
 from ascent_player.agent.dqn import DQNAgent
+from ascent_player.agent.offline_bc import offline_bc_frozen_trunk
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.training import run_eval_watch, run_training_no_ui
+from ascent_player.utils.policy_floors import read_seed_floor, write_seed_floor
+from ascent_player.utils.run_profile import (
+    collect_only_fields,
+    override_attrs,
+    override_training,
+)
 
 
 SEED_BEST = Path("checkpoints/seed_map_best.keras")
-SEED_MEAN = Path("logs/seed_map_best_mean.txt")
 LATEST = Path("checkpoints/dqn_latest.keras")
 
 
@@ -62,17 +68,7 @@ def _load_seed_agent(config: AppConfig) -> DQNAgent:
 
 
 def _read_best_mean() -> float:
-    if SEED_MEAN.exists():
-        try:
-            return float(SEED_MEAN.read_text(encoding="utf-8").strip())
-        except ValueError:
-            pass
-    return 0.0
-
-
-def _write_best_mean(mean: float) -> None:
-    SEED_MEAN.parent.mkdir(parents=True, exist_ok=True)
-    SEED_MEAN.write_text(f"{mean:.4f}\n", encoding="utf-8")
+    return read_seed_floor(default=0.0)
 
 
 def offline_td_train(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
@@ -89,9 +85,9 @@ def offline_td_train(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
     last_loss = None
     try:
         for i in range(max(1, steps)):
-            batch = agent._sample_training_batch()
+            batch = agent.sample_training_batch()
             with agent.tf.device(agent.device_info.training_device):
-                loss = agent._train_batch(batch)
+                loss = agent.train_batch(batch)
             last_loss = float(loss)
             if (i + 1) % max(1, steps // 5) == 0:
                 print(
@@ -100,9 +96,9 @@ def offline_td_train(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
                     flush=True,
                 )
             if (i + 1) % agent.config.training.target_sync_interval == 0:
-                agent._sync_target_network(hard=True)
+                agent.sync_target_network(hard=True)
             else:
-                agent._sync_target_network(hard=False)
+                agent.sync_target_network(hard=False)
     finally:
         agent.config.training.min_replay_size = prev_min
         agent.train_every = prev_every
@@ -111,43 +107,9 @@ def offline_td_train(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
 
 
 def offline_bc_train(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
-    """Behavior-clone actions from gated high-score replay (no TD bootstrap)."""
-    if len(agent.replay) < max(64, agent.batch_size):
-        print(f"OFFLINE_BC_SKIP replay={len(agent.replay)} too small", flush=True)
-        return None
-    agent.set_learning_rate(lr)
-    # Freeze early visual layers so BC only nudges the policy head.
-    frozen = []
-    for layer in agent.online.layers:
-        name = (layer.name or "").lower()
-        if any(k in name for k in ("conv", "separable", "depthwise")) and layer.trainable:
-            layer.trainable = False
-            frozen.append(layer.name)
-    if frozen:
-        print(f"OFFLINE_BC_FREEZE layers={frozen}", flush=True)
-    last_loss = None
-    batch_size = min(agent.batch_size, len(agent.replay))
-    try:
-        with agent.tf.device(agent.device_info.training_device):
-            for i in range(max(1, steps)):
-                batch = agent.replay.sample(batch_size)
-                loss = float(
-                    agent._invoke_bc_train_step(batch.states, batch.actions).numpy()
-                )
-                last_loss = loss
-                if (i + 1) % max(1, steps // 5) == 0:
-                    print(
-                        f"OFFLINE_BC step={i+1}/{steps} loss={last_loss:.4f} "
-                        f"replay={len(agent.replay)}",
-                        flush=True,
-                    )
-        agent._sync_target_network(hard=True)
-        agent.save(LATEST)
-    finally:
-        for layer in agent.online.layers:
-            if layer.name in frozen:
-                layer.trainable = True
-    return last_loss
+    return offline_bc_frozen_trunk(
+        agent, steps=steps, lr=lr, save_path=LATEST, log_prefix="OFFLINE_BC"
+    )
 
 
 async def collect_rollouts(
@@ -158,34 +120,24 @@ async def collect_rollouts(
     rule: float,
     skip_replay_load: bool,
 ) -> dict:
-    """Play without TD updates; only high-score episodes enter replay."""
-    config.training.watch_mode = False
-    config.training.min_replay_size = 10**9  # block online TD
-    config.training.train_every_gpu = 10**9
-    config.training.train_every_cpu = 10**9
-    config.training.transfer_epsilon_start = eps
-    config.training.browser_epsilon_cap = eps
-    config.training.browser_epsilon_floor = min(0.03, eps)
-    config.training.rule_prior_start = rule
-    config.training.rule_prior_end = rule
-    config.training.rule_prior_steps = 10**9
-    config.training.learning_rate = 1e-5
-    config.training.force_save_browser_replay = True
-    config.training.skip_browser_replay_load = skip_replay_load
-    config.training.sim_warmstart_teacher = False
-    config.training.sim_warmstart_demos = False
-    config.demo.use_demos_on_start = False
-    print(
-        f"COLLECT start s={seconds} eps={eps} rule={rule} "
-        f"gate>={config.training.replay_min_episode_score} "
-        f"skip_load={skip_replay_load}",
-        flush=True,
-    )
-    return await run_training_no_ui(
+    with override_training(
         config,
-        max_seconds=seconds,
-        ingest_demos=False,
-    )
+        **collect_only_fields(
+            eps=eps, skip_replay_load=skip_replay_load, rule_prior=rule
+        ),
+        learning_rate=1e-5,
+    ), override_attrs(config.demo, use_demos_on_start=False):
+        print(
+            f"COLLECT start s={seconds} eps={eps} rule={rule} "
+            f"gate>={config.training.replay_min_episode_score} "
+            f"skip_load={skip_replay_load}",
+            flush=True,
+        )
+        return await run_training_no_ui(
+            config,
+            max_seconds=seconds,
+            ingest_demos=False,
+        )
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -199,7 +151,7 @@ async def main_async(args: argparse.Namespace) -> int:
     best_mean = max(_read_best_mean(), 0.0)
     if best_mean <= 0:
         best_mean = 1213.1
-        _write_best_mean(best_mean)
+        write_seed_floor(best_mean)
 
     print(
         f"SEED_CLIMB_START seed={run_seed} hours={args.hours} "
@@ -305,7 +257,7 @@ async def main_async(args: argparse.Namespace) -> int:
             assert agent.load(LATEST)
             agent.save(SEED_BEST)
             agent.save(LATEST)
-            _write_best_mean(best_mean)
+            write_seed_floor(best_mean)
             print(
                 f"SEED_BEST_UPDATE mean={mean:.1f} min={emin:.1f} -> {SEED_BEST.name}",
                 flush=True,

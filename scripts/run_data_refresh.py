@@ -30,6 +30,12 @@ from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.demo.export import export_demos_to_replay
 from ascent_player.training import run_training_no_ui
+from ascent_player.utils.climb_policy import human_cap
+from ascent_player.utils.run_profile import (
+    collect_only_fields,
+    override_attrs,
+    override_training,
+)
 
 ELITE_REPLAY = Path("checkpoints/elite_thread_replay.pkl")
 ELITE_META = Path("checkpoints/elite_thread_replay.json")
@@ -156,40 +162,31 @@ async def distill_teacher_browser(
     thread_prior: float,
 ) -> dict[str, int | str]:
     """Short teacher-only collect (prior high, no TD) into teacher_distill_replay.pkl."""
-    config.training.watch_mode = False
-    config.training.min_replay_size = 10**9
-    config.training.train_every_gpu = 10**9
-    config.training.train_every_cpu = 10**9
-    config.training.seed_thread_enabled = True
-    config.training.seed_thread_prior_start = thread_prior
-    config.training.seed_thread_prior_end = thread_prior
-    config.training.seed_thread_prior_steps = 10**9
-    config.training.seed_thread_watch_prior = 0.0
-    config.training.transfer_epsilon_start = 0.02
-    config.training.browser_epsilon_cap = 0.02
-    config.training.browser_epsilon_floor = 0.02
-    config.training.rule_prior_start = 0.05
-    config.training.rule_prior_end = 0.05
-    config.training.force_save_browser_replay = True
-    config.training.skip_browser_replay_load = True
-    config.training.replay_min_episode_score = 800.0
-    config.training.skill_exec_at_watch = False
-    config.demo.use_demos_on_start = False
-
-    # Fresh empty agent weights — actions come from the thread prior.
     agent = DQNAgent(config)
     agent.epsilon = 0.02
     agent.save(Path("checkpoints/dqn_latest.keras"))
-
     print(
         f"TEACHER_COLLECT s={episodes_budget_seconds} prior={thread_prior:.2f}",
         flush=True,
     )
-    await run_training_no_ui(
+    with override_training(
         config,
-        max_seconds=episodes_budget_seconds,
-        ingest_demos=False,
-    )
+        **collect_only_fields(
+            eps=0.02,
+            skip_replay_load=True,
+            thread_prior=thread_prior,
+            rule_prior=0.05,
+        ),
+        replay_min_episode_score=800.0,
+        skill_exec_at_watch=False,
+        seed_thread_watch_prior=0.0,
+        browser_epsilon_floor=0.02,
+    ), override_attrs(config.demo, use_demos_on_start=False):
+        await run_training_no_ui(
+            config,
+            max_seconds=episodes_budget_seconds,
+            ingest_demos=False,
+        )
     browser = Path("checkpoints/browser_replay.pkl")
     if not browser.exists():
         print("TEACHER_DISTILL_SKIP browser_replay missing after collect", flush=True)
@@ -223,16 +220,21 @@ async def distill_teacher_browser(
     }
 
 
-def merge_hybrid_bc_mix(config: AppConfig) -> dict[str, int | str]:
+def merge_hybrid_bc_mix(
+    config: AppConfig,
+    *,
+    human_share_cap: float = 0.25,
+) -> dict[str, int | str]:
     """Combine elite + human + teacher into one offline BC pickle.
 
     Prefer elite/teacher quality: score-gate, diversity-compact, then append a
-    capped human sample so the 20k pickle cap does not drop climbs.
+    capped human sample so the pickle cap does not drop climbs.
     """
     max_items = max(20_000, int(config.training.browser_replay_max_items))
     agent = DQNAgent(config)
     agent.replay.clear()
     parts: dict[str, int] = {"elite": 0, "human": 0, "teacher": 0}
+    human_share_cap = min(1.0, max(0.0, float(human_share_cap)))
 
     for label, path in (("elite", ELITE_REPLAY), ("teacher", TEACHER_REPLAY)):
         if not path.exists():
@@ -264,23 +266,28 @@ def merge_hybrid_bc_mix(config: AppConfig) -> dict[str, int | str]:
             max_items=max_items,
             vector_dim=config.observation.vector_dim,
         )
-        human_cap = max(0, max_items - privileged)
-        if n > 0 and human_cap > 0:
-            if n > human_cap:
-                aux.replay.trim_to(human_cap)
-            agent.replay.extend_from(aux.replay, max_items=human_cap)
-            parts["human"] = min(int(n), human_cap)
+        room = max(0, max_items - privileged)
+        human_cap_n = human_cap(room, max_items, human_share_cap)
+        if n > 0 and human_cap_n > 0:
+            if n > human_cap_n:
+                aux.replay.trim_to(human_cap_n)
+            agent.replay.extend_from(aux.replay, max_items=human_cap_n)
+            parts["human"] = min(int(n), human_cap_n)
         else:
             parts["human"] = 0
-
     saved = agent.replay.save_pickle(HYBRID_BC, max_items=max_items)
     print(
         f"HYBRID_BC_MIX elite={parts['elite']} human={parts['human']} "
         f"teacher={parts['teacher']} privileged={privileged} "
-        f"saved={saved} -> {HYBRID_BC}",
+        f"human_share_cap={human_share_cap:.2f} saved={saved} -> {HYBRID_BC}",
         flush=True,
     )
-    return {**parts, "saved": saved, "path": str(HYBRID_BC)}
+    return {
+        **parts,
+        "saved": saved,
+        "path": str(HYBRID_BC),
+        "human_share_cap": human_share_cap,
+    }
 
 
 async def main_async(args: argparse.Namespace) -> int:
@@ -304,7 +311,9 @@ async def main_async(args: argparse.Namespace) -> int:
     else:
         summary["teacher"] = distill_teacher_from_elite(config)
 
-    summary["hybrid_mix"] = merge_hybrid_bc_mix(config)
+    summary["hybrid_mix"] = merge_hybrid_bc_mix(
+        config, human_share_cap=float(args.human_share_cap)
+    )
     out = Path("logs/data_refresh_summary.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -330,6 +339,12 @@ def main() -> int:
         "else copy elite as distill labels.",
     )
     parser.add_argument("--teacher-prior", type=float, default=0.90)
+    parser.add_argument(
+        "--human-share-cap",
+        type=float,
+        default=0.25,
+        help="Max fraction of hybrid_bc_mix reserved for human demos (elite/teacher first).",
+    )
     args = parser.parse_args()
     return asyncio.run(main_async(args))
 

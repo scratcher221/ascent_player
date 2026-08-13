@@ -68,7 +68,7 @@ class BrowserConfig:
     # Fixed map seed for curriculum. None = game picks a fresh seed each run.
     # Applied via CHART_TRIAL_CONFIG / __ASCENT_SET_RUN_SEED__ before play.
     run_seed: int | None = None
-    lock_run_seed: bool = True
+    lock_run_seed: bool = False
     # Raise/focus the game window after launch (helps when pinned to a side monitor).
     raise_on_launch: bool = True
 
@@ -307,6 +307,8 @@ class TrainingConfig:
     target_score: int = 10000
     device_mode: DeviceMode = DeviceMode.GPU
     watch_mode: bool = False
+    # Collect-only sessions: count steps / write replay, skip TD updates.
+    disable_td: bool = False
     # Blend RulePolicy into Watch/ε=0 play (applies even when training=False).
     watch_rule_prior: float = 0.0
     # When True, force RulePolicy on miss_risk / deep fall (Watch safety net).

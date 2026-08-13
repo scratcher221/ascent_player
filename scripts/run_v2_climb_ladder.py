@@ -23,6 +23,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from contextlib import nullcontext
 
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
@@ -34,41 +35,43 @@ from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.evaluation import evaluate_learned_policy
 from ascent_player.training import run_eval_watch, run_training_no_ui
-from ascent_player.utils.policy_floors import (
-    record_thread_bc_eval,
-    thread_bc_promotion_floor,
-    write_thread_bc_best,
+from ascent_player.agent.checkpoint_guard import (
+    is_impala_sized_checkpoint,
+    is_likely_nature_checkpoint,
+    restore_work_checkpoints_from_best,
+    save_guarded,
 )
+from ascent_player.agent.offline_bc import offline_bc_frozen_trunk
+from ascent_player.utils.policy_floors import (
+    read_v2_probe_best,
+    thread_bc_promotion_floor,
+)
+from ascent_player.utils.climb_phases import (
+    resolve_probe_and_persist,
+    run_browser_bc_and_td,
+    run_reliability,
+)
+from ascent_player.utils.run_profile import (
+    collect_only_fields,
+    locked_eval_seed,
+    override_attrs,
+    override_training,
+)
+from climb_args import add_climb_args
 
 LATEST = Path("checkpoints/dqn_latest.keras")
 THREAD_BC = Path("checkpoints/dqn_thread_bc.keras")
 V2_BEST = Path("checkpoints/dqn_v2_best.keras")
 ELITE_REPLAY = Path("checkpoints/elite_thread_replay.pkl")
 HYBRID_BC = Path("checkpoints/hybrid_bc_mix.pkl")
-HUMAN_REPLAY = Path("checkpoints/hybrid_human_replay.pkl")
 TEACHER_REPLAY = Path("checkpoints/teacher_distill_replay.pkl")
 BROWSER_REPLAY = Path("checkpoints/browser_replay.pkl")
 LADDER_LOG = Path("logs/v2_climb_ladder.jsonl")
 
-V2_PROBE_BEST = Path("logs/v2_probe_best_mean.txt")
 LADDER = (1300.0, 1500.0, 1800.0, 2000.0)
 
 
-def _read_v2_probe_best() -> float:
-    if V2_PROBE_BEST.exists():
-        try:
-            return float(V2_PROBE_BEST.read_text(encoding="utf-8").strip())
-        except ValueError:
-            pass
-    return 0.0
-
-
-def _write_v2_probe_best(mean: float) -> None:
-    V2_PROBE_BEST.parent.mkdir(parents=True, exist_ok=True)
-    V2_PROBE_BEST.write_text(f"{mean:.4f}\n", encoding="utf-8")
-
-
-def _build_config(run_seed: int) -> AppConfig:
+def _build_config(run_seed: int, *, lock_run_seed: bool = False) -> AppConfig:
     config = AppConfig()
     config.training.sim_mode = False
     config.training.device_mode = DeviceMode.AUTO
@@ -80,14 +83,22 @@ def _build_config(run_seed: int) -> AppConfig:
     config.training.transfer_frame_skip = 1
     config.training.skills_enabled = True
     config.training.skill_exec_at_watch = False
+    # Aux CE distracts Q climb until ≥2k; re-enable later in-loop.
+    config.training.reason_aux_weight = 0.0
+    config.training.skill_aux_weight = 0.0
     config.training.seed_thread_enabled = True
     config.training.watch_rule_prior = 0.0
     # Never run sim teacher/demo warmstart in browser climb sessions — it stalls.
     config.training.sim_warmstart_teacher = False
     config.training.sim_warmstart_demos = False
     config.demo.use_demos_on_start = False
-    config.browser.run_seed = int(run_seed)
-    config.browser.lock_run_seed = True
+    if lock_run_seed:
+        config.browser.run_seed = int(run_seed)
+        config.browser.lock_run_seed = True
+    else:
+        # Random maps for collect/train; probes re-lock eval seed separately.
+        config.browser.run_seed = None
+        config.browser.lock_run_seed = False
     return config
 
 
@@ -109,16 +120,19 @@ def _current_rung(mean: float) -> float:
 
 def _load_work_agent(config: AppConfig) -> DQNAgent:
     """Load v2 weights; prefer V2_BEST when present, else thread_bc / latest."""
+    restored = restore_work_checkpoints_from_best(
+        V2_BEST, (THREAD_BC, LATEST)
+    )
+    if restored:
+        print(f"CLIMB_RESTORE_WORK from {V2_BEST.name} -> {restored}", flush=True)
     agent = DQNAgent(config)
     expected = int(agent.online.count_params())
     for path in (V2_BEST, THREAD_BC, LATEST):
         if not checkpoint_exists(path):
             continue
-        # Nature-era files are ~7MB; Impala-mid weights are much larger once saved.
-        size_mb = path.stat().st_size / (1024 * 1024)
-        if expected > 5_000_000 and size_mb < 20:
+        if expected > 5_000_000 and is_likely_nature_checkpoint(path):
             print(
-                f"CLIMB_SKIP {path.name} size={size_mb:.1f}MB "
+                f"CLIMB_SKIP {path.name} size={path.stat().st_size / (1024*1024):.1f}MB "
                 f"(likely Nature; prefer clean v2 + BC warmstart)",
                 flush=True,
             )
@@ -126,7 +140,8 @@ def _load_work_agent(config: AppConfig) -> DQNAgent:
         if agent.load(path):
             print(f"CLIMB_LOAD {path.name}", flush=True)
             agent.save(LATEST)
-            agent.save(THREAD_BC)
+            if not is_impala_sized_checkpoint(THREAD_BC):
+                save_guarded(agent, THREAD_BC)
             return agent
     print("CLIMB_LOAD fresh impala_mid (clean warmstart)", flush=True)
     agent.save(LATEST)
@@ -134,11 +149,20 @@ def _load_work_agent(config: AppConfig) -> DQNAgent:
 
 
 def _load_offline_replay(agent: DQNAgent, config: AppConfig) -> int:
+    """Prefer Impala-native browser → elite → teacher; hybrid last and capped."""
     agent.replay.clear()
     loaded = 0
-    for path in (HYBRID_BC, ELITE_REPLAY, TEACHER_REPLAY, HUMAN_REPLAY):
-        if not path.exists():
+    sources = (
+        (BROWSER_REPLAY, "browser_replay.pkl"),
+        (ELITE_REPLAY, "elite_thread_replay.pkl"),
+        (TEACHER_REPLAY, "teacher_distill_replay.pkl"),
+        (HYBRID_BC, "hybrid_bc_mix.pkl"),
+    )
+    for path, label in sources:
+        if not path.exists() or path.stat().st_size < 64:
             continue
+        if label == "hybrid_bc_mix.pkl" and loaded >= 512:
+            break
         aux = DQNAgent(config)
         aux.replay.clear()
         n = aux.replay.load_pickle(
@@ -149,103 +173,60 @@ def _load_offline_replay(agent: DQNAgent, config: AppConfig) -> int:
         if n > 0:
             agent.replay.extend_from(aux.replay)
             loaded += n
-            print(f"CLIMB_REPLAY +{n} from {path.name}", flush=True)
-        if loaded >= 512:
+            print(f"CLIMB_REPLAY +{n} from {label}", flush=True)
+        if loaded >= 2048 and label != "hybrid_bc_mix.pkl":
+            break
+        if loaded >= 512 and label == "hybrid_bc_mix.pkl":
             break
     return int(len(agent.replay))
 
 
-def offline_td(agent: DQNAgent, *, steps: int, lr: float, min_score: float) -> float | None:
-    if steps <= 0:
-        print("CLIMB_TD_SKIP steps=0", flush=True)
-        return None
-    if len(agent.replay) < max(64, agent.batch_size):
-        return None
-    kept = agent.replay.filter_min_episode_score(min_score)
-    if kept < max(64, agent.batch_size):
-        print(f"CLIMB_TD_SKIP kept>={min_score:.0f} -> {kept}", flush=True)
-        return None
-    # BC may have bound LossScaleOptimizer to a Q-only variable set.
-    agent.rebuild_optimizer(lr)
-    prev_min = agent.config.training.min_replay_size
-    agent.config.training.min_replay_size = 0
-    prev_every = agent.train_every
-    agent.train_every = 1
-    last = None
-    try:
-        for i in range(max(1, steps)):
-            batch = agent._sample_training_batch()
-            with agent.tf.device(agent.device_info.training_device):
-                loss = agent._train_batch(batch)
-            last = float(loss)
-            if (i + 1) % max(1, steps // 5) == 0:
-                print(f"CLIMB_TD step={i+1}/{steps} loss={last:.4f}", flush=True)
-            if (i + 1) % agent.config.training.target_sync_interval == 0:
-                agent._sync_target_network(hard=True)
-            else:
-                agent._sync_target_network(hard=False)
-    except Exception as exc:
-        print(f"CLIMB_TD_FAIL {type(exc).__name__}: {exc} — continuing to probe", flush=True)
-        return None
-    finally:
-        agent.config.training.min_replay_size = prev_min
-        agent.train_every = prev_every
-    # Trial weights only — THREAD_BC is updated on keep/revert.
-    agent.save(LATEST)
-    return last
-
-
-def offline_bc(agent: DQNAgent, *, steps: int, lr: float) -> float | None:
-    if steps <= 0:
-        print("CLIMB_BC_SKIP steps=0", flush=True)
-        return None
-    if len(agent.replay) < max(64, agent.batch_size):
-        print(f"CLIMB_BC_SKIP replay={len(agent.replay)}", flush=True)
-        return None
-    agent.rebuild_optimizer(lr)
-    last = None
-    batch_size = min(agent.batch_size, len(agent.replay))
-    with agent.tf.device(agent.device_info.training_device):
-        for i in range(max(1, steps)):
-            batch = agent.replay.sample(batch_size)
-            last = float(agent._invoke_bc_train_step(batch.states, batch.actions).numpy())
-            if (i + 1) % max(1, steps // 5) == 0:
-                print(f"CLIMB_BC step={i+1}/{steps} loss={last:.4f}", flush=True)
-    agent._sync_target_network(hard=True)
-    # Trial weights only — THREAD_BC is updated on keep/revert.
-    agent.save(LATEST)
-    return last
-
-
-async def greedy_probe(config: AppConfig, episodes: int) -> float:
-    config.training.seed_thread_watch_prior = 0.0
-    config.training.watch_rule_prior = 0.0
-    config.training.skill_exec_at_watch = False
-    config.training.watch_mode = True
-    config.training.force_save_browser_replay = False
-    config.training.skip_browser_replay_load = True
-    stats = await run_eval_watch(config, max_episodes=max(4, episodes))
-    return float(stats.get("recent_avg", 0.0))
+async def greedy_probe(
+    config: AppConfig, episodes: int, *, eval_seed: int | None = None
+) -> float:
+    seed_cm = (
+        locked_eval_seed(config, int(eval_seed))
+        if eval_seed is not None
+        else nullcontext()
+    )
+    with seed_cm, override_training(
+        config,
+        seed_thread_watch_prior=0.0,
+        watch_rule_prior=0.0,
+        skill_exec_at_watch=False,
+        watch_mode=True,
+        force_save_browser_replay=False,
+        skip_browser_replay_load=True,
+        checkpoint_path=LATEST,
+    ):
+        stats = await run_eval_watch(config, max_episodes=max(4, episodes))
+        return float(stats.get("recent_avg", 0.0))
 
 
 async def reliability_100(
-    config: AppConfig, episodes: int, *, ckpt: Path | None = None
+    config: AppConfig,
+    episodes: int,
+    *,
+    ckpt: Path | None = None,
+    eval_seed: int | None = None,
 ) -> dict[str, float]:
     path = ckpt if ckpt is not None else (
         V2_BEST if checkpoint_exists(V2_BEST) else (
             THREAD_BC if checkpoint_exists(THREAD_BC) else LATEST
         )
     )
-    prev_ckpt = config.training.checkpoint_path
-    config.training.checkpoint_path = path
-    config.training.seed_thread_watch_prior = 0.0
-    config.training.skill_exec_at_watch = False
-    try:
+    seed_cm = (
+        locked_eval_seed(config, int(eval_seed))
+        if eval_seed is not None
+        else nullcontext()
+    )
+    with seed_cm, override_training(
+        config,
+        checkpoint_path=path,
+        seed_thread_watch_prior=0.0,
+        skill_exec_at_watch=False,
+    ):
         result = await evaluate_learned_policy(config, episodes=episodes, use_sim=False)
-    finally:
-        # Critical: do not leave checkpoint_path on V2_BEST — collect/train would
-        # overwrite the best Impala save with a slim browser checkpoint.
-        config.training.checkpoint_path = prev_ckpt or LATEST
     return {
         "mean": float(result.mean_score),
         "min": float(result.min_score),
@@ -259,41 +240,57 @@ async def policy_collect(
     seconds: int,
     prior: float,
     eps: float,
+    online_td: bool = False,
+    transfer_lr: float = 3e-5,
 ) -> dict[str, float]:
-    config.training.checkpoint_path = LATEST
-    config.training.watch_mode = False
-    config.training.min_replay_size = 10**9
-    config.training.train_every_gpu = 10**9
-    config.training.train_every_cpu = 10**9
-    config.training.seed_thread_prior_start = prior
-    config.training.seed_thread_prior_end = prior
-    config.training.seed_thread_prior_steps = 10**9
-    config.training.transfer_epsilon_start = eps
-    config.training.browser_epsilon_cap = eps
-    config.training.browser_epsilon_floor = min(0.03, eps)
-    config.training.force_save_browser_replay = True
-    config.training.skip_browser_replay_load = True
-    config.training.replay_min_episode_score = 1200.0
-    config.training.sim_warmstart_teacher = False
-    config.training.sim_warmstart_demos = False
-    config.demo.use_demos_on_start = False
-    print(f"CLIMB_POLICY_COLLECT s={seconds} prior={prior:.2f} eps={eps}", flush=True)
-    return await run_training_no_ui(config, max_seconds=seconds, ingest_demos=False)
+    fields = collect_only_fields(eps=eps, skip_replay_load=True, thread_prior=prior)
+    fields.update(
+        checkpoint_path=LATEST,
+        replay_min_episode_score=400.0,
+    )
+    if online_td:
+        fields.update(
+            disable_td=False,
+            min_replay_size=256,
+            train_every_gpu=4,
+            train_every_cpu=4,
+            transfer_learning_rate=float(transfer_lr),
+            learning_rate=float(transfer_lr),
+        )
+        print(
+            f"CLIMB_POLICY_COLLECT_ONLINE_TD s={seconds} prior={prior:.2f} "
+            f"eps={eps} lr={transfer_lr:.1e}",
+            flush=True,
+        )
+    else:
+        print(f"CLIMB_POLICY_COLLECT s={seconds} prior={prior:.2f} eps={eps}", flush=True)
+    with override_training(config, **fields), override_attrs(
+        config.demo, use_demos_on_start=False
+    ):
+        return await run_training_no_ui(
+            config, max_seconds=seconds, ingest_demos=False
+        )
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    config = _build_config(int(args.run_seed))
+    config = _build_config(
+        int(args.run_seed),
+        lock_run_seed=bool(getattr(args, "lock_run_seed", False)),
+    )
+    eval_seed = int(getattr(args, "eval_seed", args.run_seed) or args.run_seed)
     deadline = time.time() + float(args.hours) * 3600.0
     agent = _load_work_agent(config)
     best_mean = thread_bc_promotion_floor()
-    v2_best = _read_v2_probe_best()
+    v2_best = read_v2_probe_best()
     round_idx = 0
     reliability_every = max(1, int(args.reliability_every))
 
     print(
         f"CLIMB_START variant=impala_mid best={best_mean:.1f} "
         f"v2_best={v2_best:.1f} hours={args.hours} "
-        f"offline_only={int(args.offline_only)} collect_min={args.collect_minutes}",
+        f"offline_only={int(args.offline_only)} collect_min={args.collect_minutes} "
+        f"lock_seed={int(config.browser.lock_run_seed)} eval_seed={eval_seed} "
+        f"wait_energy={int(config.mechanics_reward.wait_for_energy_enabled)}",
         flush=True,
     )
 
@@ -313,23 +310,28 @@ async def main_async(args: argparse.Namespace) -> int:
             and remaining > 20 * 60
             and float(args.collect_minutes) > 0
         )
-        if collecting and bc_steps > 0 and v2_best >= 500.0:
+        ft_gate = float(
+            getattr(config.training, "finetune_min_greedy_mean", 1400.0) or 1400.0
+        )
+        online_td = bool(collecting and v2_best >= ft_gate)
+        if collecting and bc_steps > 0:
             print(
-                f"CLIMB_BC_SKIP protect v2_best={v2_best:.1f} "
-                f"(collect+TD instead of hybrid BC)",
+                f"CLIMB_BC_SKIP pre-collect hybrid "
+                f"(v2_best={v2_best:.1f}; browser/elite BC after collect)",
                 flush=True,
             )
             bc_steps = 0
-        loss = offline_bc(
+        loss = offline_bc_frozen_trunk(
             agent,
             steps=bc_steps,
             lr=float(args.bc_lr),
+            save_path=LATEST,
+            log_prefix="CLIMB_BC",
         )
 
         if collecting:
             collect_s = min(int(args.collect_minutes * 60), max(300, int(remaining * 0.25)))
             if collect_s >= 60:
-                # Always collect with pre-trial weights (good policy), not collapsed BC.
                 assert agent.load(pre)
                 agent.save(LATEST)
                 await policy_collect(
@@ -340,47 +342,32 @@ async def main_async(args: argparse.Namespace) -> int:
                         or 0.20
                     ),
                     eps=float(args.collect_eps),
+                    online_td=online_td,
+                    transfer_lr=float(args.td_lr) if online_td else 3e-5,
                 )
-                # Restore good weights; browser session may have overwritten LATEST.
-                assert agent.load(pre)
-                agent.save(LATEST)
-                # Prefer light BC on fresh policy replay; TD optional and often noisy.
+                if not online_td:
+                    assert agent.load(pre)
+                    agent.save(LATEST)
+                else:
+                    print("CLIMB_KEEP_ONLINE_TD_WEIGHTS for probe", flush=True)
                 browser_bc_steps = int(getattr(args, "browser_bc_steps", 0) or 0)
-                if BROWSER_REPLAY.exists() and browser_bc_steps > 0:
-                    agent.replay.clear()
-                    n_br = agent.replay.load_pickle(
-                        BROWSER_REPLAY,
-                        max_items=config.training.browser_replay_max_items,
-                        vector_dim=config.observation.vector_dim,
-                    )
-                    print(f"CLIMB_BROWSER_BC replay={n_br} steps={browser_bc_steps}", flush=True)
-                    loss = offline_bc(
-                        agent,
-                        steps=browser_bc_steps,
-                        lr=float(args.bc_lr),
-                    )
-                if BROWSER_REPLAY.exists() and int(args.td_steps) > 0:
-                    if len(agent.replay) < 64:
-                        _load_offline_replay(agent, config)
-                    aux = DQNAgent(config)
-                    aux.replay.clear()
-                    aux.replay.load_pickle(
-                        BROWSER_REPLAY,
-                        max_items=config.training.browser_replay_max_items,
-                        vector_dim=config.observation.vector_dim,
-                    )
-                    agent.replay.extend_from(aux.replay)
-                    td_gate = 2000.0 if best_mean >= 1500 else (
-                        600.0 if v2_best >= 500.0 else 400.0
-                    )
-                    offline_td(
-                        agent,
-                        steps=int(args.td_steps),
-                        lr=float(args.td_lr),
-                        min_score=td_gate,
-                    )
-                elif int(args.td_steps) <= 0 and browser_bc_steps <= 0:
-                    print("CLIMB_TD_SKIP disabled (td_steps=0) — probe next", flush=True)
+                if browser_bc_steps <= 0 and not online_td:
+                    browser_bc_steps = max(400, int(args.bc_steps) // 2 or 400)
+                loss = run_browser_bc_and_td(
+                    agent,
+                    config,
+                    browser_replay=BROWSER_REPLAY,
+                    elite_replay=ELITE_REPLAY,
+                    latest=LATEST,
+                    browser_bc_steps=browser_bc_steps,
+                    bc_lr=float(args.bc_lr),
+                    td_steps=int(args.td_steps),
+                    td_lr=float(args.td_lr),
+                    online_td=online_td,
+                    v2_best=v2_best,
+                    best_mean=best_mean,
+                    load_offline_replay=_load_offline_replay,
+                )
             else:
                 print("CLIMB_COLLECT_SKIP collect_s<60", flush=True)
         elif float(args.collect_minutes) <= 0:
@@ -389,96 +376,53 @@ async def main_async(args: argparse.Namespace) -> int:
         if args.offline_only and args.skip_browser_probe:
             probe_mean = best_mean
             print("CLIMB_PROBE skipped (offline-only)", flush=True)
+            promoted = False
         else:
-            # Probe trial weights in memory / LATEST (do not reload THREAD_BC).
             agent.save(LATEST)
-            probe_mean = await greedy_probe(config, int(args.probe_episodes))
+            probe_mean = await greedy_probe(
+                config, int(args.probe_episodes), eval_seed=eval_seed
+            )
             print(
                 f"CLIMB_PROBE_GREEDY mean={probe_mean:.1f} "
                 f"v2_best={v2_best:.1f} nature_floor={best_mean:.1f}",
                 flush=True,
             )
-            # Keep/promote: never overwrite a strong v2_best with weaker soft-keeps.
-            bootstrap_floor = float(args.bootstrap_keep_floor)
-            improved = probe_mean > v2_best + 1.0
-            collapsed = v2_best > 0 and probe_mean < max(
-                bootstrap_floor * 0.5, v2_best * 0.55
+            v2_best, best_mean, promoted = await resolve_probe_and_persist(
+                agent=agent,
+                config=config,
+                probe_mean=probe_mean,
+                v2_best=v2_best,
+                best_mean=best_mean,
+                bootstrap_floor=float(args.bootstrap_keep_floor),
+                confirm_eps=int(getattr(args, "confirm_episodes", 0) or 0),
+                probe_eps=int(args.probe_episodes),
+                greedy_probe_fn=greedy_probe,
+                eval_seed=eval_seed,
+                pre=pre,
+                latest=LATEST,
+                thread_bc=THREAD_BC,
+                v2_best_path=V2_BEST,
+                round_idx=round_idx,
+                bc_loss=loss,
+                append_log=_append_log,
             )
-            if v2_best <= 0:
-                promote = probe_mean >= bootstrap_floor
-            else:
-                # Never soft-keep below best — that rewrote 862/274 floors with ~176 junk.
-                promote = improved
-
-            if not promote:
-                restore = (
-                    V2_BEST
-                    if (v2_best > 0 and checkpoint_exists(V2_BEST))
-                    else pre
-                )
-                assert agent.load(restore)
-                agent.save(LATEST)
-                agent.save(THREAD_BC)
-                event = "revert" if collapsed else "hold"
-                print(
-                    f"CLIMB_{event.upper()} probe={probe_mean:.1f} "
-                    f"v2_best={v2_best:.1f} — restored {restore.name}",
-                    flush=True,
-                )
-                _append_log(
-                    {
-                        "round": round_idx,
-                        "event": event,
-                        "probe": probe_mean,
-                        "best": best_mean,
-                        "v2_best": v2_best,
-                        "bc_loss": loss,
-                    }
-                )
-                # Periodic reliability on frozen V2_BEST only (not trial THREAD_BC).
+            if not promoted:
                 if (
                     round_idx % max(1, int(args.reliability_every)) == 0
                     and not args.skip_reliability
                     and remaining >= 25 * 60
                 ):
-                    rel = await reliability_100(
-                        config, int(args.reliability_episodes), ckpt=V2_BEST
+                    await run_reliability(
+                        reliability_fn=reliability_100,
+                        config=config,
+                        episodes=int(args.reliability_episodes),
+                        eval_seed=eval_seed,
+                        round_idx=round_idx,
+                        append_log=_append_log,
+                        ckpt=V2_BEST,
+                        warn_vs_v2=v2_best,
                     )
-                    print(
-                        f"CLIMB_RELIABILITY n={args.reliability_episodes} "
-                        f"mean={rel['mean']:.1f} min={rel['min']:.1f} max={rel['max']:.1f}",
-                        flush=True,
-                    )
-                    _append_log({"round": round_idx, "event": "reliability", **rel})
-                    # Do not lower v2_best from a single 40-ep draw — high variance
-                    # was repeatedly eating 690→560 floors while 12-ep probes stayed ~620+.
-                    # Only warn when reliability looks collapsed vs the keep floor.
-                    if rel["mean"] + 1.0 < v2_best * 0.70:
-                        print(
-                            f"CLIMB_RELIABILITY_WARN mean={rel['mean']:.1f} "
-                            f"vs v2_best={v2_best:.1f} (floor unchanged)",
-                            flush=True,
-                        )
                 continue
-
-            # Promote trial weights.
-            agent.save(THREAD_BC)
-            agent.save(LATEST)
-            if improved or v2_best <= 0 or probe_mean > v2_best:
-                v2_best = max(v2_best, probe_mean)
-                _write_v2_probe_best(v2_best)
-                agent.save(V2_BEST)
-                print(f"CLIMB_V2_BEST mean={v2_best:.1f}", flush=True)
-            else:
-                print(
-                    f"CLIMB_KEEP probe={probe_mean:.1f} (v2_best stays {v2_best:.1f})",
-                    flush=True,
-                )
-            if probe_mean > best_mean:
-                best_mean = probe_mean
-                write_thread_bc_best(best_mean)
-                print(f"CLIMB_BEST_UPDATE mean={best_mean:.1f}", flush=True)
-            record_thread_bc_eval(probe_mean)
 
         rung = _current_rung(best_mean)
         row = {
@@ -498,22 +442,25 @@ async def main_async(args: argparse.Namespace) -> int:
             if remaining < 30 * 60 and int(args.reliability_episodes) >= 50:
                 print("CLIMB_RELIABILITY_SKIP low remaining wall time", flush=True)
             else:
-                rel = await reliability_100(config, int(args.reliability_episodes))
-                print(
-                    f"CLIMB_RELIABILITY n={args.reliability_episodes} "
-                    f"mean={rel['mean']:.1f} min={rel['min']:.1f} max={rel['max']:.1f}",
-                    flush=True,
+                updated = await run_reliability(
+                    reliability_fn=reliability_100,
+                    config=config,
+                    episodes=int(args.reliability_episodes),
+                    eval_seed=eval_seed,
+                    round_idx=round_idx,
+                    append_log=_append_log,
+                    raise_nature_floor=True,
+                    agent=agent,
+                    v2_best_path=V2_BEST,
+                    best_mean=best_mean,
                 )
-                _append_log({"round": round_idx, "event": "reliability", **rel})
-                if rel["mean"] > best_mean:
-                    best_mean = rel["mean"]
-                    write_thread_bc_best(best_mean)
-                    agent.save(V2_BEST)
+                if updated is not None:
+                    best_mean = updated
 
-        if best_mean >= float(args.target_mean):
-            print(f"CLIMB_TARGET_HIT mean={best_mean:.1f}", flush=True)
-            # Step 6 scaffolding: raise elite gate once 2k is stable.
-            if best_mean >= 2000.0:
+        if best_mean >= float(args.target_mean) or v2_best >= float(args.target_mean):
+            hit = max(best_mean, v2_best)
+            print(f"CLIMB_TARGET_HIT mean={hit:.1f}", flush=True)
+            if hit >= 2000.0:
                 raised = float(
                     getattr(config.training, "post_2k_elite_gate", 3000.0) or 3000.0
                 )
@@ -538,30 +485,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="v2 offline-heavy climb ladder")
-    parser.add_argument("--hours", type=float, default=4.0)
-    parser.add_argument("--run-seed", type=int, default=424242)
-    parser.add_argument("--target-mean", type=float, default=2000.0)
-    parser.add_argument("--bc-steps", type=int, default=800)
-    parser.add_argument("--bc-lr", type=float, default=3e-6)
-    parser.add_argument("--td-steps", type=int, default=400)
-    parser.add_argument("--td-lr", type=float, default=1e-5)
-    parser.add_argument(
-        "--browser-bc-steps",
-        type=int,
-        default=0,
-        help="After policy collect, BC on browser replay only (0=skip).",
-    )
-    parser.add_argument("--collect-minutes", type=float, default=12.0)
-    parser.add_argument("--collect-eps", type=float, default=0.04)
-    parser.add_argument("--probe-episodes", type=int, default=8)
-    parser.add_argument(
-        "--bootstrap-keep-floor",
-        type=float,
-        default=350.0,
-        help="While v2_best<900, keep BC weights if greedy probe >= this floor.",
-    )
-    parser.add_argument("--reliability-episodes", type=int, default=100)
-    parser.add_argument("--reliability-every", type=int, default=4)
+    add_climb_args(parser)
     parser.add_argument("--offline-only", action="store_true")
     parser.add_argument("--skip-browser-probe", action="store_true")
     parser.add_argument("--skip-reliability", action="store_true")

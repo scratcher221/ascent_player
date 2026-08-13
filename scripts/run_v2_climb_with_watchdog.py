@@ -14,56 +14,33 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _pgrep(pattern: str) -> list[int]:
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate only the trainer session started by this watchdog."""
+    if proc.poll() is not None:
+        return
     try:
-        out = subprocess.check_output(["pgrep", "-f", pattern], text=True)
-    except subprocess.CalledProcessError:
-        return []
-    return [int(x) for x in out.split() if x.strip().isdigit()]
-
-
-def _kill_training() -> None:
-    for pat in (
-        "scripts/run_v2_climb_ladder.py",
-        "ms-playwright/chromium",
-        "chrome_crashpad_handler",
-    ):
-        for pid in _pgrep(pat):
-            # Never kill this watchdog process.
-            if pat.endswith("run_v2_climb_ladder.py") and "with_watchdog" in (
-                open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(
-                    "utf-8", "replace"
-                )
-                if Path(f"/proc/{pid}/cmdline").exists()
-                else ""
-            ):
-                continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-    time.sleep(2)
-    for pat in (
-        "scripts/run_v2_climb_ladder.py",
-        "ms-playwright/chromium",
-    ):
-        for pid in _pgrep(pat):
-            cmdline = ""
-            try:
-                cmdline = (
-                    open(f"/proc/{pid}/cmdline", "rb")
-                    .read()
-                    .replace(b"\0", b" ")
-                    .decode("utf-8", "replace")
-                )
-            except OSError:
-                pass
-            if "with_watchdog" in cmdline:
-                continue
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+    try:
+        proc.wait(timeout=15)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _progress_stamp(log_path: Path) -> tuple[int, str]:
@@ -114,30 +91,13 @@ def _menu_stuck(log_path: Path) -> bool:
 
 
 def main() -> int:
+    sys.path.insert(0, str(ROOT))
+    from climb_args import add_climb_args
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hours", type=float, default=6.0)
-    parser.add_argument("--run-seed", type=int, default=424242)
-    parser.add_argument("--target-mean", type=float, default=2000.0)
+    add_climb_args(parser)
     parser.add_argument("--stall-seconds", type=float, default=180.0)
     parser.add_argument("--check-every", type=float, default=20.0)
-    parser.add_argument("--bc-steps", type=int, default=800)
-    parser.add_argument("--td-steps", type=int, default=400)
-    parser.add_argument(
-        "--browser-bc-steps",
-        type=int,
-        default=0,
-        help="Forwarded: BC on fresh browser replay after collect.",
-    )
-    parser.add_argument("--collect-minutes", type=float, default=12.0)
-    parser.add_argument("--probe-episodes", type=int, default=8)
-    parser.add_argument("--reliability-episodes", type=int, default=100)
-    parser.add_argument("--reliability-every", type=int, default=4)
-    parser.add_argument(
-        "--bootstrap-keep-floor",
-        type=float,
-        default=350.0,
-        help="Forwarded to climb ladder for early Impala keep gate.",
-    )
     args, extra = parser.parse_known_args()
 
     deadline = time.time() + max(600.0, args.hours * 3600.0)
@@ -162,6 +122,8 @@ def main() -> int:
             f"{remaining_h:.3f}",
             "--run-seed",
             str(args.run_seed),
+            "--eval-seed",
+            str(args.eval_seed),
             "--target-mean",
             str(args.target_mean),
             "--bc-steps",
@@ -172,14 +134,23 @@ def main() -> int:
             str(args.browser_bc_steps),
             "--collect-minutes",
             str(args.collect_minutes),
+            "--collect-eps",
+            str(args.collect_eps),
             "--probe-episodes",
             str(args.probe_episodes),
+            "--confirm-episodes",
+            str(args.confirm_episodes),
             "--reliability-episodes",
             str(args.reliability_episodes),
             "--reliability-every",
             str(args.reliability_every),
             "--bootstrap-keep-floor",
             str(args.bootstrap_keep_floor),
+            "--bc-lr",
+            str(args.bc_lr),
+            "--td-lr",
+            str(args.td_lr),
+            *(["--lock-run-seed"] if args.lock_run_seed else []),
             *extra,
         ]
         print(
@@ -197,6 +168,7 @@ def main() -> int:
                 env=env,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
         (ROOT / "logs" / "v2_climb_ladder.pid").write_text(
             f"{proc.pid}\n", encoding="utf-8"
@@ -236,29 +208,19 @@ def main() -> int:
                     )
                 )
                 print(
-                    f"WATCHDOG_STALL reason={reason} — killing trainer",
+                    f"WATCHDOG_STALL reason={reason} — killing trainer session",
                     flush=True,
                 )
-                proc.terminate()
-                try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                _kill_training()
+                _kill_process_group(proc)
                 break
             if ret is not None:
                 print(f"WATCHDOG_EXIT code={ret}", flush=True)
                 if ret != 0:
-                    _kill_training()
+                    _kill_process_group(proc)
                 break
             time.sleep(args.check_every)
         else:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            _kill_training()
+            _kill_process_group(proc)
             break
         time.sleep(5)
 

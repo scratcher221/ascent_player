@@ -82,7 +82,7 @@ def main() -> int:
     steps = 40
     for i in range(steps):
         batch = agent.replay.sample(min(agent.batch_size, len(agent.replay)))
-        loss = float(agent._invoke_bc_train_step(batch.states, batch.actions).numpy())
+        loss = float(agent.bc_train_step(batch.states, batch.actions).numpy())
         losses.append(loss)
         if (i + 1) % 10 == 0:
             print(f"SMOKE_BC step={i+1}/{steps} loss={loss:.4f}", flush=True)

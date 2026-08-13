@@ -90,7 +90,7 @@ class Phase01LearningFixes(unittest.TestCase):
         agent.config.training.mixed_sim_replay_ratio = 0.5
         agent.batch_size = 8
         agent.metrics.total_steps = 50_000
-        batch = agent._sample_training_batch()
+        batch = agent.sample_training_batch()
         self.assertEqual(len(batch.actions), 8)
         self.assertIsNotNone(batch.weights)
         self.assertIsNotNone(batch.indices)
