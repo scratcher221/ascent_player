@@ -118,7 +118,9 @@ class AscentGameEnv:
         )
         print(
             f"BROWSER_RESET done score={frame_state.score} "
-            f"menu={frame_state.in_menu} over={frame_state.game_over}",
+            f"menu={frame_state.in_menu} over={frame_state.game_over} "
+            f"runSeed={getattr(frame_state, 'run_seed', None)} "
+            f"lock={int(bool(self.config.browser.lock_run_seed))}",
             flush=True,
         )
         return self._finalize_observation(visual, frame_state)

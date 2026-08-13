@@ -158,6 +158,12 @@ class MechanicsRewardConfig:
     early_boost_dump_penalty: float = -0.45
     early_boost_dump_steps: int = 100
     early_boost_dump_min_drop: float = 0.08
+    # Wait for energy recharge before jumping — only when a boost is useful soon
+    # and the orb is roughly on-line. Set enabled=False or bonuses to 0 to disable.
+    wait_for_energy_enabled: bool = True
+    wait_for_energy_bonus: float = 0.08
+    wait_for_energy_recharge_bonus: float = 0.05
+    wait_for_energy_max_abs_dx: float = 0.12
     combo_gain: float = 0.40
     combo_break_penalty: float = -0.50
     booster_collect: float = 0.25

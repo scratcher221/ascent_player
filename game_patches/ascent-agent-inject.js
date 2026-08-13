@@ -1,15 +1,19 @@
 /* Injected into the live ASCENT bundle for Ascent Player training (regular climb only). */
 const __ASCENT_AGENT_MODE__ = Boolean(window.CHART_TRIAL_CONFIG?.agentMode);
 
-window.__ASCENT_SET_RUN_SEED__ = (seed) => {
+window.__ASCENT_SET_RUN_SEED__ = (seed, lock=true) => {
   window.CHART_TRIAL_CONFIG = window.CHART_TRIAL_CONFIG || {};
-  window.CHART_TRIAL_CONFIG.runSeed = seed;
-  window.CHART_TRIAL_CONFIG.lockRunSeed = true;
-  if (seed != null && seed !== "") {
-    const n = Number(seed);
-    if (Number.isFinite(n)) window.__ASCENT_RUN_SEED__ = n >>> 0;
+  if (seed == null || seed === "") {
+    window.CHART_TRIAL_CONFIG.runSeed = null;
+    window.CHART_TRIAL_CONFIG.lockRunSeed = false;
+    window.__ASCENT_RUN_SEED__ = undefined;
+    return null;
   }
-  return window.__ASCENT_RUN_SEED__ ?? seed;
+  window.CHART_TRIAL_CONFIG.runSeed = seed;
+  window.CHART_TRIAL_CONFIG.lockRunSeed = Boolean(lock);
+  const n = Number(seed);
+  if (Number.isFinite(n)) window.__ASCENT_RUN_SEED__ = n >>> 0;
+  return window.__ASCENT_RUN_SEED__;
 };
 
 window.__ASCENT_GET_RUN_SEED__ = () =>

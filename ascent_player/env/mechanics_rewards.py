@@ -245,6 +245,63 @@ class MechanicsRewardTracker:
         # Hook may export normalized (~1) or pixel vy (~hundreds).
         return vy > 0.15 if abs(vy) <= 2.0 else vy > 40.0
 
+    def _needs_boost_soon(self, state: FrameState) -> bool:
+        """True when a jump/boost would be useful shortly (not idle topping-up)."""
+        if state.boost_useful is True:
+            return True
+        gap = float(state.nearest_platform_dy or 0.0)
+        if (state.falling or state.landing_window) and gap > 0.15:
+            return True
+        above = float(state.nearest_platform_above_dy or 0.0)
+        if self._is_rising(state) and above > 0.08:
+            return True
+        return False
+
+    def _wait_for_energy_reward(
+        self,
+        previous: FrameState,
+        state: FrameState,
+        action: int,
+    ) -> float:
+        """Reward patience while energy recharges — only when a boost is useful soon.
+
+        Does not pay for idling far off-line (steer first) or when energy is full.
+        Disable via MechanicsRewardConfig.wait_for_energy_enabled / zero bonuses.
+        """
+        if not bool(getattr(self.config, "wait_for_energy_enabled", True)):
+            return 0.0
+        if previous.can_boost:
+            return 0.0
+        jumped = action in JUMP_ACTIONS
+        if jumped:
+            return 0.0  # empty_boost_penalty already handles futile jumps
+
+        needs = self._needs_boost_soon(previous) or self._needs_boost_soon(state)
+        if not needs:
+            return 0.0
+
+        if previous.falling or previous.landing_window or previous.miss_risk:
+            dx = previous.nearest_platform_dx
+        else:
+            dx = (
+                previous.target_dx
+                if previous.target_dx is not None
+                else previous.nearest_platform_dx
+            )
+        max_dx = float(
+            getattr(self.config, "wait_for_energy_max_abs_dx", 0.12) or 0.12
+        )
+        on_line = dx is None or abs(float(dx)) <= max_dx
+        reward = 0.0
+        if on_line:
+            reward += float(getattr(self.config, "wait_for_energy_bonus", 0.0) or 0.0)
+        # Credit actual recharge while being patient (even if still closing dx).
+        if float(state.boost_level) > float(previous.boost_level) + 1e-4:
+            reward += float(
+                getattr(self.config, "wait_for_energy_recharge_bonus", 0.0) or 0.0
+            )
+        return reward
+
     def _boost_economy_reward(
         self,
         previous: FrameState,
@@ -291,6 +348,8 @@ class MechanicsRewardTracker:
             reward += self.config.timed_boost_bonus
         if jumped and state.boost_useful:
             reward += self.config.timed_boost_bonus * 0.5
+
+        reward += self._wait_for_energy_reward(previous, state, action)
         return reward
 
     def _combo_reward(self, previous: FrameState, state: FrameState) -> float:

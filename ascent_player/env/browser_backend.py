@@ -142,15 +142,19 @@ _ENSURE_AGENT_MODE_JS = """
 _SET_RUN_SEED_JS = """
 ({ seed, lock }) => {
     window.CHART_TRIAL_CONFIG = window.CHART_TRIAL_CONFIG || {};
-    if (seed == null) {
+    if (seed == null || seed === "") {
         window.CHART_TRIAL_CONFIG.runSeed = null;
+        window.CHART_TRIAL_CONFIG.lockRunSeed = false;
         window.__ASCENT_RUN_SEED__ = undefined;
+        if (typeof window.__ASCENT_SET_RUN_SEED__ === "function") {
+            window.__ASCENT_SET_RUN_SEED__(null, false);
+        }
         return null;
     }
     window.CHART_TRIAL_CONFIG.runSeed = seed;
     window.CHART_TRIAL_CONFIG.lockRunSeed = Boolean(lock);
     if (typeof window.__ASCENT_SET_RUN_SEED__ === "function") {
-        window.__ASCENT_SET_RUN_SEED__(seed);
+        window.__ASCENT_SET_RUN_SEED__(seed, Boolean(lock));
     } else {
         const n = Number(seed);
         if (Number.isFinite(n)) window.__ASCENT_RUN_SEED__ = n >>> 0;

@@ -17,6 +17,6 @@ window.CHART_TRIAL_CONFIG = Object.assign(
     trainingTierIndex: 0,
     calendarApiBaseUrl: "https://ascent.xrd.workers.dev",
     runSeed: null,
-    lockRunSeed: true,
+    lockRunSeed: false,
   },
 );

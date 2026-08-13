@@ -71,6 +71,7 @@ class FrameState:
     bounces: int = 0
     storm_level: float = 0.0
     tier_index: int = 0
+    run_seed: int | None = None
     canvas_w: float = 640.0
     canvas_h: float = 360.0
     agent_hook_ok: bool = False
@@ -358,6 +359,11 @@ def merge_agent_state(frame_state: FrameState, payload: dict | None) -> FrameSta
     if payload.get("score") is not None:
         frame_state.score = int(payload["score"])
     frame_state.tier_index = int(payload.get("tierIndex", frame_state.tier_index))
+    if payload.get("runSeed") is not None:
+        try:
+            frame_state.run_seed = int(payload["runSeed"]) & 0xFFFFFFFF
+        except (TypeError, ValueError):
+            pass
     frame_state.storm_level = float(payload.get("stormLevel", 0.0))
 
     nearest = payload.get("nearestPlatformBelow")

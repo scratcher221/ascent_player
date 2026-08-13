@@ -143,6 +143,25 @@ def assign_reason(
             return TOWARD_PLATFORM_BELOW
 
     aim_dx = target_dx if target_dx is not None else frame_state.nearest_platform_dx
+    # Waiting out an empty tank when a boost would help maps to hold_align
+    # (no new reason id — keeps checkpoint head sizes stable).
+    if (
+        action not in JUMP_ACTIONS
+        and not frame_state.can_boost
+        and (aim_dx is None or abs(aim_dx) < 0.12)
+        and (
+            frame_state.boost_useful is True
+            or (
+                (frame_state.falling or frame_state.landing_window)
+                and (frame_state.nearest_platform_dy or 0.0) > 0.15
+            )
+            or (
+                frame_state.rising
+                and (frame_state.nearest_platform_above_dy or 0.0) > 0.08
+            )
+        )
+    ):
+        return HOLD_ALIGN
     if action == NOOP and (aim_dx is None or abs(aim_dx) < 0.05):
         return HOLD_ALIGN
     if action == 3 and (aim_dx is None or abs(aim_dx) < 0.05):

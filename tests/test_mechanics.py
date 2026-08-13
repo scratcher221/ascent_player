@@ -273,6 +273,73 @@ class MechanicsRewardTests(unittest.TestCase):
         reward = tracker.compute(curr, action=3)
         self.assertGreater(reward, tracker.config.survival)
 
+    def test_wait_for_energy_bonus_when_useful(self) -> None:
+        cfg_on = MechanicsRewardConfig(
+            wait_for_energy_enabled=True,
+            wait_for_energy_bonus=0.08,
+            wait_for_energy_recharge_bonus=0.05,
+        )
+        cfg_off = MechanicsRewardConfig(
+            wait_for_energy_enabled=False,
+            wait_for_energy_bonus=0.08,
+            wait_for_energy_recharge_bonus=0.05,
+        )
+        prev = FrameState(
+            can_boost=False,
+            boost_level=0.05,
+            nearest_platform_dy=0.25,
+            nearest_platform_dx=0.02,
+            orb_vy=-0.3,
+            falling=True,
+            agent_hook_ok=True,
+        )
+        curr = FrameState(
+            can_boost=False,
+            boost_level=0.10,
+            nearest_platform_dy=0.25,
+            nearest_platform_dx=0.02,
+            orb_vy=-0.3,
+            falling=True,
+            agent_hook_ok=True,
+        )
+        on = MechanicsRewardTracker(cfg_on)
+        off = MechanicsRewardTracker(cfg_off)
+        on.last_state = prev
+        off.last_state = prev
+        patient_on = on.compute(curr, action=0)
+        patient_off = off.compute(curr, action=0)
+        self.assertGreater(patient_on, patient_off)
+        self.assertGreater(patient_on, cfg_on.survival)
+
+    def test_wait_for_energy_disabled(self) -> None:
+        cfg = MechanicsRewardConfig(
+            wait_for_energy_enabled=False,
+            wait_for_energy_bonus=0.5,
+            wait_for_energy_recharge_bonus=0.5,
+            empty_boost_penalty=0.0,
+        )
+        tracker = MechanicsRewardTracker(cfg)
+        prev = FrameState(
+            can_boost=False,
+            boost_level=0.05,
+            nearest_platform_dy=0.25,
+            nearest_platform_dx=0.0,
+            falling=True,
+            agent_hook_ok=True,
+        )
+        curr = FrameState(
+            can_boost=False,
+            boost_level=0.12,
+            nearest_platform_dy=0.25,
+            nearest_platform_dx=0.0,
+            falling=True,
+            agent_hook_ok=True,
+        )
+        tracker.last_state = prev
+        reward = tracker.compute(curr, action=0)
+        # Survival + approach/steer only — no wait bonuses.
+        self.assertLess(reward, cfg.survival + 0.2)
+
 
 class VectorObsTests(unittest.TestCase):
     def test_vector_shape(self) -> None:

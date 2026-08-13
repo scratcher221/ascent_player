@@ -131,6 +131,19 @@ function __ascentResolveLocalSeed__() {
         )
     text = text.replace(seed_old, "Kc=__ascentResolveLocalSeed__()", 1)
 
+    # Re-resolve seed on every startGame (Kc is a one-shot page-load snapshot).
+    start_old = "Kc??Bc()"
+    start_new = (
+        '((typeof __ascentResolveLocalSeed__==="function"'
+        "?__ascentResolveLocalSeed__():null)??Bc())"
+    )
+    if start_old in text:
+        text = text.replace(start_old, start_new, 1)
+    elif start_new not in text:
+        raise RuntimeError(
+            "Could not find startGame seed selection (Kc??Bc); upstream changed."
+        )
+
     if seed_prelude not in text:
         text = text.replace('"use strict";', f'"use strict";\n{seed_prelude}', 1)
 

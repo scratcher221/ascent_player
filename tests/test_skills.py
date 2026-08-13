@@ -9,6 +9,7 @@ from ascent_player.agent.skills import (
     CLIMB_ABOVE,
     DODGE_HAZARD,
     FREE_PLAY,
+    HOLD_ALIGN,
     INTERCEPT_SURGE,
     LAND_BELOW,
     SkillControllers,
@@ -83,6 +84,20 @@ class SkillRouterTests(unittest.TestCase):
     def test_free_play_on_calm_rise(self) -> None:
         fs = FrameState(rising=True, agent_hook_ok=True)
         self.assertEqual(SkillRouter().propose(fs), FREE_PLAY)
+
+    def test_hold_align_waits_for_energy(self) -> None:
+        fs = FrameState(
+            rising=True,
+            can_boost=False,
+            boost_level=0.05,
+            boost_useful=True,
+            target_dx=0.02,
+            agent_hook_ok=True,
+        )
+        self.assertEqual(SkillRouter().propose(fs), HOLD_ALIGN)
+        action, skill = SkillRouter().act(fs)
+        self.assertEqual(skill, HOLD_ALIGN)
+        self.assertNotIn(action, (3, 4, 5))
 
     def test_controllers_mask_jump_without_boost(self) -> None:
         fs = FrameState(

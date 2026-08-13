@@ -175,7 +175,28 @@ class SkillControllers:
             )
         if skill == HOLD_ALIGN:
             aim = state.target_dx or state.nearest_platform_dx
-            return aim is not None and abs(aim) < 0.04 and not state.falling
+            if aim is not None and abs(aim) < 0.04 and not state.falling:
+                return True
+            # Wait for energy recharge when a boost is useful soon and roughly on-line.
+            # LAND_BELOW / miss_risk still win via higher router priority.
+            if (
+                not state.can_boost
+                and not state.miss_risk
+                and (aim is None or abs(aim) < 0.12)
+                and (
+                    state.boost_useful is True
+                    or (
+                        (state.falling or state.landing_window)
+                        and (state.nearest_platform_dy or 0.0) > 0.15
+                    )
+                    or (
+                        state.rising
+                        and (state.nearest_platform_above_dy or 0.0) > 0.08
+                    )
+                )
+            ):
+                return True
+            return False
         return False
 
     def act(self, skill: str, state: FrameState) -> int:
