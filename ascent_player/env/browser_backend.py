@@ -343,9 +343,18 @@ class BrowserBackend:
         await self._log_viewport_metrics()
         if getattr(self.config, "raise_on_launch", True):
             await self._raise_game_window()
+        self._pin_to_workspace()
         self.status = await self._make_status(True, "launched", None)
         print(f"BROWSER_LAUNCHED url={self.page.url!r}", flush=True)
         return self.status
+
+    def _pin_to_workspace(self) -> None:
+        name = str(getattr(self.config, "window_workspace_name", "") or "").strip()
+        if not name:
+            return
+        from ascent_player.env.desktop_workspace import pin_windows_to_named_desktop
+
+        pin_windows_to_named_desktop(name)
 
     def _outer_window_size(self, vp_w: int, vp_h: int) -> tuple[int, int]:
         pad_x = int(getattr(self.config, "window_frame_pad_x", 0) or 0)

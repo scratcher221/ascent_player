@@ -20,17 +20,17 @@ from ascent_player.env.target_detector import TargetDetectionTracker
 from ascent_player.agent.reason import wrong_vs_target
 from ascent_player.env.game_env import ACTION_LABELS
 from ascent_player.env.state_detector import FrameState
+from ascent_player.utils.climb_policy import eval_session_stats
 import os
 import time
 import numpy as np
 
 
 def _empty_training_stats(log_path: Path, *, error: str = "") -> dict[str, float]:
+    zeros = eval_session_stats([])
     return {
         "best_score": 0.0,
-        "recent_avg": 0.0,
-        "recent_min": 0.0,
-        "recent_max": 0.0,
+        **zeros,
         "episodes": 0.0,
         "log_path": str(log_path),
         "error": error,
@@ -185,6 +185,7 @@ async def run_training_no_ui(
             flush=True,
         )
         logger.log_note(f"decision_log={decision_logger.path} every={every}")
+    session_scores: list[float] = []
     try:
         if (
             force_demo_reingest
@@ -453,6 +454,7 @@ async def run_training_no_ui(
                     f"episode={episode} reward={episode_reward:.3f} "
                     f"score={episode_max_score:.0f} epsilon={agent.epsilon:.3f}"
                 )
+                session_scores.append(float(episode_max_score))
                 agent.end_episode()
                 agent.maybe_autosave(force=True)
                 episode += 1
@@ -490,23 +492,29 @@ async def run_training_no_ui(
         removed = agent.trim_replay_buffers()
         if removed:
             print(f"Trimmed {removed} replay transitions")
+        session_stats = eval_session_stats(session_scores)
         if not config.training.sim_mode:
-            recent = agent.progress.recent_scores[-10:]
-            recent_avg = float(sum(recent) / len(recent)) if recent else 0.0
             from ascent_player.utils.browser_replay_persist import persist_browser_replay
 
-            persist_browser_replay(agent, config, recent_avg=recent_avg)
+            persist_browser_replay(
+                agent, config, recent_avg=float(session_stats["recent_avg"])
+            )
         release_gpu_between_runs()
         agent.save()
         await env.close()
         logger.close(agent)
         print(f"Training log: {logger.path}")
-    recent = agent.progress.recent_scores[-10:]
+        print(
+            f"EVAL_SESSION n={int(session_stats['n_episodes'])} "
+            f"mean={session_stats['episode_mean']:.1f} "
+            f"min={session_stats['episode_min']:.1f} "
+            f"max={session_stats['episode_max']:.1f} "
+            f"last10={session_stats['recent_avg']:.1f}",
+            flush=True,
+        )
     return {
         "best_score": agent.progress.best_score,
-        "recent_avg": float(sum(recent) / len(recent)) if recent else 0.0,
-        "recent_min": float(min(recent)) if recent else 0.0,
-        "recent_max": float(max(recent)) if recent else 0.0,
+        **session_stats,
         "episodes": float(agent.progress.episodes_completed),
         "log_path": str(logger.path),
         "epsilon": agent.epsilon,

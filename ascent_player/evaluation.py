@@ -224,7 +224,11 @@ async def _evaluate_policy(
             jump_actions = 0
             max_score = 0.0
             done = False
-            while not done and steps < 1200:
+            max_steps = int(
+                getattr(config.training, "sim_eval_max_steps", 12_000) or 12_000
+            )
+            last_fs = None
+            while not done and steps < max_steps:
                 frame_state = env._last_frame_state
                 if frame_state is None:
                     break
@@ -262,7 +266,20 @@ async def _evaluate_policy(
                     prev_bounces = result.frame_state.bounces
                 if result.frame_state.score is not None:
                     max_score = max(max_score, float(result.frame_state.score))
+                last_fs = result.frame_state
                 done = result.done
+            capped = (not done) and steps >= max_steps
+            if last_fs is not None and not use_sim:
+                print(
+                    f"BROWSER_EVAL_DEATH ep={ep_index + 1} score={max_score:.0f} "
+                    f"steps={steps} boost={float(last_fs.boost_level):.2f} "
+                    f"can_boost={int(bool(last_fs.can_boost))} "
+                    f"fell={int(bool(last_fs.game_over))} "
+                    f"combo={int(last_fs.combo)} "
+                    f"storm={float(last_fs.storm_level):.2f} "
+                    f"capped={int(capped)}",
+                    flush=True,
+                )
             episode_stats.append(
                 _episode_skill(
                     steps=steps,

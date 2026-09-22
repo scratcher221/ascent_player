@@ -150,7 +150,7 @@ def main() -> int:
             str(args.bc_lr),
             "--td-lr",
             str(args.td_lr),
-            *(["--lock-run-seed"] if args.lock_run_seed else []),
+            *(["--lock-run-seed"] if args.lock_run_seed else ["--unlock-run-seed"]),
             *extra,
         ]
         print(

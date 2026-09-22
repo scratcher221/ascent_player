@@ -78,6 +78,10 @@ def main() -> int:
             refresh_ms=args.refresh_ms,
         )
         window.show()
+        from PyQt6.QtCore import QTimer
+        from ascent_player.env.desktop_workspace import pin_current_process_to_workspace
+
+        QTimer.singleShot(400, pin_current_process_to_workspace)
         return app.exec()
 
     log_path = args.log
@@ -112,6 +116,10 @@ def main() -> int:
         refresh_ms=args.refresh_ms,
     )
     window.show()
+    from PyQt6.QtCore import QTimer
+    from ascent_player.env.desktop_workspace import pin_current_process_to_workspace
+
+    QTimer.singleShot(400, pin_current_process_to_workspace)
     return app.exec()
 
 

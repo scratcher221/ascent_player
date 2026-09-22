@@ -13,25 +13,39 @@ def add_climb_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         default=424242,
         help="Seed used for greedy probe/reliability (comparable floors).",
     )
-    parser.add_argument(
+    lock = parser.add_mutually_exclusive_group()
+    lock.add_argument(
         "--lock-run-seed",
+        dest="lock_run_seed",
         action="store_true",
-        help="Lock collect/train to --run-seed (default: random maps each episode).",
+        help="Lock collect/train to --run-seed (default for the 2k push).",
     )
+    lock.add_argument(
+        "--unlock-run-seed",
+        dest="lock_run_seed",
+        action="store_false",
+        help="Random maps each collect episode (eval seed still locked).",
+    )
+    parser.set_defaults(lock_run_seed=True)
     parser.add_argument("--target-mean", type=float, default=2000.0)
-    parser.add_argument("--bc-steps", type=int, default=800)
+    parser.add_argument("--bc-steps", type=int, default=1000)
     parser.add_argument("--bc-lr", type=float, default=1e-5)
-    parser.add_argument("--td-steps", type=int, default=400)
+    parser.add_argument(
+        "--td-steps",
+        type=int,
+        default=0,
+        help="Offline TD steps after BC (0 until online TD keep holds).",
+    )
     parser.add_argument("--td-lr", type=float, default=1e-5)
     parser.add_argument(
         "--browser-bc-steps",
         type=int,
-        default=800,
+        default=1000,
         help="After policy collect, frozen BC on browser/elite replay.",
     )
-    parser.add_argument("--collect-minutes", type=float, default=12.0)
-    parser.add_argument("--collect-eps", type=float, default=0.05)
-    parser.add_argument("--probe-episodes", type=int, default=12)
+    parser.add_argument("--collect-minutes", type=float, default=15.0)
+    parser.add_argument("--collect-eps", type=float, default=0.04)
+    parser.add_argument("--probe-episodes", type=int, default=20)
     parser.add_argument(
         "--confirm-episodes",
         type=int,

@@ -10,7 +10,7 @@ from ascent_player.config import AppConfig
 DEFAULT_REPLAY = Path("checkpoints/elite_thread_replay.pkl")
 DEFAULT_META = Path("checkpoints/elite_thread_replay.json")
 DEFAULT_BROWSER = Path("checkpoints/browser_replay.pkl")
-DEFAULT_MIN_SCORE = 2000.0
+DEFAULT_MIN_SCORE = 1400.0
 DEFAULT_MAX_EPISODES = 64
 DEFAULT_MAX_PER_EPISODE = 128
 
@@ -24,6 +24,18 @@ class EliteReplayStore:
     max_episodes: int = DEFAULT_MAX_EPISODES
     max_per_episode: int = DEFAULT_MAX_PER_EPISODE
 
+    def selected_episodes(self) -> int:
+        if not self.meta_path.exists():
+            return 0
+        try:
+            meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return 0
+        try:
+            return int(meta.get("selected_episodes") or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def compatible(self) -> bool:
         if not self.replay_path.exists() or not self.meta_path.exists():
             return False
@@ -35,6 +47,22 @@ class EliteReplayStore:
 
     def reset_if_incompatible(self) -> None:
         if not self.replay_path.exists() or self.compatible():
+            return
+        existing = -1.0
+        if self.meta_path.exists():
+            try:
+                meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+                existing = float(meta.get("min_episode_score", 0.0))
+            except (OSError, ValueError, TypeError):
+                existing = -1.0
+        # Raising the harvest gate must not delete a lower-gated tail. Persist
+        # still merges and compact prefers high scores.
+        if existing >= 0.0:
+            print(
+                f"ELITE_GATE_KEEP existing>={existing:.0f} "
+                f"requested>={self.min_score:.0f} — not wiping",
+                flush=True,
+            )
             return
         size = self.replay_path.stat().st_size
         self.replay_path.unlink()

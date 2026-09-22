@@ -7,11 +7,16 @@ from typing import TYPE_CHECKING
 from ascent_player.agent.checkpoint import checkpoint_exists
 from ascent_player.agent.checkpoint_guard import save_guarded
 from ascent_player.agent.dqn import DQNAgent
+from ascent_player.agent.elite_replay import EliteReplayStore
 from ascent_player.agent.offline_bc import offline_bc_frozen_trunk
 from ascent_player.utils.climb_policy import (
     PromoteAction,
+    TAIL_ELITE_GATE,
     TD_RECOVERY_DEFER_MEAN,
     aux_enabled_for_score,
+    bc_score_gate,
+    browser_bc_gate,
+    confirm_supports_probe,
     decide_promote,
     elite_gate_for_score,
     offline_td_min_score,
@@ -19,8 +24,11 @@ from ascent_player.utils.climb_policy import (
     should_defer_offline_td,
 )
 from ascent_player.utils.policy_floors import (
+    read_v2_probe_best,
     record_thread_bc_eval,
     write_thread_bc_best,
+    write_v2_full_n_best,
+    write_v2_full_n_last,
     write_v2_probe_best,
 )
 
@@ -73,6 +81,45 @@ def offline_td(
     return last
 
 
+def _replay_usable(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 64
+
+
+def _load_replay(agent: DQNAgent, config: "AppConfig", path: Path) -> int:
+    if not _replay_usable(path):
+        return 0
+    return int(
+        agent.replay.load_pickle(
+            path,
+            max_items=config.training.browser_replay_max_items,
+            vector_dim=config.observation.vector_dim,
+        )
+    )
+
+
+def _merge_elite_and_browser(
+    agent: DQNAgent,
+    config: "AppConfig",
+    *,
+    elite_replay: Path,
+    browser_replay: Path,
+) -> tuple[int, int]:
+    """Load elite first, then this round's browser collect. Returns (n_elite, n_browser)."""
+    agent.replay.clear()
+    n_el = _load_replay(agent, config, elite_replay)
+    n_br = 0
+    if _replay_usable(browser_replay):
+        if n_el > 0:
+            aux = DQNAgent(config)
+            aux.replay.clear()
+            n_br = _load_replay(aux, config, browser_replay)
+            if n_br > 0:
+                agent.replay.extend_from(aux.replay)
+        else:
+            n_br = _load_replay(agent, config, browser_replay)
+    return n_el, n_br
+
+
 def run_browser_bc_and_td(
     agent: DQNAgent,
     config: "AppConfig",
@@ -89,47 +136,66 @@ def run_browser_bc_and_td(
     best_mean: float,
     load_offline_replay,
 ) -> float | None:
-    """Post-collect frozen BC (+ optional deferred offline TD). Returns last BC loss."""
+    """Post-collect frozen BC on elite+browser tail (+ optional deferred offline TD)."""
     loss = None
-    if (
-        browser_replay.exists()
-        and browser_replay.stat().st_size > 64
-        and browser_bc_steps > 0
-    ):
-        agent.replay.clear()
-        n_br = agent.replay.load_pickle(
-            browser_replay,
-            max_items=config.training.browser_replay_max_items,
-            vector_dim=config.observation.vector_dim,
+    have_data = _replay_usable(browser_replay) or _replay_usable(elite_replay)
+    if browser_bc_steps > 0 and have_data:
+        n_el, n_br = _merge_elite_and_browser(
+            agent,
+            config,
+            elite_replay=elite_replay,
+            browser_replay=browser_replay,
         )
-        if n_br < 64 and elite_replay.exists():
-            aux = DQNAgent(config)
-            aux.replay.clear()
-            aux.replay.load_pickle(
-                elite_replay,
-                max_items=config.training.browser_replay_max_items,
-                vector_dim=config.observation.vector_dim,
-            )
-            agent.replay.extend_from(aux.replay)
-            print(
-                f"CLIMB_BROWSER_BC_TOPUP elite -> replay={len(agent.replay)}",
-                flush=True,
-            )
+        elite_eps = EliteReplayStore(
+            replay_path=elite_replay,
+            meta_path=elite_replay.with_suffix(".json"),
+        ).selected_episodes()
         print(
-            f"CLIMB_BROWSER_BC replay={len(agent.replay)} steps={browser_bc_steps}",
+            f"CLIMB_BROWSER_BC replay={len(agent.replay)} steps={browser_bc_steps} "
+            f"elite={n_el} browser={n_br} elite_eps={elite_eps}",
             flush=True,
         )
-        loss = offline_bc_frozen_trunk(
-            agent,
-            steps=browser_bc_steps,
-            lr=float(bc_lr),
-            save_path=latest,
-            log_prefix="CLIMB_BC",
+        gate = browser_bc_gate(v2_best, elite_eps)
+        kept = agent.replay.filter_min_episode_score(gate)
+        fallback = bc_score_gate(
+            v2_best, kept, elite_episodes=elite_eps
         )
-    if browser_replay.exists() and int(td_steps) > 0 and not online_td:
+        if fallback < gate:
+            n_el, n_br = _merge_elite_and_browser(
+                agent,
+                config,
+                elite_replay=elite_replay,
+                browser_replay=browser_replay,
+            )
+            kept = agent.replay.filter_min_episode_score(fallback)
+            print(
+                f"CLIMB_BROWSER_BC_FALLBACK {gate:.0f}->{fallback:.0f} "
+                f"kept={kept} elite={n_el} browser={n_br}",
+                flush=True,
+            )
+            gate = fallback
+        print(
+            f"CLIMB_BROWSER_BC_FILTER >={gate:.0f} kept={kept} "
+            f"(true_mean={v2_best:.1f} elite_eps={elite_eps})",
+            flush=True,
+        )
+        if kept >= 64:
+            loss = offline_bc_frozen_trunk(
+                agent,
+                steps=browser_bc_steps,
+                lr=float(bc_lr),
+                save_path=latest,
+                log_prefix="CLIMB_BC",
+            )
+        else:
+            print(
+                f"CLIMB_BROWSER_BC_SKIP kept={kept} < 64 (gate>={gate:.0f})",
+                flush=True,
+            )
+    if _replay_usable(browser_replay) and int(td_steps) > 0 and not online_td:
         if should_defer_offline_td(v2_best):
             print(
-                f"CLIMB_TD_SKIP until v2_best>={TD_RECOVERY_DEFER_MEAN:.0f} "
+                f"CLIMB_TD_SKIP until true_mean>={TD_RECOVERY_DEFER_MEAN:.0f} "
                 f"(now={v2_best:.1f}; BC-only until FT gate)",
                 flush=True,
             )
@@ -138,12 +204,8 @@ def run_browser_bc_and_td(
                 load_offline_replay(agent, config)
             aux = DQNAgent(config)
             aux.replay.clear()
-            if browser_replay.stat().st_size > 64:
-                aux.replay.load_pickle(
-                    browser_replay,
-                    max_items=config.training.browser_replay_max_items,
-                    vector_dim=config.observation.vector_dim,
-                )
+            n_td = _load_replay(aux, config, browser_replay)
+            if n_td > 0:
                 agent.replay.extend_from(aux.replay)
             offline_td(
                 agent,
@@ -157,6 +219,33 @@ def run_browser_bc_and_td(
     elif int(td_steps) <= 0 and browser_bc_steps <= 0:
         print("CLIMB_TD_SKIP disabled (td_steps=0) — probe next", flush=True)
     return loss
+
+
+def harvest_elite_after_collect(
+    config: "AppConfig",
+    *,
+    true_mean: float,
+    collect_best: float = 0.0,
+) -> int:
+    """Merge gated collect replay into elite.
+
+    Assisted collect peaks (teacher/prior 2k) must not raise the gate:
+    that made ``EliteReplayStore`` wipe the 1400 tail. Raise only when
+    greedy true_mean itself is ≥2000.
+    """
+    gate = elite_gate_for_score(
+        true_mean,
+        float(getattr(config.training, "post_2k_elite_gate", 3000.0) or 3000.0),
+    )
+    config.training.elite_replay_min_episode_score = gate
+    store = EliteReplayStore(min_score=float(gate or TAIL_ELITE_GATE))
+    saved = store.persist_from_browser(config)
+    print(
+        f"CLIMB_ELITE_HARVEST gate>={gate:.0f} saved={saved} "
+        f"collect_best={collect_best:.0f} true_mean={true_mean:.1f}",
+        flush=True,
+    )
+    return int(saved)
 
 
 async def run_reliability(
@@ -187,6 +276,9 @@ async def run_reliability(
         flush=True,
     )
     append_log({"round": round_idx, "event": "reliability", **rel})
+    write_v2_full_n_last(float(rel["mean"]))
+    if write_v2_full_n_best(float(rel["mean"])):
+        print(f"CLIMB_FULL_N_BEST mean={rel['mean']:.1f}", flush=True)
     if warn_vs_v2 is not None and reliability_below_floor(rel["mean"], warn_vs_v2):
         print(
             f"CLIMB_RELIABILITY_WARN mean={rel['mean']:.1f} "
@@ -270,7 +362,7 @@ async def resolve_probe_and_persist(
         )
         return v2_best, best_mean, False
 
-    if confirm_eps > probe_eps and v2_best > 0:
+    if confirm_eps > probe_eps:
         confirm_mean = await greedy_probe_fn(
             config, confirm_eps, eval_seed=eval_seed
         )
@@ -279,6 +371,7 @@ async def resolve_probe_and_persist(
             f"(probe={probe_mean:.1f})",
             flush=True,
         )
+        write_v2_full_n_last(confirm_mean)
         append_log(
             {
                 "round": round_idx,
@@ -288,15 +381,23 @@ async def resolve_probe_and_persist(
                 "v2_best": v2_best,
             }
         )
-        if confirm_mean <= v2_best + 1.0:
+        if confirm_mean <= v2_best + 1.0 or not confirm_supports_probe(
+            probe_mean, confirm_mean
+        ):
             assert agent.load(
                 v2_best_path if checkpoint_exists(v2_best_path) else pre
             )
             agent.save(latest)
             save_guarded(agent, thread_bc)
+            reason = (
+                "confirm_vs_probe"
+                if confirm_mean > v2_best + 1.0
+                else "confirm_vs_floor"
+            )
             print(
                 f"CLIMB_HOLD confirm={confirm_mean:.1f} "
-                f"v2_best={v2_best:.1f} — not promoted",
+                f"probe={probe_mean:.1f} v2_best={v2_best:.1f} "
+                f"({reason}) — not promoted",
                 flush=True,
             )
             append_log(
@@ -336,7 +437,11 @@ async def resolve_probe_and_persist(
             )
         else:
             v2_best = max(v2_best, probe_mean)
-            write_v2_probe_best(v2_best)
+            write_v2_full_n_last(probe_mean)
+            write_v2_full_n_best(probe_mean)
+            # Never lower the historical last-10 artifact file.
+            if probe_mean > read_v2_probe_best():
+                write_v2_probe_best(probe_mean)
             print(f"CLIMB_V2_BEST mean={v2_best:.1f}", flush=True)
     else:
         print(
@@ -356,7 +461,6 @@ async def resolve_probe_and_persist(
         v2_best,
         float(getattr(config.training, "post_2k_elite_gate", 3000.0) or 3000.0),
     )
-    if raised is not None:
-        config.training.elite_replay_min_episode_score = raised
-        print(f"CLIMB_ELITE_GATE->{raised:.0f}", flush=True)
+    config.training.elite_replay_min_episode_score = raised
+    print(f"CLIMB_ELITE_GATE->{raised:.0f}", flush=True)
     return v2_best, best_mean, True

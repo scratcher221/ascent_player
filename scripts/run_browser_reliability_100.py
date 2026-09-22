@@ -169,8 +169,20 @@ async def main_async(args: argparse.Namespace) -> int:
     )
 
     if policy == "thread_bc":
-        from ascent_player.utils.policy_floors import apply_reliability_baseline
+        from ascent_player.utils.policy_floors import (
+            apply_reliability_baseline,
+            seed_v2_full_n_best,
+            write_v2_full_n_best,
+            write_v2_full_n_last,
+        )
 
+        write_v2_full_n_last(metrics.mean_score)
+        seed_v2_full_n_best(metrics.mean_score)
+        if write_v2_full_n_best(metrics.mean_score):
+            print(
+                f"V2_FULL_N_BEST_UPDATE reliability_mean={metrics.mean_score:.1f}",
+                flush=True,
+            )
         if apply_reliability_baseline(metrics.mean_score):
             print(
                 f"THREAD_BC_BEST_UPDATE reliability_mean={metrics.mean_score:.1f}",

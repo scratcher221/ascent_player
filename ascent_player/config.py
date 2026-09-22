@@ -13,6 +13,8 @@ ASCENT_HOST = "127.0.0.1"
 _DEFAULT_WAYLAND_CHROMIUM_ARGS = (
     "--ozone-platform=x11",
     "--disable-features=Vulkan",
+    # Distinct WM_CLASS so KWin can pin only the game window, not user Chromium.
+    "--class=ascent-player-game",
 )
 
 
@@ -63,6 +65,8 @@ class BrowserConfig:
     # Pin launched Chromium onto a named monitor (EDID / kscreen name substring).
     # Empty = no pin. Default keeps the game off the main/dev screens.
     window_monitor_match: str = "ZOWIE"
+    # KDE virtual desktop name. Empty = do not assign a desktop.
+    window_workspace_name: str = "Ascent"
     # Explicit override (x, y). When set, skips monitor name lookup.
     window_position: tuple[int, int] | None = None
     # Fixed map seed for curriculum. None = game picks a fresh seed each run.

@@ -30,7 +30,7 @@ from ascent_player.agent.dqn import DQNAgent
 from ascent_player.config import AppConfig, DeviceMode
 from ascent_player.demo.export import export_demos_to_replay
 from ascent_player.training import run_training_no_ui
-from ascent_player.utils.climb_policy import human_cap
+from ascent_player.utils.climb_policy import human_cap, TEACHER_DISTILL_MIN_SCORE
 from ascent_player.utils.run_profile import (
     collect_only_fields,
     override_attrs,
@@ -43,7 +43,7 @@ HUMAN_REPLAY = Path("checkpoints/hybrid_human_replay.pkl")
 TEACHER_REPLAY = Path("checkpoints/teacher_distill_replay.pkl")
 HYBRID_BC = Path("checkpoints/hybrid_bc_mix.pkl")
 HUMAN_DIR = Path("demonstrations/seeded_human")
-DEFAULT_ELITE_GATE = 2000.0
+DEFAULT_ELITE_GATE = 1400.0
 DEFAULT_MAX_EPISODES = 64
 DEFAULT_MAX_PER = 128
 
@@ -177,7 +177,7 @@ async def distill_teacher_browser(
             thread_prior=thread_prior,
             rule_prior=0.05,
         ),
-        replay_min_episode_score=800.0,
+        replay_min_episode_score=TEACHER_DISTILL_MIN_SCORE,
         skill_exec_at_watch=False,
         seed_thread_watch_prior=0.0,
         browser_epsilon_floor=0.02,
@@ -197,7 +197,7 @@ async def distill_teacher_browser(
         max_items=config.training.browser_replay_max_items,
         vector_dim=config.observation.vector_dim,
     )
-    kept = agent.replay.filter_min_episode_score(800.0)
+    kept = agent.replay.filter_min_episode_score(TEACHER_DISTILL_MIN_SCORE)
     compact = agent.replay.compact_diverse_episodes(
         max_episodes=100,
         max_transitions_per_episode=128,
@@ -247,6 +247,8 @@ def merge_hybrid_bc_mix(
             vector_dim=config.observation.vector_dim,
         )
         if n > 0:
+            if label == "teacher":
+                n = aux.replay.filter_min_episode_score(TEACHER_DISTILL_MIN_SCORE)
             agent.replay.extend_from(aux.replay)
             parts[label] = int(n)
 
